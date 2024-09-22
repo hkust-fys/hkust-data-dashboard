@@ -25,13 +25,12 @@ announce_channel_id = int(os.getenv('ANNOUNCE_CHANNEL_ID'))
 
 # Bus stop IDs
 kmb_ids = {
-    "S_91": "B002CEF0DBC568F5",
-    "S_91M": "B002CEF0DBC568F5",
-    "S_91P": "E9018F8A7E096544",
-    "S_291P": "E9018F8A7E096544",
-    "N_91": "3592A0182BF020C7",
-    "N_91M": "B3E60EE895DBBF06",
-    "N_91P": "C1AAFE0EB8BD89C7"
+    "S_91_Dia. Hill": "B002CEF0DBC568F5",
+    "S_91M_Dia. Hill": "B002CEF0DBC568F5",
+    "S_91P_Choi Hung": "E9018F8A7E096544",
+    "S_291P_Mong Kok": "E9018F8A7E096544",
+    "N_91_CWB": "3592A0182BF020C7",
+    "N_91M_Po Lam": "B3E60EE895DBBF06",
 }
 ctb_ids = {
     "O_792M_Sai Kung": "003130",
@@ -70,6 +69,7 @@ async def fetch_campus_data() -> None:
         for k, v in kmb_ids.items():
             stop = k.split("_")[0]
             route = k.split("_")[1]
+            dest = k.split("_")[2]
 
             # eta_entry = [str(round((datetime.datetime.fromisoformat(str(x['eta'])) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60)) for x in requests.request("GET", f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{v}").json()['data'] if x['route'] == route]
 
@@ -83,9 +83,9 @@ async def fetch_campus_data() -> None:
             eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
 
             if stop == "S":
-                s_etas[route] = eta_entry
+                s_etas[f"{route:<4} {dest}"] = eta_entry
             else:
-                n_etas[route] = eta_entry
+                n_etas[f"{route:<4} {dest}"] = eta_entry
     except Exception as e:
         warnings.warn(f"Failed to connect to KMB ETA API\nRetrying in next loop...")
         print(e)
@@ -105,14 +105,14 @@ async def fetch_campus_data() -> None:
             # Highlight ETA if < 5 minutes away
             eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
 
-            n_etas[f"{route} {dest}"] = eta_entry
+            n_etas[f"{route:<4} {dest}"] = eta_entry
     except Exception as e:
         warnings.warn(f"Failed to connect to CTB ETA API\nRetrying in next loop...")
         print(e)
 
     # Compose embed using collected data
     embed_data = discord.Embed(
-        title="☀️ Campus data dashboard",
+        title="Campus Dashboard",
         color=0xe0af68,
         timestamp=datetime.datetime.now()
     )
@@ -120,16 +120,16 @@ async def fetch_campus_data() -> None:
     # Bus queue
     bus_queue_field = f"```ansi\n"
     bus_queue_field += f"North (42 in queue)\n"
-    bus_queue_field += f"{'Route':<14}| ETA (mins)\n"
+    bus_queue_field += f"{'Route':<15}| ETA (mins)\n"
     for route, times in n_etas.items():
-        bus_queue_field += f"{route:<14}| {', '.join(times)}\n"
+        bus_queue_field += f"{route:<15}| {', '.join(times)}\n"
 
     bus_queue_field += "\n"
 
     bus_queue_field += f"South (91 in queue)\n"
-    bus_queue_field += f"{'Route':<14}| ETA (mins)\n"
+    bus_queue_field += f"{'Route':<15}| ETA (mins)\n"
     for route, times in s_etas.items():
-        bus_queue_field += f"{route:<14}| {', '.join(times)}\n"
+        bus_queue_field += f"{route:<15}| {', '.join(times)}\n"
 
     bus_queue_field += "```"
 

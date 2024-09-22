@@ -1,4 +1,5 @@
 # bot.py
+# Run on 09 or 39th second of a minute to minimize bus ETA delay
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -6,6 +7,7 @@ from discord.ext import commands, tasks
 import os
 import warnings
 import asyncio
+import requests
 import datetime
 from dotenv import load_dotenv
 
@@ -21,6 +23,21 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 # Load announcement channel ID
 announce_channel_id = int(os.getenv('ANNOUNCE_CHANNEL_ID'))
 
+# Bus stop IDs
+kmb_ids = {
+    "S_91": "B002CEF0DBC568F5",
+    "S_91M": "B002CEF0DBC568F5",
+    "S_91P": "E9018F8A7E096544",
+    "S_291P": "E9018F8A7E096544",
+    "N_91": "3592A0182BF020C7",
+    "N_91M": "B3E60EE895DBBF06",
+    "N_91P": "C1AAFE0EB8BD89C7"
+}
+ctb_ids = {
+    "O_792M_Sai Kung": "003130",
+    "I_792M_TKO": "003130"
+}
+
 # define bot
 intents = discord.Intents.default()
 bot = commands.Bot(
@@ -31,7 +48,7 @@ bot = commands.Bot(
 )
 
 # Fetch campus data every 5 minutes
-@tasks.loop(minutes=5)
+@tasks.loop(seconds=30)
 async def fetch_campus_data() -> None:
     """
     Fetch campus data, and display them in the announcement channel.
@@ -46,6 +63,53 @@ async def fetch_campus_data() -> None:
 
     # TODO: Fetch campus data from API
 
+    # Fetch transit ETAs from API
+    n_etas = {}
+    s_etas = {}
+    try:
+        for k, v in kmb_ids.items():
+            stop = k.split("_")[0]
+            route = k.split("_")[1]
+
+            # eta_entry = [str(round((datetime.datetime.fromisoformat(str(x['eta'])) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60)) for x in requests.request("GET", f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{v}").json()['data'] if x['route'] == route]
+
+            # Get list of ETAs at stop with ID v, filter to route in k and extract ISO arrival times
+            eta_entry = [x['eta'] for x in requests.request("GET", f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{v}").json()['data'] if x['route'] == route]
+
+            # Calculate minute difference from ISO arrival time
+            eta_entry = [str(round((datetime.datetime.fromisoformat(str(i)) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60)) for i in eta_entry if i != None]
+
+            # Highlight ETA if < 5 minutes away
+            eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
+
+            if stop == "S":
+                s_etas[route] = eta_entry
+            else:
+                n_etas[route] = eta_entry
+    except Exception as e:
+        warnings.warn(f"Failed to connect to KMB ETA API\nRetrying in next loop...")
+        print(e)
+    
+    try:
+        for k, v in ctb_ids.items():
+            dir = k.split("_")[0]
+            route = k.split("_")[1]
+            dest = k.split("_")[2]
+
+            # Get list of ETAs at stop with ID v and route route, filter to direction in dir and extract ISO arrival times
+            eta_entry = [x['eta'] for x in requests.request("GET", f"https://rt.data.gov.hk/v2/transport/citybus/eta/CTB/{v}/{route}").json()['data'] if x['dir'] == dir]
+
+            # Calculate minute difference from ISO arrival time
+            eta_entry = [str(round((datetime.datetime.fromisoformat(str(i)) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60)) for i in eta_entry if i != None]
+
+            # Highlight ETA if < 5 minutes away
+            eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
+
+            n_etas[f"{route} {dest}"] = eta_entry
+    except Exception as e:
+        warnings.warn(f"Failed to connect to KMB ETA API\nRetrying in next loop...")
+        print(e)
+
     # Compose embed using collected data
     embed_data = discord.Embed(
         title="☀️ Campus data dashboard",
@@ -54,13 +118,23 @@ async def fetch_campus_data() -> None:
     )
 
     # Bus queue
-    bus_queue_field = f"```\n"
-    bus_queue_field += f"{'North':<10}| 42\n"
-    bus_queue_field += f"{'South':<10}| 91\n"
+    bus_queue_field = f"```ansi\n"
+    bus_queue_field += f"North (42 in queue)\n"
+    bus_queue_field += f"{'Route':<14}| ETA (mins)\n"
+    for route, times in n_etas.items():
+        bus_queue_field += f"{route:<14}| {', '.join(times)}\n"
+
+    bus_queue_field += "\n"
+
+    bus_queue_field += f"South (91 in queue)\n"
+    bus_queue_field += f"{'Route':<14}| ETA (mins)\n"
+    for route, times in s_etas.items():
+        bus_queue_field += f"{route:<14}| {', '.join(times)}\n"
+
     bus_queue_field += "```"
 
     embed_data.add_field(
-        name="🚏 Bus queue",
+        name="🚏 Bus times",
         value=bus_queue_field,
         inline=False
     )

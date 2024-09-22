@@ -107,7 +107,7 @@ async def fetch_campus_data() -> None:
 
             n_etas[f"{route} {dest}"] = eta_entry
     except Exception as e:
-        warnings.warn(f"Failed to connect to KMB ETA API\nRetrying in next loop...")
+        warnings.warn(f"Failed to connect to CTB ETA API\nRetrying in next loop...")
         print(e)
 
     # Compose embed using collected data

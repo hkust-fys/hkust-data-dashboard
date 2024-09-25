@@ -74,7 +74,7 @@ async def fetch_campus_data() -> None:
             # eta_entry = [str(round((datetime.datetime.fromisoformat(str(x['eta'])) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60)) for x in requests.request("GET", f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{v}").json()['data'] if x['route'] == route]
 
             # Get list of ETAs at stop with ID v, filter to route in k and extract ISO arrival times
-            eta_entry = [x['eta'] for x in requests.request("GET", f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{v}").json()['data'] if x['route'] == route]
+            eta_entry = [x['eta'] for x in requests.request("GET", f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{v}").json()['data'] if x['route'] == route and x['service_type'] == 1]
 
             # Calculate minute difference from ISO arrival time
             eta_entry = [str(round((datetime.datetime.fromisoformat(str(i)) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60)) for i in eta_entry if i != None]

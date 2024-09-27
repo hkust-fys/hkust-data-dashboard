@@ -23,6 +23,11 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 # Load announcement channel ID
 announce_channel_id = int(os.getenv('ANNOUNCE_CHANNEL_ID'))
 
+# Load API Keys
+bus_queue_key = os.getenv('BUS_QUEUE_KEY')
+ssc_key = os.getenv('SSC_KEY')
+ppl_count_key = os.getenv('PPL_COUNT_KEY')
+
 # Bus stop IDs
 kmb_ids = {
     "S_91_Dia. Hill": "B002CEF0DBC568F5",
@@ -61,6 +66,24 @@ async def fetch_campus_data() -> None:
         return
 
     # TODO: Fetch campus data from API
+    # Fetch bus queue from API
+    bus_queue_hdr = {
+        'Cache-Control': 'no-cache',
+        'X-Apim-Subscription-Key': bus_queue_key
+    }
+
+    try:
+        bus_queue = requests.request(
+            "GET", 
+            "https://hkust.azure-api.net/bus-queue-data/_search?sort=@timestamp:desc&size=1", 
+            headers=bus_queue_hdr
+        ).json()
+
+        bus_queue_length_north = bus_queue['hits']['hits'][0]['_source']['north_waiting']
+        bus_queue_length_south = bus_queue['hits']['hits'][0]['_source']['south_waiting']
+    except Exception as e:
+        warnings.warn(f"Failed to connect to HKUST bus-queue API\nRetrying in next loop...")
+        print(e)
 
     # Fetch transit ETAs from API
     n_etas = {}
@@ -109,6 +132,50 @@ async def fetch_campus_data() -> None:
     except Exception as e:
         warnings.warn(f"Failed to connect to CTB ETA API\nRetrying in next loop...")
         print(e)
+    
+    # Fetch people count from API
+    ppl_count_hdr = {
+        'Cache-Control': 'no-cache',
+        'X-Apim-Subscription-Key': ppl_count_key
+    }
+
+    try:
+        ppl_count_raw = requests.request(
+            "GET",
+            "https://hkust.azure-api.net/people-count-pulse/_search?sort=@timestamp:desc&size=50",
+            headers=ppl_count_hdr
+        ).json()
+
+        ppl_count = {}
+        for h in ppl_count_raw['hits']['hits']:
+            ppl_count[h['_source']['location']] = h['_source']['count']
+        
+        # Filter locations
+        ppl_count_locs = ["LG1 Canteen", "McDonalds", "LG7 Canteen", "Chinese Restaurant", "LSK Canteen", "Seafront Cafeteria", "Starbucks", "North Gate Bus Stop", "South Gate Bus Stop", "Staff Bus Stop", "Lee Shau Kee Library 1/F", "Lee Shau Kee Library G/F", "Lee Shau Kee Library LG1", "Lee Shau Kee Library LG3", "Lee Shau Kee Library LG4", "wholeCampus"]
+        ppl_count = {loc: ppl_count[loc] for loc in ppl_count_locs}
+    except Exception as e:
+        warnings.warn(f"Failed to connect to HKUST people-count-pulse API\nRetrying in next loop...")
+        print(e)
+    
+    # Fetch food waste count from API
+    ssc_hdr = {
+        'Cache-Control': 'no-cache',
+        'X-Apim-Subscription-Key': ssc_key
+    }
+
+    try:
+        ssc_raw = requests.request(
+            "GET",
+            "https://hkust.azure-api.net/ssc/ssc/food_waste/_search?sort=@timestamp:desc&size=100",
+            headers=ssc_hdr
+        ).json()
+
+        ssc = {}
+        for h in ssc_raw['hits']['hits']:
+            ssc[h['_source']['location']] = h['_source']['weight']
+    except Exception as e:
+        warnings.warn(f"Failed to connect to HKUST ssc API\nRetrying in next loop...")
+        print(e)
 
     # Compose embed using collected data
     embed_data = discord.Embed(
@@ -119,14 +186,14 @@ async def fetch_campus_data() -> None:
 
     # Bus queue
     bus_queue_field = f"```ansi\n"
-    bus_queue_field += f"North (42 in queue)\n"
+    bus_queue_field += f"North ({bus_queue_length_north} in queue)\n"
     bus_queue_field += f"{'Route':<15}| ETA (mins)\n"
     for route, times in n_etas.items():
         bus_queue_field += f"{route:<15}| {', '.join(times)}\n"
 
     bus_queue_field += "\n"
 
-    bus_queue_field += f"South (91 in queue)\n"
+    bus_queue_field += f"South ({bus_queue_length_south} in queue)\n"
     bus_queue_field += f"{'Route':<15}| ETA (mins)\n"
     for route, times in s_etas.items():
         bus_queue_field += f"{route:<15}| {', '.join(times)}\n"
@@ -141,11 +208,8 @@ async def fetch_campus_data() -> None:
 
     # People count
     ppl_count_field = f"```\n"
-    ppl_count_field += f"{'LG1 Rest.':<10}| 443\n"
-    ppl_count_field += f"{'LG5 Rest.':<10}| 118\n"
-    ppl_count_field += f"{'LG7 Rest.':<10}| 721\n"
-    ppl_count_field += f"{'LC':<10}| 512\n"
-    ppl_count_field += f"{'Atrium':<10}| 203\n"
+    for k, v in ppl_count.items():
+        ppl_count_field += f"{k:<25}| {v}\n"
     ppl_count_field += "```"
 
     embed_data.add_field(
@@ -156,7 +220,12 @@ async def fetch_campus_data() -> None:
 
     # Food waste
     food_waste_field = f"```\n"
-    food_waste_field += f"{'Total':<10}| 73t\n\n"
+    food_waste_field += f"{'Location':<25}| Weight (kg)\n"
+    
+    for k, v in ssc.items():
+        food_waste_field += f"{k:<25}| {int(v)}\n"
+
+    food_waste_field += "\n"
     food_waste_field += f"🐷 Happypig375 reminder: If you don't finish your food, I will finish you!\n"
     food_waste_field += "```"
 

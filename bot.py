@@ -197,7 +197,7 @@ async def fetch_campus_data() -> None:
     embed_data = discord.Embed(
         title="Campus Dashboard",
         color=0xe0af68,
-        # timestamp=datetime.datetime.now()
+        timestamp=datetime.datetime.now()
     )
 
     # Bus queue
@@ -265,7 +265,7 @@ async def fetch_campus_data() -> None:
     )
 
     # Footer
-    # embed_data.set_footer(text="🕒 Last updated")
+    embed_data.set_footer(text="🕒")
 
     # Send update to announcement channel
     messages = [m async for m in announce_channel.history(limit=1)]

@@ -9,6 +9,7 @@ import warnings
 import asyncio
 import requests
 import datetime
+import dateutil.parser as dp
 from dotenv import load_dotenv
 
 # change working directory to wherever bot.py is in
@@ -81,6 +82,11 @@ async def fetch_campus_data() -> None:
 
         bus_queue_length_north = bus_queue['hits']['hits'][0]['_source']['north_waiting']
         bus_queue_length_south = bus_queue['hits']['hits'][0]['_source']['south_waiting']
+
+        # Get update time of bus queue
+        bus_queue_timestamp = bus_queue['hits']['hits'][0]['_source']['@timestamp']
+        bus_queue_dt = dp.parse(bus_queue_timestamp)
+        bus_queue_unix = int(bus_queue_dt.timestamp())
     except Exception as e:
         warnings.warn(f"Failed to connect to HKUST bus-queue API\nRetrying in next loop...")
         print(e)
@@ -150,6 +156,11 @@ async def fetch_campus_data() -> None:
         for h in ppl_count_raw['hits']['hits']:
             ppl_count[h['_source']['location']] = h['_source']['count']
         
+        # Get update time of people count
+        ppl_count_timestamp = ppl_count_raw['hits']['hits'][0]['_source']['@timestamp']
+        ppl_count_dt = dp.parse(ppl_count_timestamp)
+        ppl_count_unix = int(ppl_count_dt.timestamp())
+        
         # Filter locations
         ppl_count_locs = ["LG1 Canteen", "McDonalds", "LG7 Canteen", "Chinese Restaurant", "LSK Canteen", "Seafront Cafeteria", "Starbucks", "North Gate Bus Stop", "South Gate Bus Stop", "Staff Bus Stop", "Lee Shau Kee Library 1/F", "Lee Shau Kee Library G/F", "Lee Shau Kee Library LG1", "Lee Shau Kee Library LG3", "Lee Shau Kee Library LG4", "wholeCampus"]
         ppl_count = {loc: ppl_count[loc] for loc in ppl_count_locs}
@@ -173,6 +184,11 @@ async def fetch_campus_data() -> None:
         ssc = {}
         for h in ssc_raw['hits']['hits']:
             ssc[h['_source']['location']] = h['_source']['weight']
+        
+        # Get update time of food waste
+        ssc_timestamp = ssc_raw['hits']['hits'][0]['_source']['@timestamp']
+        ssc_dt = dp.parse(ssc_timestamp)
+        ssc_unix = int(ssc_dt.timestamp())
     except Exception as e:
         warnings.warn(f"Failed to connect to HKUST ssc API\nRetrying in next loop...")
         print(e)
@@ -181,7 +197,7 @@ async def fetch_campus_data() -> None:
     embed_data = discord.Embed(
         title="Campus Dashboard",
         color=0xe0af68,
-        timestamp=datetime.datetime.now()
+        # timestamp=datetime.datetime.now()
     )
 
     # Bus queue
@@ -201,7 +217,7 @@ async def fetch_campus_data() -> None:
     bus_queue_field += "```"
 
     embed_data.add_field(
-        name="🚏 Bus times",
+        name=f"🚏 Bus stops (queue length updated <t:{bus_queue_unix}:R>)",
         value=bus_queue_field,
         inline=False
     )
@@ -213,7 +229,7 @@ async def fetch_campus_data() -> None:
     ppl_count_field += "```"
 
     embed_data.add_field(
-        name="👩 People count",
+        name=f"👩 People count (updated <t:{ppl_count_unix}:R>)",
         value=ppl_count_field,
         inline=False
     )
@@ -230,7 +246,7 @@ async def fetch_campus_data() -> None:
     food_waste_field += "```"
 
     embed_data.add_field(
-        name="🗑️ Food waste",
+        name=f"🗑️ Food waste (updated <t:{ssc_unix}:R>)",
         value=food_waste_field,
         inline=False
     )
@@ -249,7 +265,7 @@ async def fetch_campus_data() -> None:
     )
 
     # Footer
-    embed_data.set_footer(text="🕒 Last updated")
+    # embed_data.set_footer(text="🕒 Last updated")
 
     # Send update to announcement channel
     messages = [m async for m in announce_channel.history(limit=1)]

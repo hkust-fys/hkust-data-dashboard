@@ -194,7 +194,7 @@ async def fetch_campus_data() -> None:
                 rmk = x['rmk_en']
                 if rmk == "Scheduled Bus":
                     rmk = "*"
-                elif "delayed" in rmk.lower():
+                elif "delayed" in rmk.lower() or "Moving slowly" in rmk:
                     rmk = "!"
                 elif rmk != "":
                     rmk = ""

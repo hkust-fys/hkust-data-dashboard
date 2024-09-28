@@ -9,6 +9,7 @@ import warnings
 import asyncio
 import requests
 import datetime
+import traceback
 import dateutil.parser as dp
 from dotenv import load_dotenv
 
@@ -89,7 +90,7 @@ async def fetch_campus_data() -> None:
         bus_queue_unix = int(bus_queue_dt.timestamp())
     except Exception as e:
         warnings.warn(f"Failed to connect to HKUST bus-queue API\nRetrying in next loop...")
-        print(e)
+        print(traceback.format_exc())
 
     # Fetch transit ETAs from API
     n_etas = {}
@@ -103,13 +104,36 @@ async def fetch_campus_data() -> None:
             # eta_entry = [str(round((datetime.datetime.fromisoformat(str(x['eta'])) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60)) for x in requests.request("GET", f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{v}").json()['data'] if x['route'] == route]
 
             # Get list of ETAs at stop with ID v, filter to route in k and extract ISO arrival times
-            eta_entry = [x['eta'] for x in requests.request("GET", f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{v}").json()['data'] if x['route'] == route and x['service_type'] == 1]
+            eta_entry_raw = [x for x in requests.request("GET", f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{v}").json()['data'] if x['route'] == route and x['service_type'] == 1]
+
+            eta_entry = []
+            for x in eta_entry_raw:
+                time = x['eta']
+                if time != None:
+                    time = str(round((datetime.datetime.fromisoformat(str(time)) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60))
+                else:
+                    time = ""
+
+                rmk = x['rmk_en']
+                if rmk == "Scheduled Bus":
+                    rmk = "*"
+                elif rmk != "":
+                    rmk = ""
+                
+                eta_entry_elem = ""
+                if time and int(time) <= 5:
+                    eta_entry_elem = f"\u001b[0;41;37m{time}\u001b[0m"
+                else:
+                    eta_entry_elem = time
+                eta_entry_elem += rmk
+
+                eta_entry.append(eta_entry_elem)
 
             # Calculate minute difference from ISO arrival time
-            eta_entry = [str(round((datetime.datetime.fromisoformat(str(i)) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60)) for i in eta_entry if i != None]
+            # eta_entry = [str(round((datetime.datetime.fromisoformat(str(i)) - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60)) for i in eta_entry if i != None]
 
             # Highlight ETA if < 5 minutes away
-            eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
+            # eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
 
             if stop == "S":
                 s_etas[f"{route:<4} {dest}"] = eta_entry
@@ -117,7 +141,7 @@ async def fetch_campus_data() -> None:
                 n_etas[f"{route:<4} {dest}"] = eta_entry
     except Exception as e:
         warnings.warn(f"Failed to connect to KMB ETA API\nRetrying in next loop...")
-        print(e)
+        print(traceback.format_exc())
     
     try:
         for k, v in ctb_ids.items():
@@ -137,7 +161,7 @@ async def fetch_campus_data() -> None:
             n_etas[f"{route:<4} {dest}"] = eta_entry
     except Exception as e:
         warnings.warn(f"Failed to connect to CTB ETA API\nRetrying in next loop...")
-        print(e)
+        print(traceback.format_exc())
     
     # Fetch people count from API
     ppl_count_hdr = {
@@ -166,7 +190,7 @@ async def fetch_campus_data() -> None:
         ppl_count = {loc: ppl_count[loc] for loc in ppl_count_locs}
     except Exception as e:
         warnings.warn(f"Failed to connect to HKUST people-count-pulse API\nRetrying in next loop...")
-        print(e)
+        print(traceback.format_exc())
     
     # Fetch food waste count from API
     ssc_hdr = {
@@ -191,7 +215,7 @@ async def fetch_campus_data() -> None:
         ssc_unix = int(ssc_dt.timestamp())
     except Exception as e:
         warnings.warn(f"Failed to connect to HKUST ssc API\nRetrying in next loop...")
-        print(e)
+        print(traceback.format_exc())
 
     # Compose embed using collected data
     embed_data = discord.Embed(
@@ -202,6 +226,10 @@ async def fetch_campus_data() -> None:
 
     # Bus queue
     bus_queue_field = f"```ansi\n"
+
+    bus_queue_field += "* Scheduled departure, not real-time\n"
+    bus_queue_field += "! Delayed\n\n"
+
     bus_queue_field += f"North ({bus_queue_length_north} in queue)\n"
     bus_queue_field += f"{'Route':<15}| ETA (mins)\n"
     for route, times in n_etas.items():
@@ -217,7 +245,7 @@ async def fetch_campus_data() -> None:
     bus_queue_field += "```"
 
     embed_data.add_field(
-        name=f"🚏 Bus stops (queue length updated <t:{bus_queue_unix}:R>)",
+        name=f"🚌 Bus stops (queue length updated <t:{bus_queue_unix}:R>)",
         value=bus_queue_field,
         inline=False
     )

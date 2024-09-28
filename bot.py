@@ -214,10 +214,11 @@ async def fetch_campus_data() -> None:
             # Highlight ETA if < 5 minutes away
             # eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
 
-            if stop == "S":
-                s_etas[f"🟥{route:<4} {dest}"] = eta_entry
-            else:
-                n_etas[f"🟥{route:<4} {dest}"] = eta_entry
+            if len(eta_entry) > 1 or eta_entry[0] != "":
+                if stop == "S":
+                    s_etas[f"🟥{route:<4} {dest}"] = eta_entry
+                else:
+                    n_etas[f"🟥{route:<4} {dest}"] = eta_entry
     except Exception as e:
         warnings.warn(f"Failed to connect to KMB ETA API\nRetrying in next loop...")
         print(traceback.format_exc())
@@ -237,7 +238,8 @@ async def fetch_campus_data() -> None:
             # Highlight ETA if < 5 minutes away
             eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
 
-            n_etas[f"🟨{route:<4} {dest}"] = eta_entry
+            if eta_entry != []:
+                n_etas[f"🟨{route:<4} {dest}"] = eta_entry
     except Exception as e:
         warnings.warn(f"Failed to connect to CTB ETA API\nRetrying in next loop...")
         print(traceback.format_exc())
@@ -336,7 +338,9 @@ async def fetch_campus_data() -> None:
     )
 
     # Bus queue
-    bus_queue_field = f"```ansi\n"
+    bus_queue_field = "[Bus Stations Live View](http://liveview.ust.hk/busstop/)\n"
+
+    bus_queue_field += f"```ansi\n"
 
     bus_queue_field += "🟥 KMB | 🟨 Citybus | 🟩 Minibus (inaccurate)\n"
     bus_queue_field += "* Scheduled departure, not real-time\n"
@@ -359,7 +363,7 @@ async def fetch_campus_data() -> None:
     bus_queue_field += "```"
 
     embed_data.add_field(
-        name=f"🚌 Bus stops (queue length updated <t:{bus_queue_unix}:R>)",
+        name=f"🚌 Bus stops",
         value=bus_queue_field,
         inline=False
     )

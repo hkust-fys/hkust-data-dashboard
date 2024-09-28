@@ -333,14 +333,16 @@ async def fetch_campus_data() -> None:
     bus_queue_field += "* Scheduled departure, not real-time\n"
     bus_queue_field += "! Delayed\n\n"
 
-    bus_queue_field += f"North ({bus_queue_length_north} in queue)\n"
+    # bus_queue_field += f"North ({bus_queue_length_north} in queue)\n"
+    bus_queue_field += f"North ({ppl_count['North Gate Bus Stop']} in queue)\n"  # Use people count instead
     bus_queue_field += f"{'🚍Route':<16}| ETA (mins)\n"
     for route, times in n_etas.items():
         bus_queue_field += f"{route:<16}| {', '.join(times)}\n"
 
     bus_queue_field += "\n"
 
-    bus_queue_field += f"South ({bus_queue_length_south} in queue)\n"
+    # bus_queue_field += f"South ({bus_queue_length_south} in queue)\n"
+    bus_queue_field += f"South ({ppl_count['South Gate Bus Stop']} in queue)\n"  # Use people count instead
     bus_queue_field += f"{'🚍Route':<16}| ETA (mins)\n"
     for route, times in s_etas.items():
         bus_queue_field += f"{route:<16}| {', '.join(times)}\n"

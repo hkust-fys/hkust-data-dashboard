@@ -39,9 +39,77 @@ kmb_ids = {
     "N_91_CWB": "3592A0182BF020C7",
     "N_91M_Po Lam": "B3E60EE895DBBF06",
 }
+
 ctb_ids = {
     "O_792M_Sai Kung": "003130",
     "I_792M_TKO": "003130"
+}
+
+gmb_ids = {
+    20013010: [
+        {
+            "gate": "S",
+            "no": "11",
+            "dest": "Choi Hung",
+            "route": 2004791,
+            "seq": 1
+        }
+    ],
+    20012472: [
+        {
+            "gate": "N",
+            "no": "11",
+            "dest": "Hang Hau",
+            "route": 2004791,
+            "seq": 2
+        }
+    ],
+    20013011: [
+        {
+            "gate": "S",
+            "no": "11B",
+            "dest": "Choi Hung",
+            "route": 2004828,
+            "seq": 1
+        },
+        {
+            "gate": "S",
+            "no": "11S",
+            "dest": "Choi Hung",
+            "route": 2004826,
+            "seq": 1
+        },
+    ],
+    20012474: [
+        {
+            "gate": "N",
+            "no": "11M",
+            "dest": "Hang Hau",
+            "route": 2004825,
+            "seq": 2
+        },
+        {
+            "gate": "N",
+            "no": "11S",
+            "dest": "Po Lam",
+            "route": 2004826,
+            "seq": 2
+        },
+        {
+            "gate": "N",
+            "no": "12",
+            "dest": "Po Lam",
+            "route": 2004764,
+            "seq": 1
+        },
+        {
+            "gate": "N",
+            "no": "12",
+            "dest": "Sai Kung",
+            "route": 2004764,
+            "seq": 2
+        }
+    ]
 }
 
 # define bot
@@ -117,6 +185,8 @@ async def fetch_campus_data() -> None:
                 rmk = x['rmk_en']
                 if rmk == "Scheduled Bus":
                     rmk = "*"
+                elif "delayed" in rmk.lower():
+                    rmk = "!"
                 elif rmk != "":
                     rmk = ""
                 
@@ -136,9 +206,9 @@ async def fetch_campus_data() -> None:
             # eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
 
             if stop == "S":
-                s_etas[f"{route:<4} {dest}"] = eta_entry
+                s_etas[f"🟥{route:<4} {dest}"] = eta_entry
             else:
-                n_etas[f"{route:<4} {dest}"] = eta_entry
+                n_etas[f"🟥{route:<4} {dest}"] = eta_entry
     except Exception as e:
         warnings.warn(f"Failed to connect to KMB ETA API\nRetrying in next loop...")
         print(traceback.format_exc())
@@ -158,9 +228,41 @@ async def fetch_campus_data() -> None:
             # Highlight ETA if < 5 minutes away
             eta_entry = [f"\u001b[0;41;37m{i}\u001b[0m" if int(i) <= 5 else i for i in eta_entry]
 
-            n_etas[f"{route:<4} {dest}"] = eta_entry
+            n_etas[f"🟨{route:<4} {dest}"] = eta_entry
     except Exception as e:
         warnings.warn(f"Failed to connect to CTB ETA API\nRetrying in next loop...")
+        print(traceback.format_exc())
+    
+    try:
+        for stop_id, routes in gmb_ids.items():
+            # Get list of ETAs at stop
+            eta_stop = requests.request("GET", f"https://data.etagmb.gov.hk/eta/stop/{stop_id}").json()['data']
+
+            # Get ETAs of each route at stop
+            for route in routes:
+                eta_route = [r['eta'] for r in eta_stop if r['route_id'] == route['route'] and r['route_seq'] == route['seq']][0]
+
+                eta_entry = []
+                for eta_route_elem in eta_route:
+                    eta_entry_elem = str(eta_route_elem['diff'])
+                    if eta_route_elem['diff'] <= 5:
+                        eta_entry_elem = f"\u001b[0;41;37m{eta_route_elem['diff']}\u001b[0m"
+
+                    if eta_route_elem['remarks_en']:
+                        if "Delayed" in eta_route_elem['remarks_en']:
+                            eta_entry_elem += "!"
+                        elif "Scheduled" in eta_route_elem['remarks_en']:
+                            eta_entry_elem += "*"
+                    
+                    eta_entry.append(eta_entry_elem)
+                
+                if eta_entry != []:
+                    if route['gate'] == "S":
+                        s_etas[f"🟩{route['no']:<4} {route['dest']}"] = eta_entry
+                    else:
+                        n_etas[f"🟩{route['no']:<4} {route['dest']}"] = eta_entry
+    except Exception as e:
+        warnings.warn(f"Failed to connect to GMB ETA API\nRetrying in next loop...")
         print(traceback.format_exc())
     
     # Fetch people count from API
@@ -227,20 +329,21 @@ async def fetch_campus_data() -> None:
     # Bus queue
     bus_queue_field = f"```ansi\n"
 
+    bus_queue_field += "🟥 KMB | 🟨 Citybus | 🟩 Minibus (inaccurate)\n"
     bus_queue_field += "* Scheduled departure, not real-time\n"
     bus_queue_field += "! Delayed\n\n"
 
     bus_queue_field += f"North ({bus_queue_length_north} in queue)\n"
-    bus_queue_field += f"{'Route':<15}| ETA (mins)\n"
+    bus_queue_field += f"{'🚍Route':<16}| ETA (mins)\n"
     for route, times in n_etas.items():
-        bus_queue_field += f"{route:<15}| {', '.join(times)}\n"
+        bus_queue_field += f"{route:<16}| {', '.join(times)}\n"
 
     bus_queue_field += "\n"
 
     bus_queue_field += f"South ({bus_queue_length_south} in queue)\n"
-    bus_queue_field += f"{'Route':<15}| ETA (mins)\n"
+    bus_queue_field += f"{'🚍Route':<16}| ETA (mins)\n"
     for route, times in s_etas.items():
-        bus_queue_field += f"{route:<15}| {', '.join(times)}\n"
+        bus_queue_field += f"{route:<16}| {', '.join(times)}\n"
 
     bus_queue_field += "```"
 

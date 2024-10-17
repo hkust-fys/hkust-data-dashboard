@@ -1,9 +1,4 @@
-# bot.py
-# Run on 09 or 39th second of a minute to minimize bus ETA delay
-import discord
-from discord import app_commands
-from discord.ext import commands, tasks
-
+import discord # !pip install discord.py
 import os
 import warnings
 import asyncio
@@ -11,24 +6,6 @@ import requests
 import datetime
 import traceback
 import dateutil.parser as dp
-from dotenv import load_dotenv
-
-# change working directory to wherever bot.py is in
-abspath = os.path.abspath(__file__)
-dname = os.path.dirname(abspath)
-os.chdir(dname)
-
-# load bot token
-load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
-
-# Load announcement channel ID
-announce_channel_id = int(os.getenv('ANNOUNCE_CHANNEL_ID'))
-
-# Load API Keys
-bus_queue_key = os.getenv('BUS_QUEUE_KEY')
-ssc_key = os.getenv('SSC_KEY')
-ppl_count_key = os.getenv('PPL_COUNT_KEY')
 
 # Bus stop IDs
 kmb_ids = {
@@ -39,12 +16,10 @@ kmb_ids = {
     "N_91_CWB": "3592A0182BF020C7",
     "N_91M_Po Lam": "B3E60EE895DBBF06",
 }
-
 ctb_ids = {
     "O_792M_Sai Kung": "003130",
     "I_792M_TKO": "003130"
 }
-
 gmb_ids = {
     20013010: [
         {
@@ -121,41 +96,19 @@ gmb_ids = {
     ]
 }
 
-# define bot
-intents = discord.Intents.default()
-bot = commands.Bot(
-    command_prefix = "d.",
-    intents=intents,
-    activity=discord.Activity(type=discord.ActivityType.watching, name="campus data"),
-    help_command=None
-)
-
-# Fetch campus data every 5 minutes
-@tasks.loop(seconds=30)
-async def fetch_campus_data() -> None:
+async def fetch_campus_data(bus_queue_key, ssc_key, ppl_count_key) -> None:
     """
     Fetch campus data, and display them in the announcement channel.
     """
-
-    # Check announcement channel status
-    try:
-        announce_channel = await bot.fetch_channel(announce_channel_id)
-    except:
-        warnings.warn("Failed to connect to announcement channel, retrying in next loop...")
-        return
-
-    # TODO: Fetch campus data from API
-    # Fetch bus queue from API
-    bus_queue_hdr = {
-        'Cache-Control': 'no-cache',
-        'X-Apim-Subscription-Key': bus_queue_key
-    }
 
     try:
         bus_queue = requests.request(
             "GET", 
             "https://hkust.azure-api.net/bus-queue-data/_search?sort=@timestamp:desc&size=1", 
-            headers=bus_queue_hdr
+            headers= {
+                'Cache-Control': 'no-cache',
+                'X-Apim-Subscription-Key': bus_queue_key
+            }
         ).json()
 
         bus_queue_length_north = bus_queue['hits']['hits'][0]['_source']['north_waiting']
@@ -341,27 +294,21 @@ async def fetch_campus_data() -> None:
 
     # Bus queue
     bus_queue_field = "[Bus Stations Live View](http://liveview.ust.hk/busstop/)\n"
-
     bus_queue_field += f"```ansi\n"
-
     bus_queue_field += "🟥 KMB | 🟨 Citybus | 🟩 Minibus (inaccurate)\n"
     bus_queue_field += "* Scheduled departure, not real-time\n"
     bus_queue_field += "! Delayed\n\n"
-
     # bus_queue_field += f"North ({bus_queue_length_north} in queue)\n"
     bus_queue_field += f"North ({ppl_count['North Gate Bus Stop']} in queue)\n"  # Use people count instead
     bus_queue_field += f"{'🚍Route':<16}| ETA (mins)\n"
     for route, times in n_etas.items():
         bus_queue_field += f"{route:<16}| {', '.join(times)}\n"
-
     bus_queue_field += "\n"
-
     # bus_queue_field += f"South ({bus_queue_length_south} in queue)\n"
     bus_queue_field += f"South ({ppl_count['South Gate Bus Stop']} in queue)\n"  # Use people count instead
     bus_queue_field += f"{'🚍Route':<16}| ETA (mins)\n"
     for route, times in s_etas.items():
         bus_queue_field += f"{route:<16}| {', '.join(times)}\n"
-
     bus_queue_field += "```"
 
     embed_data.add_field(
@@ -385,10 +332,8 @@ async def fetch_campus_data() -> None:
     # Food waste
     food_waste_field = f"```\n"
     food_waste_field += f"{'Location':<25}| Weight (kg)\n"
-    
     for k, v in ssc.items():
         food_waste_field += f"{k:<25}| {int(v)}\n"
-
     food_waste_field += "\n"
     food_waste_field += f"🐷 Happypig375 reminder: If you don't finish your food, I will finish you!\n"
     food_waste_field += "```"
@@ -414,33 +359,69 @@ async def fetch_campus_data() -> None:
 
     # Footer
     embed_data.set_footer(text="🕒")
+    return embed_data
 
-    # Send update to announcement channel
-    messages = [m async for m in announce_channel.history(limit=1)]
-    if len(messages) == 0:
-        await announce_channel.send(embed=embed_data)
-    else:
-        await messages[0].edit(embed=embed_data)
+if False: # Edit to True for Colab development
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        await discord.Webhook.from_url('<webhook_url>', session=session) \
+        .send(embed=await fetch_campus_data('<bus_queue_key>', '<ssc_key>', '<ppl_count_key>'))
+else: # Discord bot (production environment)
+    from dotenv import load_dotenv
+    from discord.ext import commands, tasks
+    # change working directory to wherever bot.py is in
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-# On ready event
-# Display bot guilds
-@bot.event
-async def on_ready():
-    for guild in bot.guilds:
-        print(
-            f'{bot.user} is connected to the following guild(s):\n'
-            f'{guild.name}(id: {guild.id})'
-        )
+    load_dotenv()
+    TOKEN = os.getenv('DISCORD_TOKEN')
+    announce_channel_id = int(os.getenv('ANNOUNCE_CHANNEL_ID'))
+    bus_queue_key = os.getenv('BUS_QUEUE_KEY')
+    ssc_key = os.getenv('SSC_KEY')
+    ppl_count_key = os.getenv('PPL_COUNT_KEY')
 
-    # Start fetching data
-    await fetch_campus_data.start()
+    intents = discord.Intents.default()
+    bot = commands.Bot(
+        command_prefix = "d.",
+        intents=intents,
+        activity=discord.Activity(type=discord.ActivityType.watching, name="campus data"),
+        help_command=None
+    )
 
-# (text) command not found error handling
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, discord.ext.commands.CommandNotFound):
-        return
-    raise error
+    @bot.event
+    async def on_ready():
+        for guild in bot.guilds:
+            print(
+                f'{bot.user} is connected to the following guild(s):\n'
+                f'{guild.name}(id: {guild.id})'
+            )
+        # Start fetching data
+        while True:
+            # Check announcement channel status
+            try:
+                announce_channel = await bot.fetch_channel(announce_channel_id)
+                # Send update to announcement channel
+                messages = [m async for m in announce_channel.history(limit=1)]
+                if len(messages) == 0:
+                    await announce_channel.send(embed=await fetch_campus_data())
+                else:
+                    await messages[0].edit(embed=await fetch_campus_data())
+            except:
+                warnings.warn("Failed to connect to announcement channel, retrying in next loop...")
+                return
+            
+            now = datetime.now()
+            # Run on 09 or 39th second of a minute to minimize bus ETA delay
+            await asyncio.sleep(
+                (now.replace(second=39 if 9 <= now.second <= 38 else 9)
+                + datetime.timedelta(minutes=now.second >= 39) - now)
+                .total_seconds())
 
-# Launch bot
-bot.run(TOKEN)
+    # (text) command not found error handling
+    @bot.event
+    async def on_command_error(ctx, error):
+        if isinstance(error, discord.ext.commands.CommandNotFound):
+            return
+        raise error
+
+    # Launch bot
+    bot.run(TOKEN)

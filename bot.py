@@ -1,12 +1,37 @@
-import discord # !pip install discord.py
-import os
+import os, pkg_resources, inspect
+os.chdir(os.path.dirname(os.path.abspath(inspect.getfile(lambda: None)))) # change working directory to wherever bot.py is in
+
+missing_packages = {'discord.py', 'python-dotenv'} - {pkg.key for pkg in pkg_resources.working_set}
+if missing_packages:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'pip'])
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', *missing_packages])
+if not os.path.isfile('.env'):
+    with open('.env', 'w') as env:
+        env.write('''# Required for both Colab development and Discord Bot production
+BUS_QUEUE_KEY=<your-key>
+SSC_KEY=<your-key>
+PPL_COUNT_KEY=<your-key>
+
+# Only required for Colab development (comment out this environment variable for Discord Bot production)
+DEV_WEBHOOK=<your-development-webhook>
+
+# Only required for Discord Bot production
+DISCORD_TOKEN=<your-bot-token>
+ANNOUNCE_CHANNEL_ID=<your-channel-id-in-a-connected-server>''')
+        print("Dependencies and .env file set up. Please edit the .env file with valid input.")
+        exit(0)
+
 import warnings
 import asyncio
 import requests
 import datetime
 import traceback
 import dateutil.parser as dp
-
+import discord # package discord.py
+from dotenv import load_dotenv # package python-dotenv
+load_dotenv()
+    
 # Bus stop IDs
 kmb_ids = {
     "S_91_Dia. Hill": "B002CEF0DBC568F5",
@@ -96,7 +121,7 @@ gmb_ids = {
     ]
 }
 
-async def fetch_campus_data(bus_queue_key, ssc_key, ppl_count_key) -> None:
+async def fetch_campus_data() -> None:
     """
     Fetch campus data, and display them in the announcement channel.
     """
@@ -107,7 +132,7 @@ async def fetch_campus_data(bus_queue_key, ssc_key, ppl_count_key) -> None:
             "https://hkust.azure-api.net/bus-queue-data/_search?sort=@timestamp:desc&size=1", 
             headers= {
                 'Cache-Control': 'no-cache',
-                'X-Apim-Subscription-Key': bus_queue_key
+                'X-Apim-Subscription-Key': os.getenv('BUS_QUEUE_KEY')
             }
         ).json()
 
@@ -215,8 +240,8 @@ async def fetch_campus_data(bus_queue_key, ssc_key, ppl_count_key) -> None:
                         eta_entry_elem = f"\u001b[0;41;37m{eta_route_elem['diff']}\u001b[0m"
 
                     if eta_route_elem['remarks_en']:
-                        if "Delayed" in eta_route_elem['remarks_en']:
-                            eta_entry_elem += "!"
+                        if "delayed" in eta_route_elem['remarks_en'].lower():
+                            eta_entry_elem += "!!"
                         elif "Scheduled" in eta_route_elem['remarks_en']:
                             eta_entry_elem += "*"
                     
@@ -234,7 +259,7 @@ async def fetch_campus_data(bus_queue_key, ssc_key, ppl_count_key) -> None:
     # Fetch people count from API
     ppl_count_hdr = {
         'Cache-Control': 'no-cache',
-        'X-Apim-Subscription-Key': ppl_count_key
+        'X-Apim-Subscription-Key': os.getenv('PPL_COUNT_KEY')
     }
 
     try:
@@ -263,7 +288,7 @@ async def fetch_campus_data(bus_queue_key, ssc_key, ppl_count_key) -> None:
     # Fetch food waste count from API
     ssc_hdr = {
         'Cache-Control': 'no-cache',
-        'X-Apim-Subscription-Key': ssc_key
+        'X-Apim-Subscription-Key': os.getenv('SSC_KEY')
     }
 
     try:
@@ -361,24 +386,16 @@ async def fetch_campus_data(bus_queue_key, ssc_key, ppl_count_key) -> None:
     embed_data.set_footer(text="🕒")
     return embed_data
 
-if False: # Edit to True for Colab development
+if 'DEV_WEBHOOK' in os.environ: # Colab development
     import aiohttp
     async with aiohttp.ClientSession() as session:
-        await discord.Webhook.from_url('<webhook_url>', session=session) \
-        .send(embed=await fetch_campus_data('<bus_queue_key>', '<ssc_key>', '<ppl_count_key>'))
+        await discord.Webhook.from_url(os.getenv('DEV_WEBHOOK'), session=session) \
+        .send(embed=await fetch_campus_data())
 else: # Discord bot (production environment)
-    from dotenv import load_dotenv
     from discord.ext import commands, tasks
-    # change working directory to wherever bot.py is in
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    load_dotenv()
     TOKEN = os.getenv('DISCORD_TOKEN')
     announce_channel_id = int(os.getenv('ANNOUNCE_CHANNEL_ID'))
-    bus_queue_key = os.getenv('BUS_QUEUE_KEY')
-    ssc_key = os.getenv('SSC_KEY')
-    ppl_count_key = os.getenv('PPL_COUNT_KEY')
-
     intents = discord.Intents.default()
     bot = commands.Bot(
         command_prefix = "d.",

@@ -58,7 +58,7 @@ _For Discord Bot production_ Create a bot user in the [Discord Developer Portal]
 6.
 _For Colab development_ Ctrl+Enter anywhere in the code cell you use will run the entire script.
 
-_For Discord Bot production)
+_For Discord Bot production_
 Run `bot.py`
 
 ```txt

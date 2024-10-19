@@ -130,7 +130,7 @@ async def fetch_campus_data() -> None:
         bus_queue = requests.request(
             "GET", 
             "https://hkust.azure-api.net/bus-queue-data/_search?sort=@timestamp:desc&size=1", 
-            headers= {
+            headers={
                 'Cache-Control': 'no-cache',
                 'X-Apim-Subscription-Key': os.getenv('BUS_QUEUE_KEY')
             }
@@ -257,16 +257,15 @@ async def fetch_campus_data() -> None:
         print(traceback.format_exc())
     
     # Fetch people count from API
-    ppl_count_hdr = {
-        'Cache-Control': 'no-cache',
-        'X-Apim-Subscription-Key': os.getenv('PPL_COUNT_KEY')
-    }
 
     try:
         ppl_count_raw = requests.request(
             "GET",
             "https://hkust.azure-api.net/people-count-pulse/_search?sort=@timestamp:desc&size=50",
-            headers=ppl_count_hdr
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Apim-Subscription-Key': os.getenv('PPL_COUNT_KEY')
+            }
         ).json()
 
         ppl_count = {}
@@ -286,16 +285,14 @@ async def fetch_campus_data() -> None:
         print(traceback.format_exc())
     
     # Fetch food waste count from API
-    ssc_hdr = {
-        'Cache-Control': 'no-cache',
-        'X-Apim-Subscription-Key': os.getenv('SSC_KEY')
-    }
-
     try:
         ssc_raw = requests.request(
             "GET",
             "https://hkust.azure-api.net/ssc/ssc/food_waste/_search?sort=@timestamp:desc&size=100",
-            headers=ssc_hdr
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Apim-Subscription-Key': os.getenv('SSC_KEY')
+            }
         ).json()
 
         ssc = {}

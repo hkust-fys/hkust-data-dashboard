@@ -4,8 +4,8 @@ os.chdir(os.path.dirname(os.path.abspath(inspect.getfile(lambda: None)))) # chan
 missing_packages = {'discord.py', 'python-dotenv'} - {pkg.key for pkg in pkg_resources.working_set}
 if missing_packages:
     import subprocess, sys
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'pip'])
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', *missing_packages])
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--user', '--upgrade', 'pip'])
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--user', *missing_packages])
 if not os.path.isfile('.env'):
     with open('.env', 'w') as env:
         env.write('''# Required for both Colab development and Discord Bot production
@@ -385,9 +385,10 @@ async def fetch_campus_data() -> None:
 
 if 'DEV_WEBHOOK' in os.environ: # Colab development
     import aiohttp
-    async with aiohttp.ClientSession() as session:
-        await discord.Webhook.from_url(os.getenv('DEV_WEBHOOK'), session=session) \
-        .send(embed=await fetch_campus_data())
+    async def run_dev_webhook():
+        async with aiohttp.ClientSession() as session:
+            await discord.Webhook.from_url(os.getenv('DEV_WEBHOOK'), session=session) \
+            .send(embed=await fetch_campus_data())
 else: # Discord bot (production environment)
     from discord.ext import commands, tasks
 
@@ -423,7 +424,8 @@ else: # Discord bot (production environment)
                 warnings.warn("Failed to connect to announcement channel, retrying in next loop...")
                 return
             
-            now = datetime.now()
+            # now = datetime.now()
+            now = datetime.datetime.now()
             # Run on 09 or 39th second of a minute to minimize bus ETA delay
             await asyncio.sleep(
                 (now.replace(second=39 if 9 <= now.second <= 38 else 9)

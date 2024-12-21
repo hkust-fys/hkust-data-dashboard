@@ -1,7 +1,7 @@
 import os, pkg_resources, inspect
 os.chdir(os.path.dirname(os.path.abspath(inspect.getfile(lambda: None)))) # change working directory to wherever bot.py is in
 
-missing_packages = {'discord.py', 'python-dotenv'} - {pkg.key for pkg in pkg_resources.working_set}
+missing_packages = {'discord.py', 'python-dotenv', 'bs4', 'aiohttp'} - {pkg.key for pkg in pkg_resources.working_set}
 if missing_packages:
     import subprocess, sys
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--user', '--upgrade', 'pip'])
@@ -30,6 +30,9 @@ import traceback
 import dateutil.parser as dp
 import discord # package discord.py
 from dotenv import load_dotenv # package python-dotenv
+from shuttle_bus import load_or_fetch_shuttle_data
+from datetime import timedelta
+from weather import get_weather_data
 load_dotenv()
     
 # Bus stop IDs
@@ -126,26 +129,6 @@ async def fetch_campus_data() -> None:
     Fetch campus data, and display them in the announcement channel.
     """
 
-    try:
-        bus_queue = requests.request(
-            "GET", 
-            "https://hkust.azure-api.net/bus-queue-data/_search?sort=@timestamp:desc&size=1", 
-            headers={
-                'Cache-Control': 'no-cache',
-                'X-Apim-Subscription-Key': os.getenv('BUS_QUEUE_KEY')
-            }
-        ).json()
-
-        bus_queue_length_north = bus_queue['hits']['hits'][0]['_source']['north_waiting']
-        bus_queue_length_south = bus_queue['hits']['hits'][0]['_source']['south_waiting']
-
-        # Get update time of bus queue
-        bus_queue_timestamp = bus_queue['hits']['hits'][0]['_source']['@timestamp']
-        bus_queue_dt = dp.parse(bus_queue_timestamp)
-        bus_queue_unix = int(bus_queue_dt.timestamp())
-    except Exception as e:
-        warnings.warn(f"Failed to connect to HKUST bus-queue API\nRetrying in next loop...")
-        print(traceback.format_exc())
 
     # Fetch transit ETAs from API
     n_etas = {}
@@ -255,9 +238,38 @@ async def fetch_campus_data() -> None:
     except Exception as e:
         warnings.warn(f"Failed to connect to GMB ETA API\nRetrying in next loop...")
         print(traceback.format_exc())
-    
-    # Fetch people count from API
 
+    # Fetch people at north gate and south gate using the bus_queue API
+    bus_queue = {}
+    try:
+        bus_queue_raw = requests.request(
+            "GET",
+            "https://hkust.azure-api.net/bus-queue-data/_search?sort=@timestamp:desc&size=1",
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Apim-Subscription-Key': os.getenv('BUS_QUEUE_KEY')
+            }
+        ).json()
+
+        latest_data = bus_queue_raw['hits']['hits'][0]['_source']
+
+        # Occasionally, the API will return an empty string for the waiting count
+        bus_queue = {
+            'north': int(latest_data['north_waiting']) if latest_data['north_waiting'] else 0,
+            'south': int(latest_data['south_waiting']) if latest_data['south_waiting'] else 0
+        }
+
+        bus_queue_timestamp = latest_data['@timestamp']
+    except Exception as e:
+        warnings.warn(f"Failed to connect to HKUST bus-queue API\nRetrying in next loop...")
+        print(traceback.format_exc())
+
+
+
+
+
+
+    # Fetch people count from API
     try:
         ppl_count_raw = requests.request(
             "GET",
@@ -284,28 +296,29 @@ async def fetch_campus_data() -> None:
         warnings.warn(f"Failed to connect to HKUST people-count-pulse API\nRetrying in next loop...")
         print(traceback.format_exc())
     
-    # Fetch food waste count from API
-    try:
-        ssc_raw = requests.request(
-            "GET",
-            "https://hkust.azure-api.net/ssc/ssc/food_waste/_search?sort=@timestamp:desc&size=100",
-            headers={
-                'Cache-Control': 'no-cache',
-                'X-Apim-Subscription-Key': os.getenv('SSC_KEY')
-            }
-        ).json()
+    # # Fetch food waste count from API
+    # try:
+    #     ssc_raw = requests.request(
+    #         "GET",
+    #         "https://hkust.azure-api.net/ssc/ssc/food_waste/_search?sort=@timestamp:desc&size=100",
+    #         headers={
+    #             'Cache-Control': 'no-cache',
+    #             'X-Apim-Subscription-Key': os.getenv('SSC_KEY')
+    #         }
+    #     ).json()
 
-        ssc = {}
-        for h in ssc_raw['hits']['hits']:
-            ssc[h['_source']['location']] = h['_source']['weight']
-        
-        # Get update time of food waste
-        ssc_timestamp = ssc_raw['hits']['hits'][0]['_source']['@timestamp']
-        ssc_dt = dp.parse(ssc_timestamp)
-        ssc_unix = int(ssc_dt.timestamp())
-    except Exception as e:
-        warnings.warn(f"Failed to connect to HKUST ssc API\nRetrying in next loop...")
-        print(traceback.format_exc())
+    #     ssc = {}
+    #     for h in ssc_raw['hits']['hits']:
+    #         ssc[h['_source']['location']] = h['_source']['weight']
+    #     # Debug
+    #     # print(ssc) 
+    #     # Get update time of food waste
+    #     ssc_timestamp = ssc_raw['hits']['hits'][0]['_source']['@timestamp']
+    #     ssc_dt = dp.parse(ssc_timestamp)
+    #     ssc_unix = int(ssc_dt.timestamp())
+    # except Exception as e:
+    #     warnings.warn(f"Failed to connect to HKUST ssc API\nRetrying in next loop...")
+    #     print(traceback.format_exc())
 
     # Compose embed using collected data
     embed_data = discord.Embed(
@@ -314,20 +327,30 @@ async def fetch_campus_data() -> None:
         timestamp=datetime.datetime.now()
     )
 
+    # Weather
+    weather_field = await get_weather_data()
+    embed_data.add_field(
+        name="🌦️ Weather",
+        value=weather_field,
+        inline=False
+    )
+
+
+
     # Bus queue
     bus_queue_field = "[Bus Stations Live View](http://liveview.ust.hk/busstop/)\n"
     bus_queue_field += f"```ansi\n"
     bus_queue_field += "🟥 KMB | 🟨 Citybus | 🟩 Minibus (inaccurate)\n"
     bus_queue_field += "* Scheduled departure, not real-time\n"
     bus_queue_field += "! Delayed\n\n"
-    # bus_queue_field += f"North ({bus_queue_length_north} in queue)\n"
-    bus_queue_field += f"North ({ppl_count['North Gate Bus Stop']} in queue)\n"  # Use people count instead
+    bus_queue_field += f"North ({ppl_count['North Gate Bus Stop']} in queue)\n"
+    # bus_queue_field += f"North ({bus_queue['north']} in queue)\n"  # Use people count instead
     bus_queue_field += f"{'🚍Route':<16}| ETA (mins)\n"
     for route, times in n_etas.items():
         bus_queue_field += f"{route:<16}| {', '.join(times)}\n"
     bus_queue_field += "\n"
-    # bus_queue_field += f"South ({bus_queue_length_south} in queue)\n"
-    bus_queue_field += f"South ({ppl_count['South Gate Bus Stop']} in queue)\n"  # Use people count instead
+    bus_queue_field += f"South ({ppl_count['South Gate Bus Stop']} in queue)\n"
+    # bus_queue_field += f"South ({bus_queue['south']} in queue)\n"  # Use people count instead
     bus_queue_field += f"{'🚍Route':<16}| ETA (mins)\n"
     for route, times in s_etas.items():
         bus_queue_field += f"{route:<16}| {', '.join(times)}\n"
@@ -338,6 +361,23 @@ async def fetch_campus_data() -> None:
         value=bus_queue_field,
         inline=False
     )
+
+
+    #Shuttle bus
+    try:
+        shuttle_bus_field = await load_or_fetch_shuttle_data()
+        embed_data.add_field(
+            name= "🚌 Shuttle Bus Schedule",
+            value= shuttle_bus_field,
+            inline= False
+        )
+
+        
+    except Exception as e:
+        print(f"Failed to load shuttle bus data: {str(e)}")
+        shuttle_bus_field = "```\nUnable to load shuttle bus schedule. Please check website.\n```"
+    
+
 
     # People count
     ppl_count_field = f"```\n"
@@ -351,17 +391,20 @@ async def fetch_campus_data() -> None:
         inline=False
     )
 
+
+
     # Food waste
     food_waste_field = f"```\n"
-    food_waste_field += f"{'Location':<25}| Weight (kg)\n"
-    for k, v in ssc.items():
-        food_waste_field += f"{k:<25}| {int(v)}\n"
-    food_waste_field += "\n"
+    # food_waste_field += f"{'Location':<25}| Weight (kg)\n"
+    # for k, v in ssc.items():
+    #     food_waste_field += f"{k:<25}| {int(v)}\n"
+    # food_waste_field += "\n"
     food_waste_field += f"🐷 Happypig375 reminder: If you don't finish your food, I will finish you!\n"
     food_waste_field += "```"
 
     embed_data.add_field(
-        name=f"🗑️ Food waste (updated <t:{ssc_unix}:R>)",
+        # name=f"🗑️ Food waste (updated <t:{ssc_unix}:R>)",
+        name=f"🗑️ Food waste",
         value=food_waste_field,
         inline=False
     )
@@ -420,8 +463,9 @@ else: # Discord bot (production environment)
                     await announce_channel.send(embed=await fetch_campus_data())
                 else:
                     await messages[0].edit(embed=await fetch_campus_data())
-            except:
+            except Exception as e:
                 warnings.warn("Failed to connect to announcement channel, retrying in next loop...")
+                print(traceback.format_exc())
                 return
             
             # now = datetime.now()

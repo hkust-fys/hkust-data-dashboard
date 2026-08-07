@@ -10,5 +10,13 @@ __pycache__/
 # Virtual environment
 .venv/
 
-# TEst file for python
+# Test files
 test.py
+.private/
+
+# Local agent instructions (private context)
+/AGENTS.md
+
+# Caches and generated runtime state
+/.cache/
+/bus_routes.json

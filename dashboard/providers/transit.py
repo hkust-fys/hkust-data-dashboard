@@ -1,0 +1,293 @@
+"""Transit ETA provider: KMB, Citybus, and GMB.
+
+Mappings are ordered immutable tuples; route order in the dashboard follows the
+order declared here. All functions take an injected ``HttpClient`` and are safe
+to call concurrently.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from typing import Any
+
+from dashboard.http import HttpClient
+from dashboard.models import EtaKind, EtaRow, Operator, RouteEtaGroup
+
+log = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------
+# Stop/route configuration (verified 2024-09-23, see private transport-mappings.md)
+# --------------------------------------------------------------------------
+
+KMB_STOPS: tuple[dict[str, str], ...] = (
+    {"gate": "S", "route": "91", "dest": "Diamond Hill", "stop": "B002CEF0DBC568F5"},
+    {"gate": "S", "route": "91M", "dest": "Diamond Hill", "stop": "B002CEF0DBC568F5"},
+    {"gate": "S", "route": "91P", "dest": "Choi Hung", "stop": "E9018F8A7E096544"},
+    {"gate": "S", "route": "291P", "dest": "Mong Kok", "stop": "E9018F8A7E096544"},
+    {"gate": "N", "route": "91", "dest": "Clear Water Bay", "stop": "3592A0182BF020C7"},
+    {"gate": "N", "route": "91M", "dest": "Po Lam", "stop": "B3E60EE895DBBF06"},
+)
+
+CTB_STOPS: tuple[dict[str, str], ...] = (
+    {"gate": "O", "route": "792M", "dest": "Sai Kung", "stop": "003130"},
+    {"gate": "I", "route": "792M", "dest": "TKO", "stop": "003130"},
+)
+
+# stop_id -> tuple of (route_no, destination, gate, route_id, seq)
+GMB_STOPS: dict[int, tuple[tuple[str, str, str, int, int], ...]] = {
+    20013010: (("11", "Choi Hung", "S", 2004791, 1),),
+    20012472: (("11", "Hang Hau", "N", 2004791, 2),),
+    20013011: (
+        ("11B", "Choi Hung", "S", 2004828, 1),  # directional variant: NOT 2004827
+        ("11S", "Choi Hung", "S", 2004826, 1),
+    ),
+    20012474: (
+        ("11M", "Hang Hau", "N", 2004825, 2),
+        ("11S", "Po Lam", "N", 2004826, 2),
+        ("12", "Po Lam", "N", 2004764, 1),
+        ("12", "Sai Kung", "N", 2004764, 2),
+    ),
+    20015226: (("104", "Kwun Tong", "S", 2007200, 1),),
+}
+
+KMB_BASE = "https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{stop}"
+CTB_BASE = "https://rt.data.gov.hk/v2/transport/citybus/eta/CTB/{stop}/{route}"
+GMB_BASE = "https://data.etagmb.gov.hk/eta/stop/{stop}"
+
+# ETA TTL is the provider cache window; the bot renders at its own cadence.
+TRANSIT_TTL_SECONDS = 25.0
+
+
+# --------------------------------------------------------------------------
+# Parsing helpers
+# --------------------------------------------------------------------------
+
+def _minutes_until(iso: str | None, now: datetime) -> int | None:
+    if not iso:
+        return None
+    try:
+        eta = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if eta.tzinfo is None:
+        eta = eta.replace(tzinfo=UTC)
+    diff = (eta - now).total_seconds() / 60
+    return max(0, round(diff))
+
+
+def _kmb_kind(rmk: str) -> EtaKind:
+    rmk = (rmk or "").lower()
+    if "scheduled" in rmk:
+        return EtaKind.SCHEDULED
+    if "moving slowly" in rmk or "moving slow" in rmk:
+        return EtaKind.MOVING_SLOWLY
+    if "delayed" in rmk:
+        return EtaKind.DELAYED
+    return EtaKind.REALTIME
+
+
+def _ctb_kind(rmk: str) -> EtaKind:
+    """Citybus exposes no scheduled/delay remarks; KMB-cycle entries are real."""
+    return EtaKind.REALTIME
+
+
+def _gmb_kind(remarks: str | None) -> EtaKind:
+    remarks = (remarks or "").lower()
+    if "scheduled" in remarks:
+        return EtaKind.SCHEDULED
+    if "delayed" in remarks:
+        return EtaKind.DELAYED
+    return EtaKind.REALTIME
+
+
+# --------------------------------------------------------------------------
+# Fetchers
+# --------------------------------------------------------------------------
+
+async def _fetch_kmb(client: HttpClient, now: datetime) -> list[EtaRow]:
+    rows: list[EtaRow] = []
+    for spec in KMB_STOPS:
+        data = await client.fetch_json(KMB_BASE.format(stop=spec["stop"]))
+        entries = (data or {}).get("data", []) or []
+        for entry in entries:
+            if entry.get("route") != spec["route"]:
+                continue
+            if entry.get("service_type", 1) != 1:
+                continue
+            eta_iso = entry.get("eta")
+            minutes = _minutes_until(eta_iso, now)
+            if minutes is None and eta_iso:
+                continue  # unparseable timestamp; skip rather than crash
+            rows.append(
+                EtaRow(
+                    route=spec["route"],
+                    destination=spec["dest"],
+                    gate=spec["gate"],
+                    operator=Operator.KMB,
+                    minutes=minutes,
+                    kind=_kmb_kind(entry.get("rmk_en") or ""),
+                    eta_time=_parse_iso(eta_iso),
+                    source_time=_parse_iso(entry.get("data_timestamp")),
+                )
+            )
+    return rows
+
+
+async def _fetch_citybus(client: HttpClient, now: datetime) -> list[EtaRow]:
+    rows: list[EtaRow] = []
+    for spec in CTB_STOPS:
+        data = await client.fetch_json(
+            CTB_BASE.format(stop=spec["stop"], route=spec["route"])
+        )
+        entries = (data or {}).get("data", []) or []
+        for entry in entries:
+            if entry.get("dir") != spec["gate"]:
+                continue
+            eta_iso = entry.get("eta")
+            if not eta_iso:
+                continue  # empty eta (e.g. KMB Cycle) -> no departure
+            minutes = _minutes_until(eta_iso, now)
+            if minutes is None:
+                continue
+            rows.append(
+                EtaRow(
+                    route=spec["route"],
+                    destination=spec["dest"],
+                    gate="N",  # both 792M directions load at North Gate
+                    operator=Operator.CITYBUS,
+                    minutes=minutes,
+                    kind=_ctb_kind(entry.get("rmk_en") or ""),
+                    eta_time=_parse_iso(eta_iso),
+                    source_time=_parse_iso(entry.get("data_timestamp")),
+                )
+            )
+    return rows
+
+
+async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
+    rows: list[EtaRow] = []
+    for stop_id, routes in GMB_STOPS.items():
+        data = await client.fetch_json(GMB_BASE.format(stop=stop_id))
+        entries = (data or {}).get("data", []) or []
+        # live schema (verified 2026-08-07):
+        #   {"route_id": 2004828, "route_seq": 1, "stop_seq": 1,
+        #    "enabled": true, "eta": [{"eta_seq":1, "diff":34,
+        #    "timestamp":"...", "remarks_en":"Scheduled"}]}
+        by_route: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for entry in entries:
+            if not entry.get("enabled", True):
+                continue
+            key = (entry.get("route_id"), entry.get("route_seq"))
+            by_route.setdefault(key, []).append(entry)
+        for route_no, dest, gate, route_id, seq in routes:
+            group = by_route.get((route_id, seq))
+            if not group:
+                continue
+            for entry in group:
+                eta_list = entry.get("eta") or []
+                for eta in eta_list:
+                    diff = eta.get("diff")
+                    try:
+                        minutes = int(diff) if diff is not None else None
+                    except (TypeError, ValueError):
+                        minutes = None
+                    rows.append(
+                        EtaRow(
+                            route=route_no,
+                            destination=dest,
+                            gate=gate,
+                            operator=Operator.GMB,
+                            minutes=minutes,
+                            kind=_gmb_kind(eta.get("remarks_en") or ""),
+                            eta_time=_parse_iso(eta.get("timestamp")),
+                            source_time=_parse_iso(
+                                (data or {}).get("generated_timestamp")
+                            ),
+                        )
+                    )
+    return rows
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Public API
+# --------------------------------------------------------------------------
+
+def _route_sort_key(route: str) -> tuple[int, str]:
+    """Order routes numerically (91 < 291P, 11 < 11B < 12 < 104) so the bus
+    stop list follows human intuition instead of string sorting."""
+    digits = "".join(ch for ch in route if ch.isdigit())
+    letters = "".join(ch for ch in route if not ch.isdigit())
+    return (int(digits) if digits else 9999, letters)
+
+
+def group_etas(rows: list[EtaRow]) -> list[RouteEtaGroup]:
+    """Group ETAs into a human-friendly order: North gate first, then South;
+    within each gate buses (KMB, Citybus) before minibuses, and routes ordered
+    numerically (91, 91M, 291P / 11, 11B, 12, 104) within each operator."""
+    operator_order = {Operator.KMB: 0, Operator.CITYBUS: 1, Operator.GMB: 2}
+
+    def sort_key(row: EtaRow) -> tuple:
+        return (
+            row.gate,  # N before S
+            operator_order[row.operator],  # buses before minibuses
+            _route_sort_key(row.route),
+            row.destination,
+        )
+
+    ordered = sorted(rows, key=sort_key)
+    groups: list[RouteEtaGroup] = []
+    current: RouteEtaGroup | None = None
+    for row in ordered:
+        if current is None or (current.route, current.destination, current.gate, current.operator) != (
+            row.route, row.destination, row.gate, row.operator
+        ):
+            current = RouteEtaGroup(
+                route=row.route,
+                destination=row.destination,
+                gate=row.gate,
+                operator=row.operator,
+            )
+            groups.append(current)
+        current.rows.append(row)
+    return groups
+
+
+async def fetch_transit_etas(client: HttpClient) -> tuple[list[RouteEtaGroup], datetime | None, list[str]]:
+    """Fetch all three operators concurrently and return grouped, ordered ETAs.
+
+    Returns (groups, latest_source_time, failed_operators). A single operator
+    failing does not discard the others; failed operator names are returned so
+    the renderer can surface an error.
+    """
+    now = datetime.now(UTC)
+    results = await client.gather_any(
+        [
+            _fetch_kmb(client, now),
+            _fetch_citybus(client, now),
+            _fetch_gmb(client, now),
+        ]
+    )
+    operator_names = ["KMB", "Citybus", "GMB"]
+    rows: list[EtaRow] = []
+    latest: datetime | None = None
+    failed: list[str] = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            log.warning("transit operator fetch failed: %s", result)
+            failed.append(operator_names[i])
+            continue
+        rows.extend(result)
+        for row in result:
+            if row.source_time and (latest is None or row.source_time > latest):
+                latest = row.source_time
+    return group_etas(rows), latest, failed

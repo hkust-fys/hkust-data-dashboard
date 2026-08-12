@@ -35,6 +35,10 @@ CTB_STOPS: tuple[dict[str, str], ...] = (
 )
 
 # stop_id -> tuple of (route_no, destination, gate, route_id, seq)
+# For CIRCULAR routes (e.g. 104), the same route appears at MULTIPLE
+# stop_seq along the loop; the far-end stop's ETAs are the bus RETURNING
+# to HKUST. We keep only the departure stop (the first stop_seq in the
+# route's stop sequence at this stop_id) so arrivals are never shown.
 GMB_STOPS: dict[int, tuple[tuple[str, str, str, int, int], ...]] = {
     20013010: (("11", "Choi Hung", "S", 2004791, 1),),
     20012472: (("11", "Hang Hau", "N", 2004791, 2),),
@@ -174,24 +178,43 @@ async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
         #   {"route_id": 2004828, "route_seq": 1, "stop_seq": 1,
         #    "enabled": true, "eta": [{"eta_seq":1, "diff":34,
         #    "timestamp":"...", "remarks_en":"Scheduled"}]}
-        by_route: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        by_route: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
         for entry in entries:
             if not entry.get("enabled", True):
                 continue
-            key = (entry.get("route_id"), entry.get("route_seq"))
+            key = (entry.get("route_id"), entry.get("route_seq"), entry.get("stop_seq"))
             by_route.setdefault(key, []).append(entry)
         for route_no, dest, gate, route_id, seq in routes:
-            group = by_route.get((route_id, seq))
-            if not group:
+            # For circular routes the same route/seq can appear at multiple
+            # stop_seq (the bus looping back). Keep only the FIRST stop_seq —
+            # the departure stop — so returning arrivals are never shown.
+            matching = [
+                (stop_seq, group)
+                for (rid, rseq, stop_seq), group in by_route.items()
+                if rid == route_id and rseq == seq
+            ]
+            if not matching:
                 continue
+            group = sorted(matching)[0][1]
             for entry in group:
                 eta_list = entry.get("eta") or []
+                # For CIRCULAR routes the ETA list may include both
+                # departures and the loop's return arrivals. ETAs are
+                # time-ordered; keep only the monotonically increasing prefix
+                # (a drop like 51 -> 46 is the bus coming back around, not a
+                # new departure).
+                last = -1
                 for eta in eta_list:
                     diff = eta.get("diff")
                     try:
                         minutes = int(diff) if diff is not None else None
                     except (TypeError, ValueError):
                         minutes = None
+                    if minutes is None:
+                        continue
+                    if minutes < last:
+                        continue  # loop return arrival — drop it
+                    last = minutes
                     rows.append(
                         EtaRow(
                             route=route_no,
@@ -204,6 +227,7 @@ async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
                             source_time=_parse_iso(
                                 (data or {}).get("generated_timestamp")
                             ),
+                            stop_seq=entry.get("stop_seq"),
                         )
                     )
     return rows
@@ -248,14 +272,17 @@ def group_etas(rows: list[EtaRow]) -> list[RouteEtaGroup]:
     groups: list[RouteEtaGroup] = []
     current: RouteEtaGroup | None = None
     for row in ordered:
-        if current is None or (current.route, current.destination, current.gate, current.operator) != (
-            row.route, row.destination, row.gate, row.operator
+        if current is None or (
+            current.route, current.destination, current.gate, current.operator, current.stop_seq
+        ) != (
+            row.route, row.destination, row.gate, row.operator, row.stop_seq
         ):
             current = RouteEtaGroup(
                 route=row.route,
                 destination=row.destination,
                 gate=row.gate,
                 operator=row.operator,
+                stop_seq=row.stop_seq,
             )
             groups.append(current)
         current.rows.append(row)

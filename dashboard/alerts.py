@@ -1,10 +1,10 @@
-"""Alert monitor: posts thread updates when weather warnings or traffic status
+"""Alert monitor: posts thread updates when weather warnings or TD notices
 change.
 
-Every meaningful change (a warning hoisted/removed, a corridor turning heavy or
-clearing) is posted to the dashboard thread. Critical changes — black rainstorm
-hoist/removal, typhoon signal 8+, heavy congestion appearing/disappearing —
-also ping the configured alert role.
+Every meaningful change (a warning hoisted/removed or a relevant TD traffic
+notice/roadwork appearing/clearing) is posted to the dashboard thread. Critical
+weather changes (black rainstorm hoist/removal and typhoon signal 8+) also ping
+the configured alert role.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from dashboard.models import SpeedBand, TrafficCorridorStatus, WeatherWarning
+from dashboard.models import Roadwork, TrafficCorridorStatus, TrafficIncident, WeatherWarning
 
 log = logging.getLogger(__name__)
 
@@ -69,17 +69,14 @@ def _family_of(code: str) -> str:
     return code
 
 
-# Speed below which a corridor counts as "heavy congestion" (dashboard
-# heuristic matching the RED band).
-HEAVY_SPEED_KMH = 20.0
-
-
 @dataclass
 class AlertState:
     """Last-known signal state, used to detect transitions."""
 
     warning_codes: frozenset[str] = frozenset()
-    heavy_corridors: frozenset[str] = frozenset()
+    traffic_incidents: frozenset[str] = frozenset()
+    roadworks: frozenset[str] = frozenset()
+    roadwork_labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -136,34 +133,63 @@ class AlertMonitor:
             )
         return events
 
-    def _traffic_events(
-        self, statuses: list[TrafficCorridorStatus], now: datetime
+    def _incident_events(
+        self, incidents: list[TrafficIncident], now: datetime
     ) -> list[AlertEvent]:
-        heavy = frozenset(
-            st.name
-            for st in statuses
-            if any(
-                o.band == SpeedBand.RED
-                or (o.speed_kmh is not None and o.speed_kmh < HEAVY_SPEED_KMH)
-                for o in st.observations
-            )
-        )
-        old_heavy = self.state.heavy_corridors
+        current = frozenset(incident.identifier or incident.title for incident in incidents)
         events: list[AlertEvent] = []
-        for corridor in sorted(heavy - old_heavy):
+        for incident in incidents:
+            key = incident.identifier or incident.title
+            if key not in self.state.traffic_incidents:
+                road = incident.road or incident.location
+                suffix = f" — {road}" if road else ""
+                events.append(
+                    AlertEvent(
+                        text=f"📢 **{incident.title}**{suffix} "
+                        f"(<t:{int(now.timestamp())}:t>)"
+                    )
+                )
+        for key in sorted(self.state.traffic_incidents - current):
             events.append(
                 AlertEvent(
-                    text=f"🚦 **{corridor}** heavy congestion "
-                         f"(<t:{int(now.timestamp())}:t>)",
-                    critical=True,
+                    text=f"✅ TD traffic notice cleared: **{key}** "
+                    f"(<t:{int(now.timestamp())}:t>)"
                 )
             )
-        for corridor in sorted(old_heavy - heavy):
+        return events
+
+    @staticmethod
+    def _roadwork_key(roadwork: Roadwork) -> str:
+        return roadwork.identifier or f"{roadwork.road}:{roadwork.description}"
+
+    @staticmethod
+    def _roadwork_label(roadwork: Roadwork) -> str:
+        return roadwork.description or roadwork.road or roadwork.identifier
+
+    def _roadwork_events(
+        self, roadworks: list[Roadwork], now: datetime
+    ) -> list[AlertEvent]:
+        current = {self._roadwork_key(item): item for item in roadworks}
+        events: list[AlertEvent] = []
+        for key in sorted(current.keys() - self.state.roadworks):
+            roadwork = current[key]
+            suffix = (
+                f" — {roadwork.road}"
+                if roadwork.road and roadwork.road not in roadwork.description
+                else ""
+            )
             events.append(
                 AlertEvent(
-                    text=f"✅ **{corridor}** congestion cleared "
-                         f"(<t:{int(now.timestamp())}:t>)",
-                    critical=True,
+                    text=f"🚧 **TD roadworks:** {roadwork.description}{suffix} "
+                    f"(<t:{int(now.timestamp())}:t>)"
+                )
+            )
+        for key in sorted(self.state.roadworks - current.keys()):
+            label = self.state.roadwork_labels.get(key, key)
+            events.append(
+                AlertEvent(
+                    text=f"✅ TD roadworks cleared: **{label}** "
+                    f"(<t:{int(now.timestamp())}:t>)"
                 )
             )
         return events
@@ -172,6 +198,8 @@ class AlertMonitor:
         self,
         warnings: list[WeatherWarning],
         statuses: list[TrafficCorridorStatus],
+        incidents: list[TrafficIncident] | None = None,
+        roadworks: list[Roadwork] | None = None,
         now: datetime | None = None,
     ) -> list[AlertEvent]:
         """Feed the latest state; returns the events for this tick.
@@ -179,19 +207,24 @@ class AlertMonitor:
         The first call only seeds the state (no flood of events on startup).
         """
         now = now or datetime.now(UTC)
-        events = self._warning_events(warnings, now) + self._traffic_events(
-            statuses, now
+        current_incidents = incidents or []
+        current_roadworks = roadworks or []
+        events = (
+            self._warning_events(warnings, now)
+            + self._incident_events(current_incidents, now)
+            + self._roadwork_events(current_roadworks, now)
         )
         self.state.warning_codes = frozenset(w.code for w in warnings)
-        self.state.heavy_corridors = frozenset(
-            st.name
-            for st in statuses
-            if any(
-                o.band == SpeedBand.RED
-                or (o.speed_kmh is not None and o.speed_kmh < HEAVY_SPEED_KMH)
-                for o in st.observations
-            )
+        self.state.traffic_incidents = frozenset(
+            incident.identifier or incident.title for incident in current_incidents
         )
+        self.state.roadworks = frozenset(
+            self._roadwork_key(roadwork) for roadwork in current_roadworks
+        )
+        self.state.roadwork_labels = {
+            self._roadwork_key(roadwork): self._roadwork_label(roadwork)
+            for roadwork in current_roadworks
+        }
         if not self._initialized:
             self._initialized = True
             return []

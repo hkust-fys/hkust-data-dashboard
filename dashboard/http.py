@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -174,6 +175,56 @@ class HttpClient:
 
     # -- cached fetch with stale-on-error ------------------------------------
 
+    async def _fetch_cached(
+        self,
+        spec: CachedFetch,
+        fetcher: Callable[[str], Awaitable[Any]],
+        **url_kwargs: Any,
+    ) -> tuple[bool, Any, float]:
+        """Cache any typed fetcher while retaining an expired value on error."""
+        key = spec.key(**url_kwargs)
+        hit, value = self.cache.get(key, spec.ttl)
+        if hit:
+            return False, value, self.cache._store[key].fetched_at  # noqa: SLF001
+        try:
+            value = await fetcher(spec.url.format(**url_kwargs))
+        except FetchError as exc:
+            old_hit, old = self.cache.get(key, ttl=float("inf"))
+            if old_hit:
+                log.warning("stale-on-error for %s: %s", key, exc)
+                return True, old, self.cache._store[key].fetched_at  # noqa: SLF001
+            raise
+        self.cache.set(key, value)
+        return False, value, self.cache._store[key].fetched_at
+
+    async def fetch_text_cached(
+        self,
+        spec: CachedFetch,
+        headers: dict[str, str] | None = None,
+        max_bytes: int = MAX_BYTES_TEXT,
+        **url_kwargs: Any,
+    ) -> tuple[bool, str, float]:
+        """Cached UTF-8 text with stale-on-error fallback."""
+        return await self._fetch_cached(
+            spec,
+            lambda url: self.fetch_text(url, headers, max_bytes),
+            **url_kwargs,
+        )
+
+    async def fetch_xml_text_cached(
+        self,
+        spec: CachedFetch,
+        headers: dict[str, str] | None = None,
+        max_bytes: int = MAX_BYTES_TEXT,
+        **url_kwargs: Any,
+    ) -> tuple[bool, str, float]:
+        """Cached XML text, preserving the existing lightweight validation."""
+        return await self._fetch_cached(
+            spec,
+            lambda url: self.fetch_xml_text(url, headers, max_bytes),
+            **url_kwargs,
+        )
+
     async def fetch_json_cached(
         self,
         spec: CachedFetch,
@@ -186,20 +237,11 @@ class HttpClient:
         On a cache miss, fetch; if the fetch fails and a previous value exists,
         return it marked stale: (True, value, previous_fetched_at).
         """
-        key = spec.key(**url_kwargs)
-        hit, value = self.cache.get(key, spec.ttl)
-        if hit:
-            return False, value, self.cache._store[key].fetched_at  # noqa: SLF001
-        try:
-            value = await self.fetch_json(spec.url.format(**url_kwargs), headers)
-        except FetchError as exc:
-            old_hit, old = self.cache.get(key, ttl=float("inf"))
-            if old_hit:
-                log.warning("stale-on-error for %s: %s", key, exc)
-                return True, old, self.cache._store[key].fetched_at  # noqa: SLF001
-            raise
-        self.cache.set(key, value)
-        return False, value, self.cache._store[key].fetched_at
+        return await self._fetch_cached(
+            spec,
+            lambda url: self.fetch_json(url, headers),
+            **url_kwargs,
+        )
 
     def utcnow(self) -> datetime:
         return datetime.now(UTC)

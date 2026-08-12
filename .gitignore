@@ -1,5 +1,16 @@
-# ignore pycache
+# Python bytecode and tool caches
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Build and package metadata
+*.egg-info/
+build/
+dist/
 
 # ignore environment file
 .env
@@ -10,8 +21,6 @@ __pycache__/
 # Virtual environment
 .venv/
 
-# Test files
-test.py
 .private/
 
 # Local agent instructions (private context)
@@ -19,4 +28,3 @@ test.py
 
 # Caches and generated runtime state
 /.cache/
-/bus_routes.json

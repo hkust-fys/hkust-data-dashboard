@@ -16,8 +16,8 @@ from dashboard.models import (
     EtaKind,
     ImageAsset,
     Operator,
+    Roadwork,
     RouteEtaGroup,
-    SpeedBand,
     TrafficCorridorStatus,
     TrafficIncident,
     WeatherConditions,
@@ -29,16 +29,6 @@ DESC_MAX = 4096
 FIELDS_PER_EMBED_MAX = 25
 CHARS_PER_EMBED_MAX = 6000
 EMBEDS_PER_MESSAGE_MAX = 10
-
-DASHBOARD_MARKER = "HKUST Campus Dashboard"
-DASHBOARD_FOOTER = "hkust-data-dashboard · updated"
-
-RESOURCE_LINE = (
-    "[HKUST shuttle](https://cso.ust.hk/tran/stud_sh_b) · "
-    "[Bus stops live](http://liveview.ust.hk/busstop/) · "
-    "[HKO warnings](https://www.hko.gov.hk/en/wxinfo/currwx/warning.htm) · "
-    "[HKeMobility](https://www.hkemobility.gov.hk/)"
-)
 
 _OPERATOR_ICON = {
     Operator.KMB: "🟥",
@@ -59,7 +49,7 @@ def _esc(text: str) -> str:
     return text.translate(_MD_ESCAPE)
 
 
-def _fmt_timestamp(dt: datetime | None, fmt: str = "%H:%M") -> str:
+def _fmt_timestamp(dt: datetime | None, fmt: str = "t") -> str:
     """Discord timestamp that renders in each viewer's local timezone.
 
     `style` is a Discord timestamp letter: t = HH:MM, f = full date + time,
@@ -72,6 +62,20 @@ def _fmt_timestamp(dt: datetime | None, fmt: str = "%H:%M") -> str:
     return f"<t:{int(dt.timestamp())}:{fmt}>"
 
 
+def _set_source_timestamp(
+    embed: discord.Embed,
+    label: str,
+    source_time: datetime | None,
+) -> discord.Embed:
+    """Apply the same native timestamp/footer treatment to every data pane."""
+    embed.set_footer(text=label)
+    if source_time is not None:
+        if source_time.tzinfo is None:
+            source_time = source_time.replace(tzinfo=UTC)
+        embed.timestamp = source_time
+    return embed
+
+
 def _discord_rel(ts: datetime | None) -> str:
     """Relative Discord timestamp (renders as "2 hours ago" per viewer)."""
     if ts is None:
@@ -82,43 +86,55 @@ def _discord_rel(ts: datetime | None) -> str:
 
 
 def _eta_cell(row_minutes: int | None, kind: EtaKind) -> str:
-    """ETA cell for use inside a code block.
+    """ETA cell for use inside a code block: number (2 chars) + symbol (1).
 
     Code blocks render everything literally (Discord has no table element, and
     markdown — including **bold** and *emphasis* — is not parsed inside them),
     so the markers are plain text: * = scheduled, ! = moving slowly,
-    ‼ = delayed. There is no ≤5-min marker: without bold it would just be
-    noise, and the minutes themselves are already the clearest signal.
+    ‼ = delayed. The number is LEFT-padded to 2 chars (right-aligned) and the
+    marker sits in the 3rd char (`` 6*``, ``25 ``). ETAs of 100+ minutes cap
+    at ``99+`` — nothing larger than 99 is ever shown.
     """
     if row_minutes is None:
-        return "—"
-    cell = str(row_minutes)
+        return "  —"
+    if row_minutes >= 100:
+        return "99+"
+    cell = str(row_minutes).rjust(2)
     if kind == EtaKind.SCHEDULED:
         cell += "*"
     elif kind == EtaKind.DELAYED:
         cell += "‼"
     elif kind == EtaKind.MOVING_SLOWLY:
         cell += "!"
+    else:
+        cell += " "
     return cell
 
 
-def _route_line(group: RouteEtaGroup) -> str:
+def _route_line(group: RouteEtaGroup, dest_width: int) -> str:
     """Route row for a code block: color box + route + destination + ETA column.
 
-    The color emoji (🟥/🟨/🟩) is a single-width character, so within the
-    fixed-width code block every row lines up the same way. No markdown
-    escaping is needed — code blocks render literally.
+    ``dest_width`` is the widest destination in the block (e.g. "Clear Water
+    Bay" = 15), so every row's ETA column aligns. The color emoji (🟥/🟨/🟩)
+    is a single-width character, so within the fixed-width code block every
+    row lines up the same way. No markdown escaping is needed — code blocks
+    render literally.
     """
     icon = _OPERATOR_ICON.get(group.operator, "⬜")
-    cells = ", ".join(_eta_cell(r.minutes, r.kind) for r in group.rows)
-    return f"{icon}{group.route:<6} {group.destination:<14} {cells}"
+    cells = " ".join(_eta_cell(r.minutes, r.kind) for r in group.rows)
+    return f"{icon}{group.route:<6} {group.destination:<{dest_width}} {cells}"
 
 
 def _gate_block(gate_routes: list[RouteEtaGroup]) -> str:
-    """Code block with a fixed header and column-aligned ETA rows."""
-    rows = ["```", f"{'Route':<21}ETA (mins)", "-" * 30]
+    """Code block with column-aligned ETA rows (no header row).
+
+    The destination column width is the longest destination in the block, so
+    the ETA column aligns even with names like "Clear Water Bay" (15 chars).
+    """
+    dest_width = max((len(g.destination) for g in gate_routes), default=14)
+    rows = ["```"]
     for group in gate_routes:
-        rows.append(_route_line(group))
+        rows.append(_route_line(group, dest_width))
     rows.append("```")
     return "\n".join(rows)
 
@@ -149,50 +165,46 @@ def _build_weather_embed(weather: WeatherConditions | None) -> discord.Embed | N
         elif icons:
             lines.append(" ".join(f"[!]({u})" for u in icons))
         for w in warnings:
-            line = f"**{_esc(w.name)}**"
+            line = _esc(w.name)
             if w.summary:
                 line += f" — {_esc(w.summary)}"
+            if w.issued_at:
+                line += f" · issued {_fmt_timestamp(w.issued_at, 't')}"
             lines.append(line)
-        if weather.warning_time:
-            lines.append(f"_Issued {_discord_rel(weather.warning_time)}_")
+
+    # title = the observation reading (🌡️ temp · 🌧️ rain · 💧 humidity)
+    title_parts: list[str] = []
     if snap:
-        parts = []
         if snap.temperature_c is not None:
-            parts.append(f"🌡️ {snap.temperature_c:.0f}°C")
+            title_parts.append(f"🌡️ {snap.temperature_c:.0f}°C")
         if snap.rainfall_mm is not None:
-            parts.append(f"🌧️ {snap.rainfall_mm:.1f}mm")
+            title_parts.append(f"🌧️ {snap.rainfall_mm:.1f}mm")
         if snap.humidity_pct is not None:
-            parts.append(f"💧 {snap.humidity_pct}% humidity")
-        if parts:
-            lines.append(" · ".join(parts))
-        lines.append(f"_Sai Kung station, HKO {_fmt_timestamp(snap.source_time, 't')}_")
-    elif not warnings:
+            title_parts.append(f"💧 {snap.humidity_pct}%")
+    title = " · ".join(title_parts) if title_parts else "🌦️ Weather"
+
+    if not lines and not title_parts:
         return None  # nothing to show
 
-    if not lines:
-        return None
+    lines.append("🔗 [HKO warnings](https://www.hko.gov.hk/en/wxinfo/currwx/warning.htm)")
     value = "\n".join(lines)
-    if len(value) > FIELD_VALUE_MAX:
-        value = value[: FIELD_VALUE_MAX - 1] + "…"
-    embed = _embed("🌦️ Weather", value, inline=False)
+    if len(value) > DESC_MAX:
+        value = value[: DESC_MAX - 1] + "…"
+    embed = discord.Embed(color=0xE0AF68, title=title, description=value)
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
-    embed.add_field(
-        name="🔗",
-        value="[HKO warnings](https://www.hko.gov.hk/en/wxinfo/currwx/warning.htm)",
-        inline=False,
-    )
-    return embed
+    source_time = snap.source_time if snap and snap.source_time else weather.warning_time
+    return _set_source_timestamp(embed, "HKO", source_time)
 
 
-def _build_transit_embed(groups: list[RouteEtaGroup]) -> discord.Embed | None:
+def _build_transit_embed(
+    groups: list[RouteEtaGroup],
+    source_time: datetime | None = None,
+) -> discord.Embed | None:
     if not groups:
         return None
-    lines: list[str] = []
+    lines = ["🟥 KMB · 🟨 Citybus · 🟩 Minibus (non-realtime) · * scheduled · ! slow · ‼ delayed"]
     visible = [g for g in groups if _has_departures(g)]
-    lines.append("🟥 KMB · 🟨 Citybus · 🟩 Minibus (non-realtime)")
-    # legend written so it does not start with a markdown bullet character
-    lines.append("scheduled = * · moving slowly = ! · delayed = ‼")
     if visible:
         # separate by gate with explicit headers, matching the original mockup
         for gate, label in (("N", "⬆ North Gate"), ("S", "⬇ South Gate")):
@@ -203,82 +215,109 @@ def _build_transit_embed(groups: list[RouteEtaGroup]) -> discord.Embed | None:
             lines.append(_gate_block(gate_routes))
     else:
         lines.append("No departures at this time")
+    lines.append(
+        "🔗 [HKUST shuttle](https://cso.ust.hk/tran/stud_sh_b) · "
+        "[Bus stops live](http://liveview.ust.hk/busstop/)"
+    )
 
     value = "\n".join(lines)
-    if len(value) > FIELD_VALUE_MAX:
-        # Split into two fields if needed.
-        truncated = value[: FIELD_VALUE_MAX - 1] + "…"
-        return _embed("🚌 Bus stops", truncated, inline=False)
-
-    embed = _embed("🚌 Bus stops", value, inline=False)
-    embed.add_field(
-        name="🔗",
-        value="[HKUST shuttle](https://cso.ust.hk/tran/stud_sh_b) · "
-              "[Bus stops live](http://liveview.ust.hk/busstop/)",
-        inline=False,
-    )
-    return embed
-
-
-def _traffic_summary(statuses: list[TrafficCorridorStatus]) -> str | None:
-    """Compact one-liner for the map embed description.
-
-    The map itself shows every detector; this just flags corridors that are
-    moving slowly or congested so the important info is visible at a glance.
-    """
-    flags = []
-    for status in statuses:
-        bands = {o.band for o in status.observations}
-        if SpeedBand.RED in bands:
-            flags.append(f"🔴 {_esc(status.name)} slow")
-        elif SpeedBand.AMBER in bands:
-            flags.append(f"🟠 {_esc(status.name)} heavy")
-    if not flags:
-        return None
-    return " · ".join(flags[:3])
+    if len(value) > DESC_MAX:
+        value = value[: DESC_MAX - 1] + "…"
+    embed = discord.Embed(color=0xE0AF68, title="🚌 Bus stops", description=value)
+    return _set_source_timestamp(embed, "KMB · Citybus · GMB", source_time)
 
 
 def _build_traffic_map_embed(
     png: bytes,
-    statuses: list[TrafficCorridorStatus] | None = None,
-    incidents: list[TrafficIncident] | None = None,
-    capture_time: datetime | None = None,
+    source_time: datetime | None = None,
 ) -> discord.Embed | None:
+    """Render the Google Maps base screenshot as an image pane."""
     if not png:
         return None
-    lines = []
-    summary = _traffic_summary(statuses or [])
-    if summary:
-        lines.append(summary)
-    for inc in (incidents or [])[:2]:
-        lines.append(f"⚠️ **{_esc(inc.title)}**")
-    if capture_time:
-        lines.append(f"_TD detectors {_fmt_timestamp(capture_time, 't')}_")
-    if not lines:
-        lines.append("_Detector speeds at monitored points; gray = no fresh observation_")
+    description = "[Open territory-wide view in HKeMobility](https://www.hkemobility.gov.hk/)"
     embed = discord.Embed(
         title="🗺️ Traffic map — HKUST approaches",
         color=0x2563EB,
-        description="\n".join(lines),
+        description=description,
     )
     embed.set_image(url="attachment://traffic-map.png")
-    embed.add_field(
-        name="🔗",
-        value="[HKeMobility](https://www.hkemobility.gov.hk/) — territory-wide live map",
-        inline=False,
+    return _set_source_timestamp(embed, "Google traffic", source_time)
+
+
+def _delay_text(delay_min: float) -> str:
+    if delay_min < 1:
+        return "<1 min"
+    rounded = round(delay_min)
+    return f"{rounded} min" if abs(delay_min - rounded) < 0.05 else f"{delay_min:.1f} min"
+
+
+def _build_traffic_summary_embed(
+    statuses: list[TrafficCorridorStatus] | None,
+    incidents: list[TrafficIncident] | None,
+    source_time: datetime | None,
+    roadworks: list[Roadwork] | None = None,
+    stale_sources: list[str] | None = None,
+    td_source_time: datetime | None = None,
+    traffic_source_times: dict[str, datetime] | None = None,
+) -> discord.Embed:
+    """List matched TD traffic-news and relevant roadwork evidence.
+
+    Detector statuses and their timestamps remain accepted for compatibility,
+    but are intentionally omitted from the user-facing summary.
+    """
+    lines: list[str] = []
+    evidence_times: list[str] = []
+    displayed_source_times: list[datetime] = []
+    td_times = traffic_source_times or {}
+    if incidents:
+        news_time = td_times.get("traffic_news") or td_source_time
+        evidence_times.append(f"TD traffic news {_fmt_timestamp(news_time, 't')}")
+        if news_time is not None:
+            displayed_source_times.append(news_time)
+    if roadworks:
+        roadworks_time = td_times.get("roadworks")
+        evidence_times.append(f"TD roadworks {_fmt_timestamp(roadworks_time, 't')}")
+        if roadworks_time is not None:
+            displayed_source_times.append(roadworks_time)
+    if evidence_times:
+        lines.append(" · ".join(evidence_times))
+    if stale_sources:
+        lines.append("⚠️ Stale source cache: " + ", ".join(_esc(name) for name in stale_sources))
+    notices = list(incidents or [])
+    if notices:
+        lines.append("\n**Active traffic notices**")
+        lines.extend(f"• {_esc(incident.title)}" for incident in notices)
+
+    works = list(roadworks or [])
+    if works:
+        lines.append("\n**Relevant roadworks**")
+        lines.extend(f"• {_esc(work.description)}" for work in works)
+
+    description = "\n".join(lines)
+    if len(description) > DESC_MAX:
+        description = description[: DESC_MAX - 1] + "…"
+    embed = discord.Embed(
+        title="🚦 Traffic summary",
+        color=0xF59E0B if notices or works else 0x16A34A,
+        description=description,
     )
-    return embed
+    normalized_times = [
+        time.replace(tzinfo=UTC) if time.tzinfo is None else time.astimezone(UTC)
+        for time in displayed_source_times
+    ]
+    footer_time = max(normalized_times, default=None)
+    return _set_source_timestamp(embed, "Traffic summary (latest)", footer_time)
 
 
-def _build_cctv_embeds(images: list[ImageAsset]) -> list[discord.Embed]:
+def _build_camera_embeds(images: list[ImageAsset]) -> list[discord.Embed]:
     embeds = []
     for asset in images:
         embed = discord.Embed(title=f"📷 {asset.label}", color=0x0F766E)
         embed.set_image(url=f"attachment://{asset.filename}")
         if asset.source_time:
-            # embed.timestamp is the native auto-localizing timestamp field;
-            # <t:...> markdown does NOT parse inside footer text.
-            embed.timestamp = asset.source_time
+            _set_source_timestamp(embed, "HKUST live view", asset.source_time)
+        else:
+            _set_source_timestamp(embed, "HKUST live view", None)
         embeds.append(embed)
     return embeds
 
@@ -293,14 +332,19 @@ def _embed(name: str, value: str, inline: bool = False) -> discord.Embed:
 # Public
 # --------------------------------------------------------------------------
 
-def _build_error_embed(errors: list[str]) -> discord.Embed | None:
+def _build_error_embed(
+    errors: list[str], source_time: datetime | None = None
+) -> discord.Embed | None:
     """Show unavailable providers visibly instead of silently dropping them."""
     if not errors:
         return None
     value = "\n".join(f"⚠️ {_esc(e)}" for e in errors[:10])
     if len(value) > FIELD_VALUE_MAX:
         value = value[: FIELD_VALUE_MAX - 1] + "…"
-    return _embed("⚠️ Source status", value, inline=False)
+    embed = _embed("⚠️ Source status", value, inline=False)
+    return _set_source_timestamp(
+        embed, "Dashboard check", source_time or datetime.now(UTC)
+    )
 
 
 def build_payload(
@@ -310,33 +354,37 @@ def build_payload(
     incidents: list[TrafficIncident],
     capture_time: datetime | None,
     traffic_map_png: bytes | None,
-    cctv_images: list[ImageAsset],
+    transit_source_time: datetime | None = None,
+    map_source_time: datetime | None = None,
+    roadworks: list[Roadwork] | None = None,
+    traffic_stale_sources: list[str] | None = None,
+    traffic_source_times: dict[str, datetime] | None = None,
+    traffic_source_time: datetime | None = None,
+    bus_stop_images: list[ImageAsset] | None = None,
     errors: list[str] | None = None,
     now: datetime | None = None,
 ) -> DashboardPayload:
     """Compose the dashboard payload, enforcing every Discord limit.
 
-    Embed order follows Discord reading flow: users scroll bottom-up, so the
-    most important/actionable pane (bus stops) is placed last (bottom), and
-    the least important (CCTV) comes first (top).
+    Embed order follows the user's reading flow: cameras → map → traffic →
+    weather → bus ETA (bottom, most actionable).
     """
-    payload = DashboardPayload(footer_text=DASHBOARD_FOOTER)
+    payload = DashboardPayload()
+    checked_at = now or datetime.now(UTC)
 
-    # 1. CCTV (least important — nice-to-have point views)
-    cctv_embeds = _build_cctv_embeds(cctv_images)
-    for embed, asset in zip(cctv_embeds, cctv_images, strict=True):
+    # 1. HKUST bus-stop live cameras (North/South Gate HLS).
+    live_images = bus_stop_images or []
+    live_embeds = _build_camera_embeds(live_images)
+    for embed, asset in zip(live_embeds, live_images, strict=True):
         payload.embeds.append(embed)
         payload.files.append(asset)
 
-    # 2. Source errors — visible so an unavailable provider is never silent.
-    error_embed = _build_error_embed(errors or [])
-    if error_embed is not None:
-        payload.embeds.append(error_embed)
-
-    # 3. Traffic map — the map embed carries the summary, incidents, capture
-    #    time and HKeMobility link, so no separate text pane is needed.
+    # 2. Image-first traffic map.
     if traffic_map_png:
-        map_embed = _build_traffic_map_embed(traffic_map_png, statuses, incidents, capture_time)
+        map_embed = _build_traffic_map_embed(
+            traffic_map_png,
+            map_source_time or checked_at,
+        )
         if map_embed is not None:
             payload.embeds.append(map_embed)
             payload.files.append(
@@ -345,17 +393,36 @@ def build_payload(
                     data=traffic_map_png,
                     content_type="image/png",
                     label="Traffic map",
+                    source_time=map_source_time,
                 )
             )
+
+    # 3. Traffic text is a separate pane so the map remains legible.
+    payload.embeds.append(
+        _build_traffic_summary_embed(
+            statuses=statuses,
+            incidents=incidents,
+            source_time=map_source_time,
+            roadworks=roadworks,
+            stale_sources=traffic_stale_sources,
+            td_source_time=traffic_source_time or capture_time,
+            traffic_source_times=traffic_source_times,
+        )
+    )
 
     # 4. Weather
     weather_embed = _build_weather_embed(weather)
     if weather_embed is not None:
         payload.embeds.append(weather_embed)
 
-    # 5. Transit — most important, so it sits at the bottom where Discord
-    #    users' eyes land.
-    transit_embed = _build_transit_embed(groups)
+    # 5. Source errors — visible so an unavailable provider is never silent.
+    error_embed = _build_error_embed(errors or [], checked_at)
+    if error_embed is not None:
+        payload.embeds.append(error_embed)
+
+    # 6. Bus ETA — most actionable, sits at the bottom where Discord users'
+    #    eyes land.
+    transit_embed = _build_transit_embed(groups, transit_source_time)
     if transit_embed is not None:
         payload.embeds.append(transit_embed)
 
@@ -373,8 +440,9 @@ def finalize_embed(
 ) -> discord.Embed:
     """Trim an embed's fields to hard limits (used for safety in tests)."""
     if len(embed.fields) > max_fields:
+        fields = list(embed.fields[:max_fields])
         embed.clear_fields()
-        for f in embed.fields[:max_fields]:
+        for f in fields:
             embed.add_field(name=f.name, value=f.value, inline=f.inline)
     total = sum(len(f.value) for f in embed.fields) + len(embed.description or "")
     if total > max_chars:

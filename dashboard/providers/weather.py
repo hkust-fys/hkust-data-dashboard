@@ -199,6 +199,12 @@ def parse_warnings(
         info = info_map.get(code, {})
         summary = info.get("summary") or ""
         action = info.get("action") or ""
+        # issue time comes from warnsum's issueDateTime / updateTime
+        issued = None
+        for key in ("issueDateTime", "updateTime", "issueTime"):
+            issued = as_datetime(payload.get(key))
+            if issued:
+                break
         active.append(
             WeatherWarning(
                 code=code,
@@ -206,6 +212,7 @@ def parse_warnings(
                 summary=summary if isinstance(summary, str) else "",
                 action=action if isinstance(action, str) else "",
                 icon_url=_warning_icon_url(code, icon_map),
+                issued_at=issued,
             )
         )
         raw_codes.add(code)
@@ -216,6 +223,7 @@ def parse_warnings(
         if code in raw_codes:
             continue
         name = WARNING_NAMES.get(code, code)
+        issued = as_datetime(payload.get("issueTime")) or as_datetime(payload.get("updateTime"))
         active.append(
             WeatherWarning(
                 code=code,
@@ -223,6 +231,7 @@ def parse_warnings(
                 summary=(payload.get("summary") or ""),
                 action=(payload.get("action") or ""),
                 icon_url=_warning_icon_url(code, icon_map),
+                issued_at=issued,
             )
         )
 

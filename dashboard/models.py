@@ -77,6 +77,7 @@ class EtaRow:
     kind: EtaKind = EtaKind.REALTIME
     eta_time: datetime | None = None
     source_time: datetime | None = None
+    stop_seq: int | None = None  # GMB loop stop index; None for KMB/Citybus
 
 
 @dataclass
@@ -88,6 +89,7 @@ class RouteEtaGroup:
     gate: str
     operator: Operator
     rows: list[EtaRow] = field(default_factory=list)
+    stop_seq: int | None = None  # GMB loop stop index; None for KMB/Citybus
 
 
 # --------------------------------------------------------------------------
@@ -115,6 +117,7 @@ class WeatherWarning:
     summary: str = ""
     action: str = ""
     icon_url: str = ""
+    issued_at: datetime | None = None
 
 
 @dataclass
@@ -211,10 +214,18 @@ class ImageAsset:
 
 
 @dataclass
+class CameraFrame:
+    """A decoded live-view frame before renderer attachment naming."""
+
+    data: bytes
+    label: str
+    source_time: datetime
+
+
+@dataclass
 class DashboardPayload:
     """Complete dashboard: ordered embeds plus attachments."""
 
     embeds: list[object] = field(default_factory=list)  # list[discord.Embed]
     files: list[ImageAsset] = field(default_factory=list)
-    footer_text: str = ""
     created_at: datetime = field(default_factory=datetime.now)

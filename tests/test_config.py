@@ -5,6 +5,11 @@ import pytest
 from dashboard.config import ConfigError, Settings
 
 
+@pytest.fixture(autouse=True)
+def _google_maps_key(monkeypatch):
+    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "test-maps-key")
+
+
 def test_settings_from_env_valid(monkeypatch):
     monkeypatch.setenv("DISCORD_TOKEN", "abc")
     monkeypatch.setenv("ANNOUNCE_CHANNEL_ID", "12345")
@@ -19,6 +24,7 @@ def test_settings_from_env_valid(monkeypatch):
 def test_settings_missing_required_keys(monkeypatch):
     monkeypatch.delenv("DISCORD_TOKEN", raising=False)
     monkeypatch.delenv("ANNOUNCE_CHANNEL_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
     with pytest.raises(ConfigError):
         Settings.from_env(require_keys=True)
 

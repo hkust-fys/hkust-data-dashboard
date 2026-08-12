@@ -6,7 +6,14 @@ from dashboard.alerts import (
     _family_of,
     _warning_name,
 )
-from dashboard.models import SpeedBand, TrafficCorridorStatus, TrafficObservation, WeatherWarning
+from dashboard.models import (
+    Roadwork,
+    SpeedBand,
+    TrafficCorridorStatus,
+    TrafficIncident,
+    TrafficObservation,
+    WeatherWarning,
+)
 from tests.fixtures import sample_data as s
 
 
@@ -87,19 +94,67 @@ def test_cancel_posts_event():
     assert events[0].critical  # black rainstorm removal also pings
 
 
-def test_heavy_congestion_appears_and_clears():
+def test_detector_congestion_does_not_post_thread_events():
     mon = AlertMonitor()
     mon.update([], [])
     slow = _status("Clear Water Bay Road", SpeedBand.RED, speed=10)
-    events = mon.update([], [slow])
-    assert len(events) == 1
-    assert events[0].critical
-    assert "heavy congestion" in events[0].text
+    assert mon.update([], [slow]) == []
 
     clear = _status("Clear Water Bay Road", SpeedBand.GREEN, speed=60)
-    events = mon.update([], [clear])
+    assert mon.update([], [clear]) == []
+
+
+def test_relevant_td_traffic_notice_posts_and_clears():
+    mon = AlertMonitor()
+    incident = TrafficIncident(
+        identifier="td-1",
+        title="Lane closure on Clear Water Bay Road",
+        description="One lane closed",
+        road="Clear Water Bay Road",
+        location="HKUST approach",
+        direction="eastbound",
+        status="active",
+    )
+    mon.update([], [], [])
+    events = mon.update([], [], [incident])
     assert len(events) == 1
-    assert "cleared" in events[0].text
+    assert "Lane closure on Clear Water Bay Road" in events[0].text
+
+    events = mon.update([], [], [])
+    assert len(events) == 1
+    assert "TD traffic notice cleared" in events[0].text
+
+
+def test_relevant_roadwork_posts_once_and_clears_with_description():
+    mon = AlertMonitor()
+    roadwork = Roadwork(
+        identifier="rw-1",
+        description="Lane closure near HKUST",
+        road="Clear Water Bay Road",
+    )
+    mon.update([], [], [], [])
+
+    events = mon.update([], [], [], [roadwork])
+    assert len(events) == 1
+    assert "TD roadworks" in events[0].text
+    assert "Lane closure near HKUST" in events[0].text
+    assert "Clear Water Bay Road" in events[0].text
+    assert not events[0].critical
+
+    assert mon.update([], [], [], [roadwork]) == []
+
+    events = mon.update([], [], [], [])
+    assert len(events) == 1
+    assert "TD roadworks cleared" in events[0].text
+    assert "Lane closure near HKUST" in events[0].text
+
+
+def test_first_update_seeds_roadwork_without_flood():
+    mon = AlertMonitor()
+    roadwork = Roadwork("rw-1", "Lane closure", "University Road")
+
+    assert mon.update([], [], [], [roadwork]) == []
+    assert mon.update([], [], [], [roadwork]) == []
 
 
 def test_no_events_when_nothing_changes():

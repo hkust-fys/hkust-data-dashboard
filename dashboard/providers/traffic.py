@@ -1,5 +1,5 @@
 """Transport Department traffic provider: detector speeds/volume/occupancy,
-Special Traffic News, roadworks GeoJSON, and two CCTV JPEGs.
+Special Traffic News, roadworks GeoJSON.
 
 Official TD/data.gov.hk feeds only. RTHK scraping is explicitly out of scope.
 Speed bands are dashboard heuristics (documented), not TD classifications.
@@ -11,12 +11,11 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from dashboard.http import HttpClient, as_datetime
+from dashboard.http import CachedFetch, HttpClient, as_datetime
 from dashboard.models import (
-    ImageAsset,
     Roadwork,
     SpeedBand,
     TrafficCorridorStatus,
@@ -42,29 +41,32 @@ ROADWORKS_URL = (
     "https://resource.data.one.gov.hk/td/roadworks-location/get_all_the_roadworks.geojson"
 )
 
-# TD CCTV snapshots moved from cctv.td.gov.hk to tdcctv.data.one.gov.hk
-# (verified 2026-08-07; the old host no longer resolves).
-CCTV_CAMERAS: tuple[dict[str, str], ...] = (
-    {
-        "id": "K627F",
-        "url": "https://tdcctv.data.one.gov.hk/K627F.JPG",
-        "label": "K627F — Clear Water Bay Rd near Fei Ngo Shan Rd",
-        "caption": "TD CCTV K627F: point view at Clear Water Bay Road near Fei Ngo Shan Road.",
-    },
-    {
-        "id": "AID07117",
-        "url": "https://tdcctv.data.one.gov.hk/AID07117.JPG",
-        "label": "AID07117 — Lung Cheung Rd near Diamond Hill",
-        "caption": "TD CCTV AID07117: point view at Lung Cheung Road near Diamond Hill.",
-    },
-)
-
 # Refresh cadences.
 OBS_TTL_SECONDS = 55.0
-CCTV_TTL_SECONDS = 115.0
 NEWS_TTL_SECONDS = 295.0
 ROADWORKS_TTL_SECONDS = 15 * 60.0
 META_TTL_SECONDS = 24 * 60 * 60.0
+
+DETECTOR_META_SPEC = CachedFetch(
+    DETECTOR_META_URL,
+    META_TTL_SECONDS,
+    cache_key="td-detector-metadata",
+)
+DETECTOR_OBS_SPEC = CachedFetch(
+    DETECTOR_OBS_URL,
+    OBS_TTL_SECONDS,
+    cache_key="td-detector-observations",
+)
+SPECIAL_NEWS_SPEC = CachedFetch(
+    SPECIAL_NEWS_URL,
+    NEWS_TTL_SECONDS,
+    cache_key="td-special-news",
+)
+ROADWORKS_SPEC = CachedFetch(
+    ROADWORKS_URL,
+    ROADWORKS_TTL_SECONDS,
+    cache_key="td-roadworks",
+)
 
 # --------------------------------------------------------------------------
 # Corridor aliases (dashboard heuristics, not TD classifications)
@@ -503,54 +505,37 @@ def parse_roadworks(geojson: dict[str, Any]) -> list[Roadwork]:
 
 
 # --------------------------------------------------------------------------
-# CCTV
-# --------------------------------------------------------------------------
-
-def _is_jpeg(data: bytes) -> bool:
-    return len(data) >= 3 and data[:3] == b"\xff\xd8\xff"
-
-
-async def fetch_cctv_images(client: HttpClient) -> list[ImageAsset]:
-    """Fetch the two representative TD CCTV JPEGs as replaceable attachments."""
-    assets: list[ImageAsset] = []
-    for camera in CCTV_CAMERAS:
-        try:
-            data = await client.fetch_bytes(
-                camera["url"], max_bytes=4 * 1024 * 1024
-            )
-            if not _is_jpeg(data):
-                log.warning("CCTV %s returned non-JPEG content", camera["id"])
-                continue
-            assets.append(
-                ImageAsset(
-                    filename=f"{camera['id']}.jpg",
-                    data=data,
-                    content_type="image/jpeg",
-                    label=camera["label"],
-                    caption=camera["caption"],
-                    source_time=client.utcnow(),
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("CCTV %s fetch failed: %s", camera["id"], exc)
-    return assets
-
-
-# --------------------------------------------------------------------------
 # Public facade
 # --------------------------------------------------------------------------
 
 async def fetch_traffic_data(
     client: HttpClient,
-) -> tuple[list[TrafficCorridorStatus], list[TrafficIncident], list[Roadwork], datetime | None]:
+) -> tuple[
+    list[TrafficCorridorStatus],
+    list[TrafficIncident],
+    list[Roadwork],
+    datetime | None,
+    list[str],
+    dict[str, datetime],
+]:
     """Fetch detectors, special news, and roadworks (metadata is cached daily).
 
-    Returns (statuses, incidents, roadworks, capture_time).
+    Returns ``(statuses, incidents, roadworks, detector_capture_time,
+    stale_sources, source_times)``.  ``source_times`` preserves the cached
+    fetch time for each independently refreshed TD feed; the detector XML's
+    own capture time takes precedence when present.
     """
+    stale_sources: list[str] = []
+    source_times: dict[str, datetime] = {}
     # metadata: daily cache, tolerate failure
     meta: dict[str, _DetectorMeta] = {}
     try:
-        meta_text = await client.fetch_text(DETECTOR_META_URL, max_bytes=2 * 1024 * 1024)
+        stale, meta_text, _ = await client.fetch_text_cached(
+            DETECTOR_META_SPEC,
+            max_bytes=2 * 1024 * 1024,
+        )
+        if stale:
+            stale_sources.append("TD detector metadata")
         meta = parse_detector_metadata(meta_text)
     except Exception as exc:  # noqa: BLE001
         log.warning("TD detector metadata fetch failed: %s", exc)
@@ -558,28 +543,43 @@ async def fetch_traffic_data(
     statuses: list[TrafficCorridorStatus] = []
     capture_time: datetime | None = None
     try:
-        obs_text = await client.fetch_xml_text(DETECTOR_OBS_URL)
+        stale, obs_text, fetched_at = await client.fetch_xml_text_cached(
+            DETECTOR_OBS_SPEC
+        )
+        if stale:
+            stale_sources.append("TD detector observations")
         obs = parse_detector_observations(obs_text)
         statuses = build_corridor_statuses(obs, meta)
         capture_time = max(
             (o.capture_time for s in statuses for o in s.observations if o.capture_time),
             default=None,
         )
+        source_times["detectors"] = capture_time or datetime.fromtimestamp(
+            fetched_at, UTC
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("TD detector observations fetch failed: %s", exc)
 
     incidents: list[TrafficIncident] = []
     try:
-        news_text = await client.fetch_xml_text(SPECIAL_NEWS_URL)
+        stale, news_text, fetched_at = await client.fetch_xml_text_cached(
+            SPECIAL_NEWS_SPEC
+        )
+        if stale:
+            stale_sources.append("TD traffic news")
         incidents = filter_relevant_incidents(parse_special_news(news_text))
+        source_times["traffic_news"] = datetime.fromtimestamp(fetched_at, UTC)
     except Exception as exc:  # noqa: BLE001
         log.warning("TD special news fetch failed: %s", exc)
 
     roadworks: list[Roadwork] = []
     try:
-        rw = await client.fetch_json(ROADWORKS_URL)
+        stale, rw, fetched_at = await client.fetch_json_cached(ROADWORKS_SPEC)
+        if stale:
+            stale_sources.append("TD roadworks")
         roadworks = parse_roadworks(rw)
+        source_times["roadworks"] = datetime.fromtimestamp(fetched_at, UTC)
     except Exception as exc:  # noqa: BLE001
         log.warning("TD roadworks fetch failed: %s", exc)
 
-    return statuses, incidents, roadworks, capture_time
+    return statuses, incidents, roadworks, capture_time, stale_sources, source_times

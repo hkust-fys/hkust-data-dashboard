@@ -130,6 +130,39 @@ def test_group_etas_stable_order_and_merging():
     assert len(grp_91.rows) == 2
 
 
+def test_group_etas_splits_gmb_circular_stops_by_stop_seq():
+    """A circular GMB route (e.g. 104) appears at multiple stop_seq along its
+    loop; the far-end stop's ETAs are the bus RETURNING to HKUST and must not
+    be merged into the departure stop's group (which would make later ETAs
+    drop below earlier ones)."""
+    from dashboard.models import EtaRow, Operator
+
+    # the departure stop at HKUST: 0, 21, 46
+    departure = [
+        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
+               minutes=0, stop_seq=1),
+        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
+               minutes=21, stop_seq=1),
+        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
+               minutes=46, stop_seq=1),
+    ]
+    # the far-end stop (loop return): 30, 45 — must NOT appear
+    loopback = [
+        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
+               minutes=30, stop_seq=24),
+        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
+               minutes=45, stop_seq=24),
+    ]
+    groups = group_etas(departure + loopback)
+    g104 = [g for g in groups if g.route == "104"]
+    # two distinct groups: departure stop and loopback stop
+    assert len(g104) == 2
+    dep = [g for g in g104 if g.stop_seq == 1][0]
+    assert [r.minutes for r in dep.rows] == [0, 21, 46]  # strictly increasing
+    ret = [g for g in g104 if g.stop_seq == 24][0]
+    assert [r.minutes for r in ret.rows] == [30, 45]
+
+
 def test_route_sort_key_numeric():
     from dashboard.providers.transit import _route_sort_key
 

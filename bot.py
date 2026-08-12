@@ -16,33 +16,30 @@ import io
 import logging
 import os
 import sys
+from dataclasses import replace
 
 import discord
 from dotenv import load_dotenv
 
+from dashboard import maps
 from dashboard.config import ConfigError, Settings
 from dashboard.http import HttpClient
 from dashboard.models import (
+    CameraFrame,
     DashboardPayload,
     ImageAsset,
     WeatherConditions,
 )
+from dashboard.providers import cameras, transit
 from dashboard.providers import traffic as traffic_provider
-from dashboard.providers import transit
 from dashboard.providers import weather as weather_provider
 from dashboard.render import (
-    DASHBOARD_FOOTER,
-    DASHBOARD_MARKER,
     build_payload,
 )
-from dashboard.traffic_map import render_traffic_map
+from dashboard.runtime import startup_preflight
 
 log = logging.getLogger(__name__)
-
-# Marker text embedded in the dashboard message so the bot can find its own
-# message when scanning history (never edits arbitrary user messages).
-MESSAGE_MARKER = f"{DASHBOARD_MARKER} · {DASHBOARD_FOOTER}"
-
+DASHBOARD_MESSAGE_MARKER = "HKUST Campus Dashboard"
 
 def _setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -75,16 +72,39 @@ async def collect_all(
     async def _traffic():
         return await traffic_provider.fetch_traffic_data(client)
 
-    async def _cctv():
-        return await traffic_provider.fetch_cctv_images(client)
+    async def _traffic_map():
+        # Transit ETA groups still drive retained estimated bus markers.
+        groups: list = []
+        try:
+            transit_result = await tasks["transit"]
+            if isinstance(transit_result, tuple) and len(transit_result) == 3:
+                groups = transit_result[0]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("traffic map: transit groups unavailable: %s", exc)
+        return await maps.fetch_traffic_map(
+            client,
+            groups=groups,
+            cache_dir=settings.cache_dir,
+        )
+
+    async def _bus_stops():
+        if not settings.ffmpeg_executable:
+            raise RuntimeError("camera support disabled by startup preflight")
+        return await cameras.fetch_bus_stop_frames(
+            client,
+            ffmpeg_executable=settings.ffmpeg_executable,
+        )
 
     for name, coro in (
         ("transit", _transit()),
         ("weather", _weather()),
         ("traffic", _traffic()),
-        ("cctv", _cctv()),
+        ("bus_stops", _bus_stops()),
     ):
         tasks[name] = asyncio.create_task(coro)
+
+    # The map uses transit ETA groups to estimate bus positions.
+    tasks["traffic_map"] = asyncio.create_task(_traffic_map())
 
     results: dict[str, object] = {}
     for name, task in tasks.items():
@@ -96,10 +116,7 @@ async def collect_all(
     return results
 
 
-def _to_payload(
-    results: dict[str, object],
-    traffic_map_png: bytes | None,
-) -> DashboardPayload:
+def _to_payload(results: dict[str, object]) -> DashboardPayload:
     """Convert collected results into a renderable payload."""
     errors: list[str] = []
 
@@ -107,12 +124,14 @@ def _to_payload(
     if isinstance(transit_result, Exception):
         errors.append("transit ETA unavailable")
         groups: list = []
+        transit_source_time = None
     elif isinstance(transit_result, tuple) and len(transit_result) == 3:
-        groups, _, failed_ops = transit_result
+        groups, transit_source_time, failed_ops = transit_result
         for op in failed_ops:
             errors.append(f"{op} ETA unavailable")
     else:
         groups = []
+        transit_source_time = None
 
     weather_result = results.get("weather")
     weather: WeatherConditions | None = None
@@ -127,22 +146,60 @@ def _to_payload(
         weather = weather_result
 
     traffic_result = results.get("traffic")
+    traffic_source_times: dict = {}
     if isinstance(traffic_result, Exception):
         errors.append("TD traffic unavailable")
-        statuses, incidents, capture_time = [], [], None
-    elif isinstance(traffic_result, tuple):
-        statuses, incidents, _, capture_time = traffic_result
+        statuses, incidents, roadworks, capture_time, traffic_stale = [], [], [], None, []
+    elif isinstance(traffic_result, tuple) and len(traffic_result) >= 6:
+        (
+            statuses,
+            incidents,
+            roadworks,
+            capture_time,
+            traffic_stale,
+            traffic_source_times,
+        ) = traffic_result[:6]
+    elif isinstance(traffic_result, tuple) and len(traffic_result) >= 5:
+        statuses, incidents, roadworks, capture_time, traffic_stale = traffic_result
+    elif isinstance(traffic_result, tuple) and len(traffic_result) == 4:
+        statuses, incidents, roadworks, capture_time = traffic_result
+        traffic_stale = []
     else:
-        statuses, incidents, capture_time = [], [], None
+        statuses, incidents, roadworks, capture_time, traffic_stale = [], [], [], None, []
 
-    cctv_result = results.get("cctv")
-    if isinstance(cctv_result, Exception):
-        errors.append("TD CCTV unavailable")
-        cctv_images: list[ImageAsset] = []
-    elif isinstance(cctv_result, list):
-        cctv_images = cctv_result
+    # The map provider returns the Google base image and retained markers.
+    smap_result = results.get("traffic_map")
+    if isinstance(smap_result, Exception):
+        map_png: bytes | None = None
+    elif isinstance(smap_result, tuple) and len(smap_result) >= 2:
+        map_png = smap_result[0]
     else:
-        cctv_images = []
+        map_png = None
+    if map_png is None:
+        errors.append("traffic map unavailable")
+    map_source_time = None
+
+    # Bus-stop camera frames (HKUST HLS live view).
+    bus_stops_result = results.get("bus_stops")
+    if isinstance(bus_stops_result, Exception):
+        errors.append("bus-stop cameras unavailable")
+        bus_stop_images: list[ImageAsset] = []
+    elif isinstance(bus_stops_result, list):
+        bus_stop_images = []
+        for frame in bus_stops_result:
+            if isinstance(frame, CameraFrame) and frame.data:
+                bus_stop_images.append(
+                    ImageAsset(
+                        filename=f"busstop-{len(bus_stop_images)}.jpg",
+                        data=frame.data,
+                        content_type="image/jpeg",
+                        label=frame.label,
+                        caption="live view",
+                        source_time=frame.source_time,
+                    )
+                )
+    else:
+        bus_stop_images = []
 
     return build_payload(
         weather=weather,
@@ -150,8 +207,14 @@ def _to_payload(
         statuses=statuses,
         incidents=incidents,
         capture_time=capture_time,
-        traffic_map_png=traffic_map_png,
-        cctv_images=cctv_images,
+        traffic_map_png=map_png,
+        transit_source_time=transit_source_time,
+        map_source_time=map_source_time,
+        roadworks=roadworks,
+        traffic_stale_sources=traffic_stale,
+        traffic_source_times=traffic_source_times,
+        traffic_source_time=capture_time,
+        bus_stop_images=bus_stop_images,
         errors=errors,
     )
 
@@ -160,15 +223,59 @@ def _to_payload(
 # Message lifecycle
 # --------------------------------------------------------------------------
 
-async def _find_dashboard_message(channel) -> object | None:
-    """Scan recent history for a bot-authored message with our marker."""
+def _is_dashboard_message(message, expected_author) -> bool:
+    """Return whether ``message`` is this bot's exact dashboard marker."""
+    expected_author_id = getattr(expected_author, "id", None)
+    author = getattr(message, "author", None)
+    return bool(
+        expected_author_id is not None
+        and getattr(author, "bot", False)
+        and getattr(author, "id", None) == expected_author_id
+        and getattr(message, "content", "") == DASHBOARD_MESSAGE_MARKER
+    )
+
+
+async def _find_dashboard_message(channel, expected_author=None) -> object | None:
+    """Scan recent history for this bot's latest dashboard message.
+
+    Author ID plus the stable marker avoid taking over another message from
+    this bot (for example an alert or command response) in the same channel.
+    """
+    expected_author = expected_author or getattr(
+        getattr(channel, "guild", None), "me", None
+    )
     try:
         async for message in channel.history(limit=50):
-            if message.author.bot and MESSAGE_MARKER in (message.content or ""):
+            if _is_dashboard_message(message, expected_author):
                 return message
     except Exception as exc:  # noqa: BLE001
         log.warning("history scan failed: %s", exc)
     return None
+
+
+async def _resolve_dashboard_message(
+    channel,
+    configured_message_id: int | None,
+    expected_author,
+) -> object | None:
+    """Validate a configured message, otherwise fall back to history scan."""
+    if configured_message_id:
+        try:
+            configured = await channel.fetch_message(configured_message_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "configured message %s not found, scanning: %s",
+                configured_message_id,
+                exc,
+            )
+        else:
+            if _is_dashboard_message(configured, expected_author):
+                return configured
+            log.warning(
+                "configured message %s is not this bot's exact dashboard marker; scanning",
+                configured_message_id,
+            )
+    return await _find_dashboard_message(channel, expected_author)
 
 
 async def _ensure_dashboard_message(channel, payload: DashboardPayload) -> object:
@@ -177,7 +284,7 @@ async def _ensure_dashboard_message(channel, payload: DashboardPayload) -> objec
     if message is not None:
         return message
     # create exactly one
-    message = await channel.send(content=MESSAGE_MARKER)
+    message = await channel.send(content=DASHBOARD_MESSAGE_MARKER)
     log.info("created dashboard message %s in %s", message.id, getattr(channel, "id", "?"))
     return message
 
@@ -190,7 +297,11 @@ async def _apply_payload(message, payload: DashboardPayload) -> None:
     """Edit embeds + attachments atomically; replace images to avoid CDN cache."""
     embeds = [e for e in payload.embeds if e is not None]
     files = [discord_file(asset) for asset in payload.files]
-    await message.edit(content=MESSAGE_MARKER, embeds=embeds, attachments=files)
+    await message.edit(
+        content=DASHBOARD_MESSAGE_MARKER,
+        embeds=embeds,
+        attachments=files,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -209,6 +320,7 @@ class DashboardUpdater:
         self._thread = None
         self._loop_task: asyncio.Task | None = None
         self._running = False
+        self._start_lock = asyncio.Lock()
         from dashboard.alerts import AlertMonitor
 
         self.alerts = AlertMonitor()
@@ -216,12 +328,24 @@ class DashboardUpdater:
     async def start(self, channel=None) -> None:
         import aiohttp
 
-        self.session = aiohttp.ClientSession()
-        self.client = HttpClient(
-            self.session, timeout_seconds=self.settings.http_timeout_seconds
+        async with self._start_lock:
+            if self.is_running:
+                log.info("dashboard update loop already running; ignoring duplicate start")
+                return
+            self.session = aiohttp.ClientSession()
+            self.client = HttpClient(
+                self.session, timeout_seconds=self.settings.http_timeout_seconds
+            )
+            self._running = True
+            self._loop_task = asyncio.create_task(self._update_loop(channel))
+
+    @property
+    def is_running(self) -> bool:
+        return bool(
+            self._running
+            and self._loop_task is not None
+            and not self._loop_task.done()
         )
-        self._running = True
-        self._loop_task = asyncio.create_task(self._update_loop(channel))
 
     async def _ensure_thread(self) -> None:
         """Create the updates thread under the dashboard message once."""
@@ -249,9 +373,15 @@ class DashboardUpdater:
             warnings = weather_result[1]
         traffic_result = results.get("traffic")
         statuses = []
+        incidents = []
+        roadworks = []
         if isinstance(traffic_result, tuple):
             statuses = traffic_result[0]
-        events = self.alerts.update(warnings, statuses)
+            if len(traffic_result) > 1:
+                incidents = traffic_result[1]
+            if len(traffic_result) > 2:
+                roadworks = traffic_result[2]
+        events = self.alerts.update(warnings, statuses, incidents, roadworks)
         if not events or self._thread is None:
             return
         for event in events:
@@ -275,22 +405,7 @@ class DashboardUpdater:
         assert self.client is not None
         results = await collect_all(self.client, self.settings)
 
-        # Traffic map: rebuild only when traffic data changed.
-        traffic_result = results.get("traffic")
-        map_png: bytes | None = None
-        if isinstance(traffic_result, tuple):
-            statuses, incidents, roadworks, capture = traffic_result
-            map_png, err = render_traffic_map(
-                statuses,
-                incidents,
-                roadworks,
-                capture,
-                cache_dir=self.settings.cache_dir,
-            )
-            if err:
-                log.warning("traffic map render failed: %s", err)
-
-        payload = _to_payload(results, map_png)
+        payload = _to_payload(results)
 
         if channel is None:
             # dry-run / dev: just keep the last payload for inspection
@@ -316,8 +431,11 @@ class DashboardUpdater:
             self._loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._loop_task
+            self._loop_task = None
         if self.session is not None:
             await self.session.close()
+            self.session = None
+        self.client = None
 
 
 # --------------------------------------------------------------------------
@@ -338,6 +456,9 @@ async def run_discord_bot(settings: Settings) -> None:
     @bot.event
     async def on_ready() -> None:
         log.info("Logged in as %s", bot.user)
+        if updater.is_running:
+            log.info("dashboard update loop already active after reconnect")
+            return
         try:
             channel = bot.get_channel(settings.announce_channel_id)
             if channel is None:
@@ -351,18 +472,11 @@ async def run_discord_bot(settings: Settings) -> None:
             await bot.close()
             return
         # Resolve the message once (configured ID or history scan).
-        message = None
-        if settings.dashboard_message_id:
-            try:
-                message = await channel.fetch_message(settings.dashboard_message_id)
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "configured message %s not found, scanning: %s",
-                    settings.dashboard_message_id,
-                    exc,
-                )
-        if message is None:
-            message = await _find_dashboard_message(channel)
+        message = await _resolve_dashboard_message(
+            channel,
+            settings.dashboard_message_id,
+            bot.user,
+        )
         updater._message = message  # noqa: SLF001
         await updater.start(channel)
 
@@ -389,20 +503,11 @@ async def run_dev_webhook(settings: Settings) -> None:
     async with aiohttp.ClientSession() as session:
         client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
         results = await collect_all(client, settings)
-        traffic_result = results.get("traffic")
-        map_png: bytes | None = None
-        if isinstance(traffic_result, tuple):
-            statuses, incidents, roadworks, capture = traffic_result
-            map_png, err = render_traffic_map(
-                statuses, incidents, roadworks, capture, cache_dir=settings.cache_dir
-            )
-            if err:
-                log.warning("traffic map render failed: %s", err)
-        payload = _to_payload(results, map_png)
+        payload = _to_payload(results)
         webhook = discord.Webhook.from_url(settings.dev_webhook, session=session)
         files = [discord_file(a) for a in payload.files]
         await webhook.send(
-            content=MESSAGE_MARKER,
+            content="",
             embeds=[e for e in payload.embeds if e is not None],
             files=files or None,
         )
@@ -421,16 +526,7 @@ async def run_dry_run(settings: Settings) -> None:
     async with aiohttp.ClientSession() as session:
         client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
         results = await collect_all(client, settings)
-        traffic_result = results.get("traffic")
-        map_png: bytes | None = None
-        if isinstance(traffic_result, tuple):
-            statuses, incidents, roadworks, capture = traffic_result
-            map_png, err = render_traffic_map(
-                statuses, incidents, roadworks, capture, cache_dir=settings.cache_dir
-            )
-            if err:
-                log.warning("traffic map render failed: %s", err)
-        payload = _to_payload(results, map_png)
+        payload = _to_payload(results)
 
         lines: list[str] = []
         for i, embed in enumerate(payload.embeds):
@@ -447,7 +543,6 @@ async def run_dry_run(settings: Settings) -> None:
                 lines.append(f"image: {embed.image.url}")
         lines.append("")
         lines.append(f"files: {[a.filename for a in payload.files]}")
-        lines.append(f"marker: {MESSAGE_MARKER}")
 
         preview_path = os.path.join(".private", "dashboard-preview.txt")
         with open(preview_path, "w", encoding="utf-8") as f:
@@ -496,6 +591,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     _setup_logging(settings.log_level)
+
+    try:
+        ffmpeg_executable = startup_preflight()
+    except ConfigError as exc:
+        ffmpeg_executable = None
+        print(
+            f"Camera warning: {exc} Cameras are disabled; the dashboard will continue.",
+            file=sys.stderr,
+        )
+    settings = replace(settings, ffmpeg_executable=ffmpeg_executable)
 
     try:
         if args.dev_webhook:

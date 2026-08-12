@@ -383,11 +383,10 @@ def jpeg_bytes() -> bytes:
     return b"\xff\xd8\xff\xe0" + b"\x00" * 128
 
 
-def cctv_assets() -> list[ImageAsset]:
+def bus_stop_assets() -> list[ImageAsset]:
     return [
         ImageAsset(
-            filename="K627F.jpg", data=jpeg_bytes(), content_type="image/jpeg",
-            label="K627F — Clear Water Bay Rd near Fei Ngo Shan Rd",
-            caption="point view", source_time=utc(),
+            filename="busstop-0.jpg", data=jpeg_bytes(), content_type="image/jpeg",
+            label="North Gate bus stop", caption="live view", source_time=utc(),
         )
     ]

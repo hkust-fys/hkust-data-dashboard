@@ -1,7 +1,5 @@
-"""HttpClient tests: TTL caching, stale-on-error, and retry caps (using
-aioresponses to avoid real network)."""
+"""HttpClient tests: TTL caching and stale-on-error without real network."""
 
-import aioresponses
 import pytest
 
 from dashboard.http import CachedFetch, FetchError, HttpClient, TtlCache
@@ -30,53 +28,90 @@ def test_ttl_cache_fifo_eviction():
 
 
 @pytest.mark.asyncio
-async def test_fetch_json_cached_uses_ttl_and_returns_fresh():
-    import aiohttp
+async def test_fetch_json_cached_uses_ttl_and_returns_fresh(monkeypatch):
+    client = HttpClient(object())
+    calls = 0
 
-    async with aiohttp.ClientSession() as session:
-        client = HttpClient(session)
-        spec = CachedFetch("https://example.test/data.json", ttl=60, cache_key="data")
-        with aioresponses.aioresponses() as mock:
-            mock.get("https://example.test/data.json", payload={"a": 1})
-            stale, value, fetched = await client.fetch_json_cached(spec)
-            assert stale is False
-            assert value == {"a": 1}
-            # second call hits cache (no extra HTTP)
-            stale2, value2, _ = await client.fetch_json_cached(spec)
-            assert stale2 is False and value2 == {"a": 1}
-            # only one request matched: the second call came from cache
-            assert len(mock.requests) == 1
+    async def fetch_json(_url, _headers=None):
+        nonlocal calls
+        calls += 1
+        return {"a": 1}
 
-
-@pytest.mark.asyncio
-async def test_fetch_json_cached_stale_on_error():
-    import aiohttp
-
-    async with aiohttp.ClientSession() as session:
-        client = HttpClient(session, retry_attempts=1)
-        spec = CachedFetch("https://example.test/data.json", ttl=60, cache_key="data")
-        with aioresponses.aioresponses() as mock:
-            mock.get("https://example.test/data.json", payload={"a": 1})
-            _, _, _ = await client.fetch_json_cached(spec)
-            # expire the cache then fail the fetch
-            client.cache._store["data"].fetched_at = 0  # noqa: SLF001
-            mock.get("https://example.test/data.json", status=500)
-            stale, value, _ = await client.fetch_json_cached(spec)
-            assert stale is True
-            assert value == {"a": 1}
+    monkeypatch.setattr(client, "fetch_json", fetch_json)
+    spec = CachedFetch("https://example.test/data.json", ttl=60, cache_key="data")
+    stale, value, fetched = await client.fetch_json_cached(spec)
+    assert stale is False
+    assert value == {"a": 1}
+    stale2, value2, fetched2 = await client.fetch_json_cached(spec)
+    assert stale2 is False and value2 == {"a": 1}
+    assert fetched2 == fetched
+    assert calls == 1
 
 
 @pytest.mark.asyncio
-async def test_fetch_raises_when_no_cached_value():
-    import aiohttp
+async def test_fetch_json_cached_stale_on_error(monkeypatch):
+    client = HttpClient(object(), retry_attempts=1)
+    should_fail = False
 
-    async with aiohttp.ClientSession() as session:
-        client = HttpClient(session, retry_attempts=1)
-        spec = CachedFetch("https://example.test/other.json", ttl=60, cache_key="other")
-        with aioresponses.aioresponses() as mock:
-            mock.get("https://example.test/other.json", status=500)
-            with pytest.raises(FetchError):
-                await client.fetch_json_cached(spec)
+    async def fetch_json(_url, _headers=None):
+        if should_fail:
+            raise FetchError("offline")
+        return {"a": 1}
+
+    monkeypatch.setattr(client, "fetch_json", fetch_json)
+    spec = CachedFetch("https://example.test/data.json", ttl=60, cache_key="data")
+    await client.fetch_json_cached(spec)
+    client.cache._store["data"].fetched_at = 0  # noqa: SLF001
+    should_fail = True
+    stale, value, _ = await client.fetch_json_cached(spec)
+    assert stale is True
+    assert value == {"a": 1}
+
+
+@pytest.mark.asyncio
+async def test_fetch_text_cached_uses_ttl_and_stale_on_error(monkeypatch):
+    client = HttpClient(object(), retry_attempts=1)
+    calls = 0
+    should_fail = False
+
+    async def fetch_text(_url, _headers=None, _max_bytes=None):
+        nonlocal calls
+        calls += 1
+        if should_fail:
+            raise FetchError("offline")
+        return "first"
+
+    monkeypatch.setattr(client, "fetch_text", fetch_text)
+    spec = CachedFetch("https://example.test/data.txt", ttl=60, cache_key="text")
+    stale, value, fetched_at = await client.fetch_text_cached(spec)
+    assert stale is False
+    assert value == "first"
+
+    cached_stale, cached_value, cached_at = await client.fetch_text_cached(spec)
+    assert cached_stale is False
+    assert cached_value == "first"
+    assert cached_at == fetched_at
+    assert calls == 1
+
+    client.cache._store["text"].fetched_at = 0  # noqa: SLF001
+    should_fail = True
+    stale, value, stale_at = await client.fetch_text_cached(spec)
+    assert stale is True
+    assert value == "first"
+    assert stale_at == 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_raises_when_no_cached_value(monkeypatch):
+    client = HttpClient(object(), retry_attempts=1)
+
+    async def fail(_url, _headers=None):
+        raise FetchError("offline")
+
+    monkeypatch.setattr(client, "fetch_json", fail)
+    spec = CachedFetch("https://example.test/other.json", ttl=60, cache_key="other")
+    with pytest.raises(FetchError):
+        await client.fetch_json_cached(spec)
 
 
 @pytest.mark.asyncio

@@ -57,6 +57,7 @@ class Settings:
     log_level: str = "INFO"
     cache_dir: str = field(default=".cache")
     alert_role_id: int | None = None
+    ffmpeg_executable: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, require_keys: bool = True) -> Settings:

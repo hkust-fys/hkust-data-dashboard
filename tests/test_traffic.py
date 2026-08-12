@@ -1,11 +1,22 @@
-"""Traffic provider tests: detector CSV/XML parsing, corridor matching, incident
-dedup, speed bands, CCTV JPEG validation."""
+"""Traffic provider tests: parsing, corridor matching, and source caching."""
+
+from datetime import UTC, datetime
+
+import pytest
 
 from dashboard.models import SpeedBand
 from dashboard.providers.traffic import (
-    _is_jpeg,
+    DETECTOR_META_SPEC,
+    DETECTOR_META_URL,
+    DETECTOR_OBS_SPEC,
+    DETECTOR_OBS_URL,
+    ROADWORKS_SPEC,
+    ROADWORKS_URL,
+    SPECIAL_NEWS_SPEC,
+    SPECIAL_NEWS_URL,
     _sanitize_text,
     build_corridor_statuses,
+    fetch_traffic_data,
     filter_relevant_incidents,
     match_corridors,
     parse_detector_metadata,
@@ -127,6 +138,96 @@ def test_parse_roadworks_matches_corridors():
 
 
 def test_jpeg_validation():
+    # bus-stop frame validation uses the same JPEG sniff
+    from dashboard.providers.cameras import _is_jpeg
+
     assert _is_jpeg(s.jpeg_bytes())
     assert not _is_jpeg(b"not a jpeg")
     assert not _is_jpeg(b"")
+
+
+def _traffic_client(monkeypatch):
+    from dashboard.http import FetchError, HttpClient
+
+    client = HttpClient(object(), retry_attempts=1)
+    calls = {url: 0 for url in (
+        DETECTOR_META_URL,
+        DETECTOR_OBS_URL,
+        SPECIAL_NEWS_URL,
+        ROADWORKS_URL,
+    )}
+    state = {"fail": False}
+
+    def record(url):
+        calls[url] += 1
+        if state["fail"]:
+            raise FetchError("offline")
+
+    async def fetch_text(url, _headers=None, _max_bytes=None):
+        record(url)
+        return s.DETECTOR_CSV
+
+    async def fetch_xml_text(url, _headers=None, _max_bytes=None):
+        record(url)
+        return s.DETECTOR_XML if url == DETECTOR_OBS_URL else s.SPECIAL_NEWS_XML
+
+    async def fetch_json(url, _headers=None, _max_bytes=None):
+        record(url)
+        return s.ROADWORKS_JSON
+
+    monkeypatch.setattr(client, "fetch_text", fetch_text)
+    monkeypatch.setattr(client, "fetch_xml_text", fetch_xml_text)
+    monkeypatch.setattr(client, "fetch_json", fetch_json)
+    return client, calls, state
+
+
+@pytest.mark.asyncio
+async def test_fetch_traffic_data_honors_all_source_ttls(monkeypatch):
+    client, calls, _ = _traffic_client(monkeypatch)
+    first = await fetch_traffic_data(client)
+    second = await fetch_traffic_data(client)
+
+    assert sum(calls.values()) == 4
+    assert all(count == 1 for count in calls.values())
+    assert second == first
+    assert first[0]
+    assert first[3] is not None
+    assert first[5]["detectors"] == first[3]
+    assert first[5]["traffic_news"] == datetime.fromtimestamp(
+        client.cache._store[SPECIAL_NEWS_SPEC.key()].fetched_at, UTC  # noqa: SLF001
+    )
+    assert first[5]["roadworks"] == datetime.fromtimestamp(
+        client.cache._store[ROADWORKS_SPEC.key()].fetched_at, UTC  # noqa: SLF001
+    )
+
+    assert DETECTOR_META_SPEC.ttl == 24 * 60 * 60
+    assert DETECTOR_OBS_SPEC.ttl == 55
+    assert SPECIAL_NEWS_SPEC.ttl == 295
+    assert ROADWORKS_SPEC.ttl == 15 * 60
+
+
+@pytest.mark.asyncio
+async def test_fetch_traffic_data_uses_expired_values_on_source_errors(monkeypatch):
+    client, calls, state = _traffic_client(monkeypatch)
+    first = await fetch_traffic_data(client)
+
+    for entry in client.cache._store.values():  # noqa: SLF001
+        entry.fetched_at = 0
+    state["fail"] = True
+    stale = await fetch_traffic_data(client)
+
+    assert sum(calls.values()) == 8
+    assert all(count == 2 for count in calls.values())
+    assert stale[:4] == first[:4]
+    assert stale[4] == [
+        "TD detector metadata",
+        "TD detector observations",
+        "TD traffic news",
+        "TD roadworks",
+    ]
+    assert stale[3] == first[3]
+    assert stale[5] == {
+        "detectors": first[3],
+        "traffic_news": datetime.fromtimestamp(0, UTC),
+        "roadworks": datetime.fromtimestamp(0, UTC),
+    }

@@ -83,6 +83,7 @@ def test_transit_embed_marks_nonrealtime_and_scheduled():
     assert "🔗 [HKUST shuttle]" in value
     assert "[Bus stops live]" in value
     assert not embed.fields
+    assert embed.footer.text == "Transport Department · bus ETA"
 
 
 def test_transit_embed_route_line_no_commas():
@@ -221,6 +222,15 @@ def test_traffic_summary_includes_relevant_roadworks():
     assert embed.timestamp == s.utc()
 
 
+def test_traffic_summary_links_to_official_td_traffic_news():
+    from dashboard.render import TD_TRAFFIC_NEWS_URL, _build_traffic_summary_embed
+
+    embed = _build_traffic_summary_embed([], [], None)
+
+    assert f"[TD traffic news]({TD_TRAFFIC_NEWS_URL})" in embed.description
+    assert embed.footer.text == "Transport Department · traffic notices"
+
+
 def test_traffic_summary_keeps_each_displayed_source_time_separate():
     from dashboard.models import Roadwork
     from dashboard.render import _build_traffic_summary_embed
@@ -244,10 +254,13 @@ def test_traffic_summary_keeps_each_displayed_source_time_separate():
 
     assert "TD detectors" not in embed.description
     assert "TD monitored slow points" not in embed.description
-    assert f"TD traffic news <t:{int(news_time.timestamp())}:t>" in embed.description
+    assert (
+        f"TD traffic news updated <t:{int(news_time.timestamp())}:f>"
+        in embed.description
+    )
     assert f"TD roadworks <t:{int(roadworks_time.timestamp())}:t>" in embed.description
     assert embed.timestamp == roadworks_time
-    assert embed.footer.text == "Traffic summary (latest)"
+    assert embed.footer.text == "Transport Department · traffic notices"
 
 
 def test_traffic_summary_ignores_detector_statuses_and_color():
@@ -264,7 +277,7 @@ def test_traffic_summary_ignores_detector_statuses_and_color():
     assert "TD monitored slow points" not in embed.description
     assert embed.color.value == 0x16A34A
     assert embed.timestamp is None
-    assert embed.footer.text == "Traffic summary (latest)"
+    assert embed.footer.text == "Transport Department · traffic notices"
 
 
 def test_weather_embed_multiple_warning_icons():
@@ -313,6 +326,9 @@ def test_weather_embed_title_reading_and_issued_timestamps():
     # each warning has an issued timestamp (Discord <t:> renders locally)
     assert "issued <t:" in embed.description
     assert embed.description.count("issued <t:") == 2
+    assert embed.description.count(":R>") == 2
+    assert ":f>" not in embed.description
+    assert ":t>" not in embed.description
     assert (
         "🔗 [HKO warnings](https://www.hko.gov.hk/en/wxinfo/dailywx/wxwarntoday.htm)"
         in embed.description

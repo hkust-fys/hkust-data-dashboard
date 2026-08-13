@@ -94,7 +94,7 @@ class Settings:
             dashboard_message_id=dashboard_message_id,
             dev_webhook=os.getenv("DEV_WEBHOOK", "").strip() or None,
             update_interval_seconds=_env_int(
-                "UPDATE_INTERVAL_SECONDS", 15, minimum=10
+                "UPDATE_INTERVAL_SECONDS", 15, minimum=15
             ),
             http_timeout_seconds=_env_float("HTTP_TIMEOUT_SECONDS", 10.0),
             log_level=log_level,

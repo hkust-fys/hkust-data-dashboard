@@ -182,7 +182,7 @@ def test_to_payload_uses_news_and_roadwork_times_without_detector_legend():
     summary = next(embed for embed in payload.embeds if embed.title == "🚦 Traffic summary")
 
     assert "TD detectors" not in summary.description
-    assert f"TD traffic news <t:{int(news_time.timestamp())}:t>" in summary.description
+    assert f"TD traffic news updated <t:{int(news_time.timestamp())}:f>" in summary.description
     assert f"TD roadworks <t:{int(roadworks_time.timestamp())}:t>" in summary.description
     assert summary.timestamp == roadworks_time
 
@@ -241,6 +241,107 @@ async def test_updater_continues_after_provider_failure(monkeypatch):
     # still created one message
     assert updater._message is not None
     await updater.stop()
+
+
+@pytest.mark.asyncio
+async def test_presenter_does_not_wait_for_slow_background_collection(monkeypatch):
+    """A presentation tick must not inherit provider latency."""
+    import asyncio
+    import time
+
+    import bot as bot_module
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_collect(client, settings):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"weather": (None, [], None), "traffic": ([], [], [], None)}
+
+    monkeypatch.setattr(bot_module, "collect_all", slow_collect)
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001 - avoid a real HTTP session
+    updater.client = object()
+
+    began = time.monotonic()
+    await updater._tick()  # noqa: SLF001
+    assert time.monotonic() - began < 0.1
+    await started.wait()
+    assert updater._snapshot is None  # noqa: SLF001
+
+    # A second presentation while the map/provider work is slow must not start
+    # a competing Playwright capture/collection.
+    await updater._tick()  # noqa: SLF001
+    assert calls == 1
+
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert updater._snapshot is not None  # noqa: SLF001
+    await updater.stop()
+
+
+@pytest.mark.asyncio
+async def test_provider_snapshot_publishes_before_slow_map_finishes(monkeypatch):
+    """Fast transit is presentable while the single map capture is still running."""
+    import asyncio
+
+    import bot as bot_module
+
+    map_release = asyncio.Event()
+
+    async def incremental_collect(client, settings, on_result=None):
+        transit_result = (s.route_groups(), s.utc(), [])
+        assert on_result is not None
+        on_result("transit", transit_result)
+        await map_release.wait()
+        on_result("traffic_map", (b"png", []))
+        return {"transit": transit_result, "traffic_map": (b"png", [])}
+
+    monkeypatch.setattr(bot_module, "collect_all", incremental_collect)
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater.client = object()
+    await updater._tick()  # noqa: SLF001
+    await asyncio.sleep(0)
+    assert updater._snapshot is not None  # noqa: SLF001
+    assert "transit" in updater._snapshot.results  # noqa: SLF001
+    assert "traffic_map" not in updater._snapshot.results  # noqa: SLF001
+    map_release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert "traffic_map" in updater._snapshot.results  # noqa: SLF001
+    await updater.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_inflight_collection(monkeypatch):
+    import asyncio
+
+    import bot as bot_module
+
+    cancelled = asyncio.Event()
+
+    async def slow_collect(client, settings):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(bot_module, "collect_all", slow_collect)
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater.client = object()
+    await updater._tick()  # noqa: SLF001
+    assert updater._collection_task is not None  # noqa: SLF001
+    await updater.stop()
+    assert cancelled.is_set()
+    assert updater._collection_task is None  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -326,3 +427,40 @@ def test_missing_camera_dependency_warns_but_dashboard_continues(monkeypatch, ca
     assert bot_module.main(["--dry-run", "--no-keys"]) == 0
     assert observed["ffmpeg"] is None
     assert "Cameras are disabled; the dashboard will continue" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_map_starts_google_capture_and_geometry_together(monkeypatch):
+    """A slow geometry refresh cannot postpone the required browser capture."""
+    import asyncio
+
+    from dashboard import maps
+    from dashboard.providers.route_geometry import RouteGeometry
+
+    capture_started = asyncio.Event()
+    geometry_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_capture(**_kwargs):
+        capture_started.set()
+        await release.wait()
+        return object()
+
+    async def delayed_geometry(*_args, **_kwargs):
+        geometry_started.set()
+        await release.wait()
+        return RouteGeometry()
+
+    def rendered(*_args):
+        return b"map"
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", delayed_capture)
+    monkeypatch.setattr(maps, "fetch_route_geometry", delayed_geometry)
+    monkeypatch.setattr(maps, "render_map", rendered)
+    operation = asyncio.create_task(maps.fetch_traffic_map(object(), cache_dir="unused"))
+    await asyncio.wait_for(
+        asyncio.gather(capture_started.wait(), geometry_started.wait()), timeout=0.2
+    )
+    release.set()
+    png, _ = await operation
+    assert png == b"map"

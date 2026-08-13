@@ -115,6 +115,23 @@ def test_parse_special_news_and_filter_relevant():
     assert len(relevant) <= 3
 
 
+def test_parse_special_news_live_uppercase_schema_and_hkt_announcement_time():
+    incidents = parse_special_news(s.SPECIAL_NEWS_LIVE_XML)
+
+    assert len(incidents) == 1
+    incident = incidents[0]
+    assert incident.identifier == "IN-26-00001"
+    assert incident.title == "Road Incident"
+    assert incident.description == "One lane near Fei Ngo Shan Road is closed."
+    assert incident.road == "Clear Water Bay Road"
+    assert incident.location == "Clear Water Bay Road"
+    assert incident.direction == "Kowloon"
+    assert incident.status == "UPDATED"
+    assert incident.announcement_time == datetime.fromisoformat(
+        "2026-08-13T17:23:00+08:00"
+    )
+
+
 def test_parse_special_news_dedupes():
     doubled = s.SPECIAL_NEWS_XML.replace("</trafficNews>", s.SPECIAL_NEWS_XML.split("<trafficNews>")[-1])
     incidents = parse_special_news(doubled)
@@ -193,8 +210,8 @@ async def test_fetch_traffic_data_honors_all_source_ttls(monkeypatch):
     assert first[0]
     assert first[3] is not None
     assert first[5]["detectors"] == first[3]
-    assert first[5]["traffic_news"] == datetime.fromtimestamp(
-        client.cache._store[SPECIAL_NEWS_SPEC.key()].fetched_at, UTC  # noqa: SLF001
+    assert first[5]["traffic_news"] == datetime.fromisoformat(
+        "2026-08-13T16:45:00+08:00"
     )
     assert first[5]["roadworks"] == datetime.fromtimestamp(
         client.cache._store[ROADWORKS_SPEC.key()].fetched_at, UTC  # noqa: SLF001
@@ -228,6 +245,6 @@ async def test_fetch_traffic_data_uses_expired_values_on_source_errors(monkeypat
     assert stale[3] == first[3]
     assert stale[5] == {
         "detectors": first[3],
-        "traffic_news": datetime.fromtimestamp(0, UTC),
+        "traffic_news": datetime.fromisoformat("2026-08-13T16:45:00+08:00"),
         "roadworks": datetime.fromtimestamp(0, UTC),
     }

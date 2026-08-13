@@ -62,6 +62,6 @@ def test_settings_invalid_channel_id(monkeypatch):
 def test_settings_invalid_interval(monkeypatch):
     monkeypatch.setenv("DISCORD_TOKEN", "t")
     monkeypatch.setenv("ANNOUNCE_CHANNEL_ID", "1")
-    monkeypatch.setenv("UPDATE_INTERVAL_SECONDS", "5")  # below minimum 10
+    monkeypatch.setenv("UPDATE_INTERVAL_SECONDS", "14")  # below minimum 15
     with pytest.raises(ConfigError):
         Settings.from_env()

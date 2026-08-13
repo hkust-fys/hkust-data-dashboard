@@ -36,7 +36,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
-    "live: opt-in smoke tests that hit public endpoints (excluded from CI)",
+    "live: smoke tests that hit public endpoints and require internet access; no API keys",
 ]
 
 [tool.ruff]

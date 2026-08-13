@@ -30,12 +30,15 @@ async def fetch_traffic_map(
 ) -> tuple[bytes | None, list[object]]:
     """Capture the Google base map and render retained bus/stop markers."""
     base_image_task = asyncio.create_task(capture_gmaps_base(cache_dir=cache_dir))
-    base_image = await base_image_task
-
     public_stops: list[Stop] = []
     route_lines: list[object] = []
+    # Disk-backed geometry is immediate; a cold cache is independently bounded
+    # by the provider.  Start it alongside browser capture so routing trouble
+    # can never delay launching the required Google Maps screenshot.
+    geometry_task = asyncio.create_task(fetch_route_geometry(client, cache_dir=cache_dir))
+    base_image = await base_image_task
     try:
-        geometry = await fetch_route_geometry(client, cache_dir=cache_dir)
+        geometry = await geometry_task
         public_stops = geometry.stops
         route_lines = list(geometry.routes)
     except Exception as exc:  # noqa: BLE001

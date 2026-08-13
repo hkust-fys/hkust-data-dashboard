@@ -1,6 +1,7 @@
-"""Opt-in live smoke tests against public endpoints (not run in CI).
+"""Live smoke tests against public endpoints.
 
-Run explicitly with:  python -m pytest -m live
+These run in the default pytest invocation, require internet access, and do
+not require API keys or credentials.
 """
 
 import aiohttp

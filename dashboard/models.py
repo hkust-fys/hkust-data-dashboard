@@ -184,6 +184,7 @@ class TrafficIncident:
     status: str  # raw status string from TD
     start_time: datetime | None = None
     end_time: datetime | None = None
+    announcement_time: datetime | None = None
 
 
 @dataclass

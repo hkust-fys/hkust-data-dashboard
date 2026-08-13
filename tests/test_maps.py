@@ -137,11 +137,30 @@ def test_fit_view_returns_fixed_base_map_bounds():
     )
 
 
-def test_bus_prediction_uses_matching_official_upstream_stop_and_heading():
+def test_bus_prediction_interpolates_on_matching_official_upstream_geometry():
+    farther_upstream = Stop("F", "Farther upstream", 22.333360, 114.242881)
     upstream = Stop("U", "Upstream", 22.333360, 114.252881)
     gate = Stop("G", "H.K.U.S.T. SOUTH", 22.333360, 114.262881)
     destination = Stop("D", "Destination", 22.333360, 114.272881)
-    lines = [RouteLine("X", "KMB", "outbound", [upstream, gate, destination])]
+    # The road bends north between the upstream TD stops.  The estimate must
+    # follow this routed shape, not the straight stop-to-stop chord.
+    path = [
+        (farther_upstream.lat, farther_upstream.lon),
+        (22.343360, 114.242881),
+        (upstream.lat, upstream.lon),
+        (gate.lat, gate.lon),
+        (destination.lat, destination.lon),
+    ]
+    lengths = [
+        renderer._path_segment_length(a, b) for a, b in zip(path, path[1:], strict=False)
+    ]
+    offsets = [0.0, lengths[0] + lengths[1]]
+    offsets.extend([offsets[-1] + lengths[2], offsets[-1] + lengths[2] + lengths[3]])
+    lines = [
+        RouteLine(
+            "X", "KMB", "outbound", [farther_upstream, upstream, gate, destination], path, offsets
+        )
+    ]
     group = RouteEtaGroup(
         route="X",
         destination="Destination",
@@ -150,8 +169,58 @@ def test_bus_prediction_uses_matching_official_upstream_stop_and_heading():
         rows=[EtaRow("X", "Destination", "S", Operator.KMB, 3, EtaKind.REALTIME)],
     )
     bus = renderer.predict_buses([group], lines)[0]
-    assert (bus[1], bus[2]) == (upstream.lat, upstream.lon)
-    assert math.isclose(bus[-1], 0.0, abs_tol=1e-9)
+    # Three minutes at two minutes per official stop is halfway from the
+    # previous TD stop to the one before it, rather than a snapped stop.
+    assert bus[1] > upstream.lat  # on the northward road bend
+    assert not math.isclose(bus[2], (farther_upstream.lon + upstream.lon) / 2, abs_tol=2e-5)
+    assert not math.isclose(bus[-1], 0.0, abs_tol=0.05)
+
+
+def test_bus_prediction_has_no_straight_chord_fallback_without_osm_path():
+    upstream = Stop("U", "Upstream", 22.333360, 114.252881)
+    gate = Stop("G", "H.K.U.S.T. SOUTH", 22.333360, 114.262881)
+    destination = Stop("D", "Destination", 22.333360, 114.272881)
+    line = RouteLine("X", "KMB", "outbound", [upstream, gate, destination])
+    group = RouteEtaGroup(
+        route="X", destination="Destination", gate="S", operator=Operator.KMB,
+        rows=[EtaRow("X", "Destination", "S", Operator.KMB, 1, EtaKind.REALTIME)],
+    )
+    assert renderer.predict_buses([group], [line]) == []
+
+
+def test_interpolated_bus_arrow_uses_the_local_curved_road_tangent():
+    # Eastbound road turns north: a bus after the bend must not keep the
+    # route-wide eastbound heading.
+    path = [(22.3300, 114.2600), (22.3300, 114.2610), (22.3310, 114.2610)]
+    first = renderer._path_segment_length(path[0], path[1])
+    located = renderer._point_at_path_offset(path, first + 10)
+    assert located is not None
+    _lat, _lon, heading = located
+    assert math.isclose(heading, math.pi / 2, abs_tol=0.01)
+    arrow = renderer._bus_direction_arrow_triangle((100, 100), heading)
+    assert arrow[0][1] < 100  # screen-space arrow points north after the bend
+
+    reverse_path = list(reversed(path))
+    reverse = renderer._point_at_path_offset(reverse_path, 10)
+    assert reverse is not None
+    assert math.isclose(reverse[2], -math.pi / 2, abs_tol=0.01)
+    reverse_arrow = renderer._bus_direction_arrow_triangle((100, 100), reverse[2])
+    assert reverse_arrow[0][1] > 100
+
+
+def test_bus_prediction_never_renders_at_official_route_termini():
+    upstream = Stop("U", "Upstream", 22.333360, 114.252881)
+    gate = Stop("G", "H.K.U.S.T. SOUTH", 22.333360, 114.262881)
+    destination = Stop("D", "Destination", 22.333360, 114.272881)
+    path = [(s.lat, s.lon) for s in (upstream, gate, destination)]
+    first = renderer._path_segment_length(path[0], path[1])
+    lines = [RouteLine("X", "KMB", "outbound", [upstream, gate, destination], path, [0, first, first * 2])]
+    group = RouteEtaGroup(
+        route="X", destination="Destination", gate="S", operator=Operator.KMB,
+        rows=[EtaRow("X", "Destination", "S", Operator.KMB, 2, EtaKind.REALTIME)],
+    )
+    # Two minutes would put this estimate precisely on the upstream terminus.
+    assert renderer.predict_buses([group], lines) == []
 
 
 def test_public_stop_markers_are_offset_on_opposite_road_sides(tmp_path, monkeypatch):
@@ -195,16 +264,40 @@ def test_stop_glyphs_are_eight_pixels():
         assert (right - left, bottom - top) == (8, 8)
 
 
-def test_bus_marker_has_high_contrast_bordered_effect():
+def test_bus_estimate_is_a_colored_route_pill_with_embedded_white_direction_triangle():
+    import inspect
+
     canvas = Image.new("RGBA", (80, 80), (120, 120, 120, 255))
-    renderer._draw_bus_marker(
-        renderer.ImageDraw.Draw(canvas), 40, 40, 0, renderer.OPERATOR_COLORS[Operator.KMB]
+    renderer._draw_bus_route_marker(
+        renderer.ImageDraw.Draw(canvas),
+        renderer.LabelPlacement("91", (30, 20, 55, 41), (20, 30), Operator.KMB, 0),
+        renderer.OPERATOR_COLORS[Operator.KMB],
+        renderer._font(13),
     )
     colors = {pixel[:3] for _count, pixel in canvas.getcolors(maxcolors=1_000_000)}
-    assert (255, 255, 255) in colors
-    assert any(max(color) < 30 for color in colors)
-    assert (210, 239, 250) in colors  # windows
+    assert (20, 20, 20) in colors  # compact dark label outline
     assert renderer.OPERATOR_COLORS[Operator.KMB] in colors
+    assert (255, 255, 255) in colors  # route text and embedded direction triangle
+    assert "draw.line" not in inspect.getsource(renderer._draw_bus_route_marker)
+    assert not hasattr(renderer, "_draw_bus_marker")
+    assert not hasattr(renderer, "_draw_bus_label_pointer")
+
+
+def test_bus_direction_arrow_is_centred_in_the_pill_at_the_road_anchor():
+    marker = renderer.BusMarker(("91",), 40, 40, Operator.KMB, 0.0)
+    canvas = Image.new("RGBA", (120, 90), (120, 120, 120, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    placement = renderer._layout_bus_labels([marker], draw, renderer._font(13), canvas.size)[0]
+    triangle = renderer._bus_direction_arrow_triangle(placement.marker, placement.heading)
+    centroid = (
+        sum(point[0] for point in triangle) / 3,
+        sum(point[1] for point in triangle) / 3,
+    )
+    assert centroid == placement.marker == (marker.x, marker.y)
+    assert placement.rect[0] <= marker.x <= placement.rect[2]
+    assert placement.rect[1] <= marker.y <= placement.rect[3]
+    assert (placement.rect[1] + placement.rect[3]) / 2 == marker.y
+    assert placement.rect[0] < marker.x < placement.rect[2]
 
 
 def test_bus_label_layout_never_overlaps_is_in_bounds_and_deterministic():
@@ -218,22 +311,17 @@ def test_bus_label_layout_never_overlaps_is_in_bounds_and_deterministic():
     first = renderer._layout_bus_labels(markers, draw, font, canvas.size)
     second = renderer._layout_bus_labels(markers, draw, font, canvas.size)
     assert first == second
-    assert len(first) == len(markers)
+    assert len(first) == 1
+    assert first[0].text == "0/1/2/3/4"
     for index, placement in enumerate(first):
         left, top, right, bottom = placement.rect
         assert 0 <= left < right <= canvas.width
         assert 0 <= top < bottom <= canvas.height
         assert all(
-            not renderer._rects_overlap(
-                placement.rect,
-                (marker.x - 17, marker.y - 13, marker.x + 17, marker.y + 13),
-            )
-            for marker in markers
-        )
-        assert all(
             not renderer._rects_overlap(placement.rect, other.rect)
             for other in first[index + 1 :]
         )
+        assert (top + bottom) / 2 == placement.marker[1]
 
 
 def test_public_stops_merge_by_place_and_direction_but_keep_opposite_direction():
@@ -267,6 +355,42 @@ def test_792m_and_kmb_same_direction_stops_merge_across_operator_offsets():
     paths = [[(stop.lat, stop.lon) for stop in line.stops] for line in lines]
     markers = renderer._merged_public_stop_markers([kmb, ctb], lines, paths)
     assert len(markers) == 1
+
+
+def test_hang_hau_same_direction_kmb_ctb_gmb_merge_but_opposite_stays():
+    west = Stop("W", "Hang Hau Road West", 22.31780, 114.26400)
+    east = Stop("E", "Hang Hau Road East", 22.31780, 114.26800)
+    kmb = Stop("K", "Hang Hau Road", 22.317800, 114.266000)
+    ctb = Stop("C", "Hang Hau Rd Bus Stop", 22.317825, 114.266020)
+    gmb = Stop("G", "Hang Hau Road", 22.317780, 114.265985)
+    opposite = Stop("O", "Hang Hau Road", 22.317840, 114.266010)
+    lines = [
+        RouteLine("91M", "KMB", "out", [west, kmb, east]),
+        RouteLine("792M", "CTB", "out", [west, ctb, east]),
+        RouteLine("11", "GMB", "seq-2", [west, gmb, east]),
+        RouteLine("91M", "KMB", "in", [east, opposite, west]),
+    ]
+    paths = [[(s.lat, s.lon) for s in line.stops] for line in lines]
+    markers = renderer._merged_public_stop_markers([kmb, ctb, gmb, opposite], lines, paths)
+    assert len(markers) == 2
+    assert math.isclose(renderer._angular_distance(markers[0][2], markers[1][2]), math.pi)
+
+
+def test_gmb_stops_do_not_emit_public_glyphs_but_keep_geometry_for_eta():
+    upstream = Stop("G-U", "Minibus upstream", 22.333360, 114.252881)
+    gate = Stop("G-G", "H.K.U.S.T. SOUTH", 22.333360, 114.262881)
+    destination = Stop("G-D", "Minibus destination", 22.333360, 114.272881)
+    path = [(stop.lat, stop.lon) for stop in (upstream, gate, destination)]
+    first = renderer._path_segment_length(path[0], path[1])
+    line = RouteLine("11", "GMB", "seq-1", [upstream, gate, destination], path, [0, first, first * 2])
+
+    # The provider's GMB geometry remains available to ETA interpolation.
+    group = RouteEtaGroup(
+        route="11", destination="Minibus destination", gate="S", operator=Operator.GMB,
+        rows=[EtaRow("11", "Minibus destination", "S", Operator.GMB, 1, EtaKind.REALTIME)],
+    )
+    assert renderer.predict_buses([group], [line])
+    assert renderer._merged_public_stop_markers([gate], [line], [path]) == []
 
 
 def test_bus_markers_merge_matching_route_operator_at_same_position():

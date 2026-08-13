@@ -11,7 +11,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 from dashboard.http import CachedFetch, HttpClient, as_datetime
@@ -24,6 +24,7 @@ from dashboard.models import (
 )
 
 log = logging.getLogger(__name__)
+HKT = timezone(timedelta(hours=8))
 
 # --------------------------------------------------------------------------
 # Endpoints (public, no key)
@@ -405,41 +406,59 @@ def speed_band(speed_kmh: float | None, stale: bool = False) -> SpeedBand:
 # --------------------------------------------------------------------------
 
 def parse_special_news(xml_text: str) -> list[TrafficIncident]:
-    """Parse TD special traffic news v2; dedupe by identifier/status."""
+    """Parse current and legacy TD special traffic news XML schemas."""
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
         log.warning("TD special news parse failed: %s", exc)
         return []
 
-    ns = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
-    nsmap = {"td": ns} if ns else {}
-
     incidents: list[TrafficIncident] = []
-    for item in root.findall(".//td:item", nsmap) if nsmap else root.findall(".//item"):
+    items = [
+        element
+        for element in root.iter()
+        if element.tag.split("}")[-1].lower() in {"item", "message"}
+    ]
+    for item in items:
         fields: dict[str, str] = {}
         for child in item:
-            tag = child.tag.split("}")[-1]
+            tag = child.tag.split("}")[-1].lower()
             fields[tag] = (child.text or "").strip()
-        identifier = fields.get("identifier") or fields.get("id") or ""
-        title = fields.get("title") or ""
-        description = fields.get("description") or fields.get("details") or ""
-        location = fields.get("location") or ""
-        direction = fields.get("direction") or ""
-        status = fields.get("status") or ""
+        identifier = (
+            fields.get("incident_number")
+            or fields.get("identifier")
+            or fields.get("id")
+            or ""
+        )
+        title = fields.get("incident_heading_en") or fields.get("title") or ""
+        description = (
+            fields.get("content_en")
+            or fields.get("incident_detail_en")
+            or fields.get("description")
+            or fields.get("details")
+            or ""
+        )
+        location = fields.get("location_en") or fields.get("location") or ""
+        direction = fields.get("direction_en") or fields.get("direction") or ""
+        status = fields.get("incident_status_en") or fields.get("status") or ""
         if not (identifier or title):
             continue
+        announcement_time = as_datetime(fields.get("announcement_date"))
+        if announcement_time is not None and announcement_time.tzinfo is None:
+            # TD's live feed publishes local Hong Kong wall-clock values.
+            announcement_time = announcement_time.replace(tzinfo=HKT)
         incidents.append(
             TrafficIncident(
                 identifier=identifier,
                 title=title,
                 description=_sanitize_text(description),
-                road=fields.get("road") or "",
+                road=fields.get("road") or location,
                 location=location,
                 direction=direction,
                 status=status,
                 start_time=as_datetime(fields.get("start_time") or fields.get("effective_time")),
                 end_time=as_datetime(fields.get("end_time") or fields.get("expiry_time")),
+                announcement_time=announcement_time,
             )
         )
     return _dedupe_incidents(incidents)
@@ -568,7 +587,13 @@ async def fetch_traffic_data(
         if stale:
             stale_sources.append("TD traffic news")
         incidents = filter_relevant_incidents(parse_special_news(news_text))
-        source_times["traffic_news"] = datetime.fromtimestamp(fetched_at, UTC)
+        official_time = max(
+            (incident.announcement_time for incident in incidents if incident.announcement_time),
+            default=None,
+        )
+        source_times["traffic_news"] = official_time or datetime.fromtimestamp(
+            fetched_at, UTC
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("TD special news fetch failed: %s", exc)
 

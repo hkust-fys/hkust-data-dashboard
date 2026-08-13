@@ -29,6 +29,7 @@ DESC_MAX = 4096
 FIELDS_PER_EMBED_MAX = 25
 CHARS_PER_EMBED_MAX = 6000
 EMBEDS_PER_MESSAGE_MAX = 10
+TD_TRAFFIC_NEWS_URL = "https://www.td.gov.hk/en/special_news/spnews.htm"
 
 _OPERATOR_ICON = {
     Operator.KMB: "🟥",
@@ -169,7 +170,10 @@ def _build_weather_embed(weather: WeatherConditions | None) -> discord.Embed | N
             if w.summary:
                 line += f" — {_esc(w.summary)}"
             if w.issued_at:
-                line += f" · issued {_fmt_timestamp(w.issued_at, 't')}"
+                # Relative timestamps keep the warning line readable across
+                # midnight (Discord renders nearby dates as “today”/
+                # “yesterday” rather than repeating a calendar date).
+                line += f" · issued {_fmt_timestamp(w.issued_at, 'R')}"
             lines.append(line)
 
     # title = the observation reading (🌡️ temp · 🌧️ rain · 💧 humidity)
@@ -226,7 +230,7 @@ def _build_transit_embed(
     if len(value) > DESC_MAX:
         value = value[: DESC_MAX - 1] + "…"
     embed = discord.Embed(color=0xE0AF68, title="🚌 Bus stops", description=value)
-    return _set_source_timestamp(embed, "KMB · Citybus · GMB", source_time)
+    return _set_source_timestamp(embed, "Transport Department · bus ETA", source_time)
 
 
 def _build_traffic_map_embed(
@@ -273,7 +277,7 @@ def _build_traffic_summary_embed(
     td_times = traffic_source_times or {}
     if incidents:
         news_time = td_times.get("traffic_news") or td_source_time
-        evidence_times.append(f"TD traffic news {_fmt_timestamp(news_time, 't')}")
+        evidence_times.append(f"TD traffic news updated {_fmt_timestamp(news_time, 'f')}")
         if news_time is not None:
             displayed_source_times.append(news_time)
     if roadworks:
@@ -283,6 +287,7 @@ def _build_traffic_summary_embed(
             displayed_source_times.append(roadworks_time)
     if evidence_times:
         lines.append(" · ".join(evidence_times))
+    lines.append(f"🔗 [TD traffic news]({TD_TRAFFIC_NEWS_URL})")
     if stale_sources:
         lines.append("⚠️ Stale source cache: " + ", ".join(_esc(name) for name in stale_sources))
     notices = list(incidents or [])
@@ -308,7 +313,9 @@ def _build_traffic_summary_embed(
         for time in displayed_source_times
     ]
     footer_time = max(normalized_times, default=None)
-    return _set_source_timestamp(embed, "Traffic summary (latest)", footer_time)
+    return _set_source_timestamp(
+        embed, "Transport Department · traffic notices", footer_time
+    )
 
 
 def _build_camera_embeds(images: list[ImageAsset]) -> list[discord.Embed]:

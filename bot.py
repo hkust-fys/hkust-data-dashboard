@@ -12,11 +12,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import inspect
 import io
 import logging
 import os
 import sys
-from dataclasses import replace
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 import discord
 from dotenv import load_dotenv
@@ -55,6 +58,7 @@ def _setup_logging(level: str) -> None:
 async def collect_all(
     client: HttpClient,
     settings: Settings,
+    on_result: Callable[[str, object], None] | None = None,
 ) -> dict[str, object]:
     """Fetch all provider groups concurrently; return raw results keyed by name.
 
@@ -107,12 +111,25 @@ async def collect_all(
     tasks["traffic_map"] = asyncio.create_task(_traffic_map())
 
     results: dict[str, object] = {}
-    for name, task in tasks.items():
-        try:
-            results[name] = await task
-        except Exception as exc:  # noqa: BLE001
-            log.warning("provider %s failed: %s", name, exc)
-            results[name] = exc
+    task_names = {task: name for name, task in tasks.items()}
+    pending = set(tasks.values())
+    # Publish every provider as soon as it settles.  In particular, a slow
+    # browser capture no longer prevents weather/traffic/transit from reaching
+    # the snapshot used by the fixed-cadence presenter.
+    while pending:
+        done, pending = await asyncio.wait(
+            pending, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            name = task_names[task]
+            try:
+                value = task.result()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("provider %s failed: %s", name, exc)
+                value = exc
+            results[name] = value
+            if on_result is not None:
+                on_result(name, value)
     return results
 
 
@@ -308,6 +325,22 @@ async def _apply_payload(message, payload: DashboardPayload) -> None:
 # Updater loop
 # --------------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class CollectionSnapshot:
+    """The atomically published, last-good provider results.
+
+    Provider fetches may take much longer than a Discord presentation period.
+    The updater therefore publishes a completed collection as one immutable
+    snapshot.  A failed provider retains its previous value where possible,
+    while the error is retained so the renderer can surface stale data.
+    """
+
+    results: dict[str, object]
+    generation: int
+    completed_monotonic: float
+    stale_providers: frozenset[str] = frozenset()
+
 class DashboardUpdater:
     """Owns the session, providers, caches, and the single update loop."""
 
@@ -316,6 +349,10 @@ class DashboardUpdater:
         self.session = None
         self.client: HttpClient | None = None
         self._last_good_payload: DashboardPayload | None = None
+        self._snapshot: CollectionSnapshot | None = None
+        self._collection_task: asyncio.Task | None = None
+        self._collection_generation = 0
+        self._last_alert_generation = 0
         self._message = None
         self._thread = None
         self._loop_task: asyncio.Task | None = None
@@ -392,6 +429,9 @@ class DashboardUpdater:
                 log.warning("alert post failed: %s", exc)
 
     async def _update_loop(self, channel=None) -> None:
+        # Start collection promptly, but never make rendering wait for it.
+        self._start_collection_if_idle()
+        next_tick = time.monotonic()
         while self._running:
             try:
                 await self._tick(channel)
@@ -399,13 +439,107 @@ class DashboardUpdater:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("update tick failed: %s", exc)
-            await asyncio.sleep(self.settings.update_interval_seconds)
+            next_tick += self.settings.update_interval_seconds
+            await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+
+    def _start_collection_if_idle(self) -> None:
+        """Launch at most one async collection; map capture stays single-flight.
+
+        ``collect_all`` starts the Google Maps capture only once per
+        collection.  Keeping the enclosing task single-flight therefore also
+        prevents overlapping Playwright captures and cache-file races.
+        """
+        if not self._running or self.client is None:
+            return
+        if self._collection_task is not None and not self._collection_task.done():
+            return
+        self._collection_generation += 1
+        generation = self._collection_generation
+        publish = lambda name, value: self._publish_provider_result(  # noqa: E731
+            generation, name, value
+        )
+        # Keeping this small compatibility branch makes injected test/dev
+        # collectors from before snapshots continue to work; production's
+        # ``collect_all`` always has the incremental callback.
+        if "on_result" in inspect.signature(collect_all).parameters:
+            collection = collect_all(self.client, self.settings, on_result=publish)
+        else:
+            collection = collect_all(self.client, self.settings)
+        task = asyncio.create_task(collection)
+        self._collection_task = task
+        task.add_done_callback(self._collection_finished)
+
+    def _collection_finished(self, task: asyncio.Task) -> None:
+        """Publish a completed collection without blocking the presenter."""
+        if self._collection_task is not task:
+            # A cancelled/replaced task can still run its done callback.
+            return
+        self._collection_task = None
+        if task.cancelled():
+            return
+        try:
+            fresh = task.result()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("background collection failed: %s", exc)
+            return
+        if not isinstance(fresh, dict):
+            log.warning("background collection returned invalid result")
+            return
+
+        # ``collect_all`` publishes providers individually.  This fallback is
+        # retained for alternate collectors that do not invoke the callback.
+        if self._snapshot is None or self._snapshot.generation < self._collection_generation:
+            for name, value in fresh.items():
+                self._publish_provider_result(self._collection_generation, name, value)
+
+    def _publish_provider_result(self, generation: int, name: str, value: object) -> None:
+        """Atomically merge one provider into the current last-good snapshot."""
+        if not self._running or generation != self._collection_generation:
+            return
+        previous = self._snapshot
+        merged: dict[str, object] = {}
+        stale: set[str] = set()
+        if previous is not None:
+            merged.update(previous.results)
+            stale.update(previous.stale_providers)
+            # At the beginning of a new collection, all retained values are
+            # stale until their owning provider has supplied this generation.
+            if previous.generation != generation:
+                stale.update(merged)
+        if isinstance(value, Exception) and name in merged and not isinstance(merged[name], Exception):
+            stale.add(name)
+        else:
+            merged[name] = value
+            if isinstance(value, Exception):
+                stale.add(name)
+            else:
+                stale.discard(name)
+        self._snapshot = CollectionSnapshot(
+            results=merged,
+            generation=generation,
+            completed_monotonic=time.monotonic(),
+            stale_providers=frozenset(stale),
+        )
+
+    def _snapshot_payload(self) -> DashboardPayload | None:
+        """Build from the latest completed snapshot, never from a live fetch."""
+        if self._snapshot is None:
+            return None
+        return _to_payload(self._snapshot.results)
 
     async def _tick(self, channel=None) -> None:
-        assert self.client is not None
-        results = await collect_all(self.client, self.settings)
-
-        payload = _to_payload(results)
+        # The presenter is deliberately independent of provider latency.  It
+        # starts the next refresh when idle then reads only a completed snapshot.
+        self._start_collection_if_idle()
+        # Let an already-ready task publish its callback, without awaiting a
+        # slow provider.  This also makes fast local/dry-run providers visible
+        # on the first presentation.
+        await asyncio.sleep(0)
+        if self._collection_task is not None and self._collection_task.done():
+            self._collection_finished(self._collection_task)
+        payload = self._snapshot_payload()
+        if payload is None:
+            return
 
         if channel is None:
             # dry-run / dev: just keep the last payload for inspection
@@ -423,7 +557,9 @@ class DashboardUpdater:
 
         # status thread + alerts (create the thread after the message exists)
         await self._ensure_thread()
-        await self._post_alert_events(results)
+        if self._snapshot is not None and self._snapshot.generation != self._last_alert_generation:
+            await self._post_alert_events(self._snapshot.results)
+            self._last_alert_generation = self._snapshot.generation
 
     async def stop(self) -> None:
         self._running = False
@@ -432,6 +568,11 @@ class DashboardUpdater:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._loop_task
             self._loop_task = None
+        if self._collection_task is not None:
+            self._collection_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._collection_task
+            self._collection_task = None
         if self.session is not None:
             await self.session.close()
             self.session = None

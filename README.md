@@ -62,7 +62,7 @@ Copy `.env.example` to `.env` and set the required values. Never commit `.env`.
 | `DASHBOARD_MESSAGE_ID` | optional | Existing bot-authored dashboard message to reuse |
 | `DEV_WEBHOOK` | development | One-shot preview webhook |
 | `ALERT_ROLE_ID` | optional | Role used for configured critical alerts |
-| `UPDATE_INTERVAL_SECONDS` | optional | Dashboard edit interval; default 15 seconds |
+| `UPDATE_INTERVAL_SECONDS` | optional | Dashboard edit interval; default/minimum 15 seconds |
 | `HTTP_TIMEOUT_SECONDS` | optional | Per-request timeout; default 10 seconds |
 | `CACHE_DIR` | optional | Bounded cache directory; default `.cache` |
 | `LOG_LEVEL` | optional | Standard Python log level; default `INFO` |
@@ -91,18 +91,14 @@ time—are displayed.
 
 ## Test
 
-Fixture tests require no network or credentials.
+The default test run includes live smoke tests against public transit, weather,
+and Transport Department endpoints. Internet access is required for those
+tests; they do not require API keys or credentials.
 
 ```bash
 ruff check .
 python -m compileall -q bot.py dashboard tests
-python -m pytest -m "not live"
-```
-
-Opt-in smoke tests hit public endpoints:
-
-```bash
-python -m pytest -m live
+python -m pytest
 ```
 
 The bot exposes a `hkust-dashboard` console command after installation. It also

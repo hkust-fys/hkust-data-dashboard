@@ -1,6 +1,6 @@
 """Shared test fixtures (sanitized; no keys, no real message content)."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 from dashboard.models import (
     EtaKind,
@@ -273,6 +273,7 @@ SPECIAL_NEWS_XML = """<?xml version="1.0" encoding="UTF-8"?>
     <location>Clear Water Bay Road</location>
     <direction>towards Kowloon</direction>
     <status>Active</status>
+    <ANNOUNCEMENT_DATE>2026-08-13T16:30:00</ANNOUNCEMENT_DATE>
     <start_time>{start}</start_time>
   </item>
   <item>
@@ -282,6 +283,7 @@ SPECIAL_NEWS_XML = """<?xml version="1.0" encoding="UTF-8"?>
     <location>Lung Cheung Road</location>
     <direction>inbound</direction>
     <status>Active</status>
+    <ANNOUNCEMENT_DATE>2026-08-13T16:45:00</ANNOUNCEMENT_DATE>
     <start_time>{start}</start_time>
   </item>
   <item>
@@ -291,10 +293,27 @@ SPECIAL_NEWS_XML = """<?xml version="1.0" encoding="UTF-8"?>
     <location>Nathan Road</location>
     <direction>inbound</direction>
     <status>Active</status>
+    <ANNOUNCEMENT_DATE>2026-08-13T17:00:00</ANNOUNCEMENT_DATE>
     <start_time>{start}</start_time>
   </item>
 </trafficNews>
 """.format(start=utc().isoformat())
+
+SPECIAL_NEWS_LIVE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<list>
+  <message>
+    <INCIDENT_NUMBER>IN-26-00001</INCIDENT_NUMBER>
+    <INCIDENT_HEADING_EN>Road Incident</INCIDENT_HEADING_EN>
+    <INCIDENT_DETAIL_EN>Traffic Accident</INCIDENT_DETAIL_EN>
+    <LOCATION_EN>Clear Water Bay Road</LOCATION_EN>
+    <DIRECTION_EN>Kowloon</DIRECTION_EN>
+    <ANNOUNCEMENT_DATE>2026-08-13T17:23:00</ANNOUNCEMENT_DATE>
+    <INCIDENT_STATUS_EN>UPDATED</INCIDENT_STATUS_EN>
+    <CONTENT_EN>One lane near Fei Ngo Shan Road is closed.</CONTENT_EN>
+    <ID>143997</ID>
+  </message>
+</list>
+"""
 
 ROADWORKS_JSON = {
     "type": "FeatureCollection",
@@ -364,6 +383,7 @@ def traffic_incidents() -> list[TrafficIncident]:
             description="Traffic accident near Fei Ngo Shan Road, slow.",
             road="Clear Water Bay Road", location="Clear Water Bay Road",
             direction="towards Kowloon", status="Active", start_time=utc(),
+            announcement_time=datetime(2026, 8, 13, 16, 30, tzinfo=timezone(timedelta(hours=8))),
         )
     ]
 

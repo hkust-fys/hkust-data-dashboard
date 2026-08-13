@@ -1,6 +1,8 @@
 """HKO weather provider tests: warning-code normalization, tolerance of empty
 objects/null fields, and observation parsing."""
 
+from datetime import datetime
+
 from dashboard.providers.weather import (
     KNOWN_WARNING_CODES,
     parse_observations,
@@ -67,3 +69,16 @@ def test_parse_warnings_null_fields_tolerated():
     )
     assert warnings[0].summary == ""
     assert warnings[0].action == ""
+
+
+def test_parse_warning_issued_time_does_not_use_later_update_time():
+    warnings = parse_warnings(
+        {
+            "WHOT": {
+                "code": "WHOT",
+                "issueTime": "2026-08-05T06:45:00+08:00",
+                "updateTime": "2026-08-13T06:45:00+08:00",
+            }
+        }
+    )
+    assert warnings[0].issued_at == datetime.fromisoformat("2026-08-05T06:45:00+08:00")

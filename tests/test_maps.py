@@ -21,18 +21,27 @@ def _png_data_url(image: Image.Image) -> str:
     return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode()
 
 
+def _detailed_image(size: tuple[int, int], alpha: int = 255) -> Image.Image:
+    image = Image.new("RGBA", size)
+    pixels = image.load()
+    for y in range(size[1]):
+        for x in range(size[0]):
+            pixels[x, y] = ((x * 17) % 256, (y * 29) % 256, ((x + y) * 13) % 256, alpha)
+    return image
+
+
 def test_canvas_export_is_normalized_to_projection_viewport():
-    source = Image.new("RGB", (20, 10), (12, 34, 56))
+    source = _detailed_image((40, 20)).convert("RGB")
     exported = tiles._decode_canvas_export(_png_data_url(source), (40, 20))
     assert exported.size == (40, 20)
     assert exported.mode == "RGB"
-    assert exported.getpixel((20, 10)) == (12, 34, 56)
+    assert exported.getpixel((20, 10)) == source.getpixel((20, 10))
 
 
 def test_canvas_alpha_is_composited_over_neutral_and_incomplete_is_rejected():
-    translucent = Image.new("RGBA", (20, 10), (0, 0, 0, 242))
-    exported = tiles._decode_canvas_export(_png_data_url(translucent), (20, 10))
-    assert exported.getpixel((10, 5)) != (0, 0, 0)
+    translucent = _detailed_image((40, 20), alpha=242)
+    exported = tiles._decode_canvas_export(_png_data_url(translucent), (40, 20))
+    assert exported.getpixel((10, 5)) != translucent.getpixel((10, 5))[:3]
 
     incomplete = Image.new("RGBA", (20, 10), (10, 20, 30, 0))
     try:
@@ -78,9 +87,25 @@ def test_largest_successful_png_wins_among_multiple_canvas_candidates():
 
 def test_first_valid_canvas_skips_larger_invalid_candidate():
     invalid = _png_data_url(Image.new("RGBA", (40, 20), (0, 0, 0, 0)))
-    valid = _png_data_url(Image.new("RGB", (40, 20), (12, 34, 56)))
+    detailed = _detailed_image((40, 20)).convert("RGB")
+    valid = _png_data_url(detailed)
     selected = tiles._decode_first_valid_canvas([invalid, valid], (40, 20))
-    assert selected.getpixel((20, 10)) == (12, 34, 56)
+    assert selected.getpixel((20, 10)) == detailed.getpixel((20, 10))
+
+
+def test_canvas_export_rejects_opaque_tile_loading_grid():
+    grid = Image.new("RGB", (512, 256), (244, 243, 240))
+    draw = renderer.ImageDraw.Draw(grid)
+    for x in range(0, grid.width, 128):
+        draw.line((x, 0, x, grid.height), fill=(255, 255, 255), width=1)
+    for y in range(0, grid.height, 128):
+        draw.line((0, y, grid.width, y), fill=(255, 255, 255), width=1)
+    try:
+        tiles._decode_canvas_export(_png_data_url(grid), grid.size)
+    except ValueError as exc:
+        assert "loading placeholder" in str(exc)
+    else:
+        raise AssertionError("opaque tile loading grid was accepted")
 
 
 async def test_invalid_black_cache_is_not_reused(tmp_path, monkeypatch):
@@ -230,6 +255,20 @@ def test_public_stops_merge_by_place_and_direction_but_keep_opposite_direction()
     assert math.isclose(renderer._angular_distance(markers[0][2], markers[1][2]), math.pi)
 
 
+def test_792m_and_kmb_same_direction_stops_merge_across_operator_offsets():
+    west = Stop("W", "West", 22.3340, 114.2290)
+    kmb = Stop("KMB", "Ngan Ying Road", 22.3340, 114.2300)
+    ctb = Stop("CTB", "Ngan Ying Road", 22.33435, 114.2301)
+    east = Stop("E", "East", 22.3340, 114.2310)
+    lines = [
+        RouteLine("91M", "KMB", "out", [west, kmb, east]),
+        RouteLine("792M", "CTB", "out", [west, ctb, east]),
+    ]
+    paths = [[(stop.lat, stop.lon) for stop in line.stops] for line in lines]
+    markers = renderer._merged_public_stop_markers([kmb, ctb], lines, paths)
+    assert len(markers) == 1
+
+
 def test_bus_markers_merge_matching_route_operator_at_same_position():
     predictions = [
         ("91", 22.334, 114.230, Operator.KMB, 0.0),
@@ -242,6 +281,17 @@ def test_bus_markers_merge_matching_route_operator_at_same_position():
     )
     assert len(markers) == 2
     assert [marker.routes for marker in markers] == [("91",), ("91M",)]
+
+
+def test_off_map_bus_prediction_has_no_marker_or_label():
+    markers = renderer._merge_bus_markers(
+        [("91", 90.0, 0.0, Operator.KMB, 0.0)],
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM,
+        (renderer.MAP_WIDTH, renderer.MAP_HEIGHT),
+    )
+    assert markers == []
 
 
 def test_legend_has_no_obsolete_google_traffic_or_direction_explanation():

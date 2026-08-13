@@ -18,7 +18,7 @@ def test_settings_from_env_valid(monkeypatch):
     assert settings.discord_token == "abc"
     assert settings.announce_channel_id == 12345
     assert settings.dashboard_message_id is None
-    assert settings.update_interval_seconds == 30
+    assert settings.update_interval_seconds == 15
 
 
 def test_settings_missing_required_keys(monkeypatch):

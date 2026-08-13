@@ -186,7 +186,9 @@ def _build_weather_embed(weather: WeatherConditions | None) -> discord.Embed | N
     if not lines and not title_parts:
         return None  # nothing to show
 
-    lines.append("🔗 [HKO warnings](https://www.hko.gov.hk/en/wxinfo/currwx/warning.htm)")
+    lines.append(
+        "🔗 [HKO warnings](https://www.hko.gov.hk/en/wxinfo/dailywx/wxwarntoday.htm)"
+    )
     value = "\n".join(lines)
     if len(value) > DESC_MAX:
         value = value[: DESC_MAX - 1] + "…"

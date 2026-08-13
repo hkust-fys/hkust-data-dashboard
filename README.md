@@ -62,7 +62,7 @@ Copy `.env.example` to `.env` and set the required values. Never commit `.env`.
 | `DASHBOARD_MESSAGE_ID` | optional | Existing bot-authored dashboard message to reuse |
 | `DEV_WEBHOOK` | development | One-shot preview webhook |
 | `ALERT_ROLE_ID` | optional | Role used for configured critical alerts |
-| `UPDATE_INTERVAL_SECONDS` | optional | Dashboard edit interval; default 30 seconds |
+| `UPDATE_INTERVAL_SECONDS` | optional | Dashboard edit interval; default 15 seconds |
 | `HTTP_TIMEOUT_SECONDS` | optional | Per-request timeout; default 10 seconds |
 | `CACHE_DIR` | optional | Bounded cache directory; default `.cache` |
 | `LOG_LEVEL` | optional | Standard Python log level; default `INFO` |

@@ -453,10 +453,15 @@ def _merged_public_stop_markers(
     center_lon: float = BASE_MAP_LON,
     zoom: float = BASE_MAP_ZOOM,
     size: tuple[int, int] = (MAP_WIDTH, MAP_HEIGHT),
-    location_tolerance: float = 7.0,
+    location_tolerance: float = 16.0,
     angular_tolerance: float = math.radians(20),
 ) -> list[tuple[float, float, float]]:
-    """Merge same-place/same-direction stops while retaining the opposite side."""
+    """Merge same-place/same-direction stops across operators.
+
+    Official operators publish slightly different coordinates for the same
+    physical stop.  The 16 px tolerance covers the observed 792M versus
+    91/91M offsets while the heading check retains opposite road sides.
+    """
     headings_by_id = _stop_direction_headings(route_lines)
     candidates: list[tuple[float, float, float, str]] = []
     paths = list(route_paths)
@@ -540,6 +545,8 @@ def _merge_bus_markers(
     projected = []
     for route, lat, lon, operator, heading in predictions:
         x, y = project(lat, lon, center_lat, center_lon, zoom, size)
+        if not (0 <= x < size[0] and 0 <= y < size[1]):
+            continue
         projected.append((operator.value, route, x, y, operator, heading))
     for _operator_name, route, x, y, operator, heading in sorted(projected):
         key = (

@@ -8,9 +8,8 @@ import binascii
 import io
 import logging
 import os
-from contextlib import suppress
 
-from PIL import Image
+from PIL import Image, ImageStat
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +133,13 @@ def _normalize_canvas_image(source: Image.Image, viewport: tuple[int, int]) -> I
     black_pixels = sum(1 for rgb in sample.getdata() if max(rgb) < 8)
     if black_pixels > sample.width * sample.height * 0.20:
         raise ValueError("map canvas export contained a materially black region")
+    quantized_colors = {
+        (red // 16, green // 16, blue // 16)
+        for red, green, blue in sample.getdata()
+    }
+    luminance_spread = ImageStat.Stat(sample.convert("L")).stddev[0]
+    if len(quantized_colors) < 24 or luminance_spread < 4:
+        raise ValueError("map canvas export was a low-information loading placeholder")
     return image
 
 
@@ -188,18 +194,38 @@ async def capture_gmaps_base(
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page(
-                viewport={"width": viewport[0], "height": viewport[1]}
-            )
-            await page.goto(url, wait_until="commit", timeout=20000)
-            with suppress(Exception):
+            try:
+                page = await browser.new_page(
+                    viewport={"width": viewport[0], "height": viewport[1]}
+                )
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_selector("canvas", timeout=15000)
-            await asyncio.sleep(3.5)
-            data_urls = await page.evaluate(CANVAS_EXPORT_SCRIPT)
-            await browser.close()
 
-        image = _decode_first_valid_canvas(data_urls, viewport)
-        image.save(cache_path, format="PNG")
+                # Google first paints an opaque 256 px tile-placeholder grid.
+                # Poll until a detailed canvas appears, then recapture after a
+                # short settling interval so late roads, labels, and traffic
+                # paint operations are included.
+                deadline = asyncio.get_running_loop().time() + 25.0
+                image = None
+                while asyncio.get_running_loop().time() < deadline:
+                    try:
+                        data_urls = await page.evaluate(CANVAS_EXPORT_SCRIPT)
+                        _decode_first_valid_canvas(data_urls, viewport)
+                    except ValueError:
+                        await asyncio.sleep(1.0)
+                        continue
+                    await asyncio.sleep(1.5)
+                    data_urls = await page.evaluate(CANVAS_EXPORT_SCRIPT)
+                    image = _decode_first_valid_canvas(data_urls, viewport)
+                    break
+                if image is None:
+                    raise ValueError("Google Maps canvas did not finish rendering")
+            finally:
+                await browser.close()
+
+        temporary_path = cache_path + ".tmp"
+        image.save(temporary_path, format="PNG")
+        os.replace(temporary_path, cache_path)
         return image
     except Exception as exc:  # noqa: BLE001
         log.warning("Playwright Google Maps canvas export failed (%s), loading cache", exc)

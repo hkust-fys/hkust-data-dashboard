@@ -199,9 +199,10 @@ def parse_warnings(
         info = info_map.get(code, {})
         summary = info.get("summary") or ""
         action = info.get("action") or ""
-        # issue time comes from warnsum's issueDateTime / updateTime
+        # Keep the warning's original issue time distinct from later reissue
+        # or provider-update timestamps shown in the embed metadata.
         issued = None
-        for key in ("issueDateTime", "updateTime", "issueTime"):
+        for key in ("issueDateTime", "issueTime", "updateTime"):
             issued = as_datetime(payload.get(key))
             if issued:
                 break

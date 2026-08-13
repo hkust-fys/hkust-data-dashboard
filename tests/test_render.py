@@ -313,7 +313,10 @@ def test_weather_embed_title_reading_and_issued_timestamps():
     # each warning has an issued timestamp (Discord <t:> renders locally)
     assert "issued <t:" in embed.description
     assert embed.description.count("issued <t:") == 2
-    assert "🔗 [HKO warnings]" in embed.description
+    assert (
+        "🔗 [HKO warnings](https://www.hko.gov.hk/en/wxinfo/dailywx/wxwarntoday.htm)"
+        in embed.description
+    )
     assert embed.timestamp is not None  # native footer timestamp field
     assert embed.footer.text == "HKO"
 

@@ -277,7 +277,7 @@ def _fake_settings():
     return Settings(
         discord_token="",
         announce_channel_id=1,
-        update_interval_seconds=30,
+        update_interval_seconds=15,
         cache_dir=".cache",
     )
 

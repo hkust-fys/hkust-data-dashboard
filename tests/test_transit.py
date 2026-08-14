@@ -8,6 +8,7 @@ import pytest
 from dashboard.models import EtaKind, Operator
 from dashboard.providers.transit import (
     GMB_STOPS,
+    KMB_STOPS,
     _fetch_citybus,
     _fetch_gmb,
     _fetch_kmb,
@@ -21,10 +22,14 @@ class _StubClient:
 
     def __init__(self, responses: dict[str, object]) -> None:
         self._responses = responses
+        self.calls: list[str] = []
 
     async def fetch_json(self, url: str, headers: dict[str, str] | None = None):
+        self.calls.append(url)
         for key, value in self._responses.items():
             if key in url:
+                if isinstance(value, Exception):
+                    raise value
                 return value
         raise AssertionError(f"unexpected URL: {url}")
 
@@ -61,6 +66,13 @@ async def test_kmb_empty_list_is_safe():
 
 
 @pytest.mark.asyncio
+async def test_kmb_deduplicates_shared_stop_endpoints():
+    client = _StubClient({"/stop-eta/": s.kmb_json_empty()})
+    await _fetch_kmb(client, s.utc())
+    assert len(client.calls) == len({spec["stop"] for spec in KMB_STOPS})
+
+
+@pytest.mark.asyncio
 async def test_citybus_handles_empty_eta_and_kmb_cycle():
     client = _StubClient({"/eta/CTB/": s.citybus_json()})
     rows = await _fetch_citybus(client, s.utc())
@@ -93,6 +105,19 @@ async def test_gmb_delayed_remark():
     rows = await _fetch_gmb(client, s.utc())
     delayed = [r for r in rows if r.route == "11S"]
     assert delayed and delayed[0].kind == EtaKind.DELAYED
+
+
+@pytest.mark.asyncio
+async def test_one_failed_gmb_stop_does_not_hide_other_minibuses(caplog):
+    client = _StubClient(
+        {
+            "/eta/stop/20013010": RuntimeError("one stop unavailable"),
+            "/eta/stop/": s.gmb_json(),
+        }
+    )
+    rows = await _fetch_gmb(client, s.utc())
+    assert rows
+    assert "20013010" in caplog.text
 
 
 def test_gmb_config_has_both_gates_and_verified_stops():
@@ -139,19 +164,49 @@ def test_group_etas_splits_gmb_circular_stops_by_stop_seq():
 
     # the departure stop at HKUST: 0, 21, 46
     departure = [
-        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
-               minutes=0, stop_seq=1),
-        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
-               minutes=21, stop_seq=1),
-        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
-               minutes=46, stop_seq=1),
+        EtaRow(
+            route="104",
+            destination="Kwun Tong",
+            gate="S",
+            operator=Operator.GMB,
+            minutes=0,
+            stop_seq=1,
+        ),
+        EtaRow(
+            route="104",
+            destination="Kwun Tong",
+            gate="S",
+            operator=Operator.GMB,
+            minutes=21,
+            stop_seq=1,
+        ),
+        EtaRow(
+            route="104",
+            destination="Kwun Tong",
+            gate="S",
+            operator=Operator.GMB,
+            minutes=46,
+            stop_seq=1,
+        ),
     ]
     # the far-end stop (loop return): 30, 45 — must NOT appear
     loopback = [
-        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
-               minutes=30, stop_seq=24),
-        EtaRow(route="104", destination="Kwun Tong", gate="S", operator=Operator.GMB,
-               minutes=45, stop_seq=24),
+        EtaRow(
+            route="104",
+            destination="Kwun Tong",
+            gate="S",
+            operator=Operator.GMB,
+            minutes=30,
+            stop_seq=24,
+        ),
+        EtaRow(
+            route="104",
+            destination="Kwun Tong",
+            gate="S",
+            operator=Operator.GMB,
+            minutes=45,
+            stop_seq=24,
+        ),
     ]
     groups = group_etas(departure + loopback)
     g104 = [g for g in groups if g.route == "104"]
@@ -167,7 +222,12 @@ def test_route_sort_key_numeric():
     from dashboard.providers.transit import _route_sort_key
 
     assert _route_sort_key("91") < _route_sort_key("291P")
-    assert _route_sort_key("11") < _route_sort_key("11B") < _route_sort_key("12") < _route_sort_key("104")
+    assert (
+        _route_sort_key("11")
+        < _route_sort_key("11B")
+        < _route_sort_key("12")
+        < _route_sort_key("104")
+    )
 
 
 def test_gmb_config_iteration_is_deterministic():

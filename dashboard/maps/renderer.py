@@ -73,6 +73,7 @@ class LabelPlacement(NamedTuple):
     operator: Operator
     heading: float
 
+
 def mercator_y(lat: float) -> float:
     return (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2
 
@@ -108,9 +109,7 @@ def congestion_color(delay_min: float | None) -> tuple[int, int, int]:
     return CONGESTION_COLORS["green"]
 
 
-def offset_polyline(
-    points: list[tuple[float, float]], offset: float
-) -> list[tuple[float, float]]:
+def offset_polyline(points: list[tuple[float, float]], offset: float) -> list[tuple[float, float]]:
     """Offset a screen-space path to the left of its travel direction."""
     if len(points) < 2 or not offset:
         return points
@@ -141,16 +140,16 @@ def offset_where_overlapping(
     def distance_to_segment(point, start, end) -> float:
         dx, dy = end[0] - start[0], end[1] - start[1]
         denominator = dx * dx + dy * dy
-        ratio = 0.0 if not denominator else max(
-            0.0,
-            min(
-                1.0,
-                (
-                    (point[0] - start[0]) * dx
-                    + (point[1] - start[1]) * dy
-                )
-                / denominator,
-            ),
+        ratio = (
+            0.0
+            if not denominator
+            else max(
+                0.0,
+                min(
+                    1.0,
+                    ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / denominator,
+                ),
+            )
         )
         return math.hypot(
             point[0] - start[0] - ratio * dx,
@@ -161,8 +160,7 @@ def offset_where_overlapping(
     segments = list(zip(other, other[1:], strict=False))
     return [
         moved
-        if min(distance_to_segment(point, start, end) for start, end in segments)
-        <= threshold
+        if min(distance_to_segment(point, start, end) for start, end in segments) <= threshold
         else point
         for point, moved in zip(points, shifted, strict=True)
     ]
@@ -171,11 +169,11 @@ def offset_where_overlapping(
 def predict_buses(
     groups: list[RouteEtaGroup], route_lines: Iterable[object]
 ) -> list[tuple[str, float, float, Operator, float]]:
-    """Estimate buses on their matching official TD route geometry.
+    """Estimate buses on their matching official HKeMobility route geometry.
 
     The ETA is only evidence of time to the target stop, not GPS.  We use a
     deliberately coarse two-minutes-per-stop pace, then interpolate by
-    arclength on an OSM road path constrained by the official TD stop order.
+    arclength on the official HKeMobility spatial line and official stop order.
     A line without validated road geometry produces no estimate.
     """
     buses: list[tuple[str, float, float, Operator, float]] = []
@@ -205,20 +203,38 @@ def predict_buses(
             stop_offsets = list(getattr(line, "stop_offsets", ()))
             if len(stops) < 3 or len(path) < 2 or len(stop_offsets) != len(stops):
                 continue
-            gate_index = min(
-                range(len(stops)),
-                key=lambda index: math.hypot(
+            gate_distances = [
+                math.hypot(
                     float(stops[index].lat) - target_gate[0],
                     float(stops[index].lon) - target_gate[1],
-                ),
+                )
+                for index in range(len(stops))
+            ]
+            gate_distance = min(gate_distances)
+            circular = (
+                group.operator == Operator.GMB
+                and group.route == "104"
+                and str(stops[0].stop_id) == str(stops[-1].stop_id)
             )
-            gate_distance = math.hypot(
-                float(stops[gate_index].lat) - target_gate[0],
-                float(stops[gate_index].lon) - target_gate[1],
-            )
-            # A target at either terminus cannot have a defensible upstream
-            # placement.  Likewise, endpoints must never become bus markers.
-            if gate_distance > 0.004 or gate_index in (0, len(stops) - 1):
+            # The 104 ETA is for its next departure from the repeated HKUST
+            # stop.  Use the final loop occurrence so walking backwards follows
+            # the bus that is currently completing the circular trip.
+            if circular:
+                gate_index = max(
+                    index
+                    for index, distance in enumerate(gate_distances)
+                    if math.isclose(distance, gate_distance, abs_tol=1e-8)
+                )
+            else:
+                gate_index = gate_distances.index(gate_distance)
+            # A one-way target at either terminus has no defensible upstream
+            # placement.  The repeated final stop of circular 104 is the sole
+            # exception; the predicted marker itself still stays off endpoints.
+            if (
+                gate_distance > 0.004
+                or gate_index == 0
+                or (gate_index == len(stops) - 1 and not circular)
+            ):
                 continue
             downstream_names = " ".join(stop.name.lower() for stop in stops[gate_index:])
             destination_score = sum(token in downstream_names for token in destination_tokens)
@@ -233,21 +249,32 @@ def predict_buses(
             if row.minutes is None:
                 continue
             # ETA is measured at the target stop.  Walk back through the
-            # matching TD sequence at roughly two minutes per stop, and linearly
+            # matching official sequence at roughly two minutes per stop, and linearly
             # interpolate only within that official geometry segment.
             position = gate_index - max(0, row.minutes) / 2
             if position <= 0 or position >= len(stops) - 1:
                 continue
             index = math.floor(position)
             fraction = position - index
-            target_offset = stop_offsets[index] + (
-                stop_offsets[index + 1] - stop_offsets[index]
-            ) * fraction
+            target_offset = (
+                stop_offsets[index] + (stop_offsets[index + 1] - stop_offsets[index]) * fraction
+            )
             located = _point_at_path_offset(path, target_offset)
             if located is None:
                 continue
             lat, lon, heading = located
-            buses.append((group.route, lat, lon, group.operator, heading))
+            # Identify the vehicle's service direction at a glance.  This is
+            # particularly important where the same route number has a loop.
+            # GMB 104 is a circular service.  Stop 13 (Ngau Tau Kok Road,
+            # outside Lotus Tower) is the approved turn point: before it the
+            # vehicle is heading for Kwun Tong; from it onward it is returning
+            # to HKUST.
+            if group.operator == Operator.GMB and group.route == "104":
+                terminus = "Kwun Tong" if position < 12 else "HKUST"
+            else:
+                # Keep marker wording consistent with the compact ETA embed.
+                terminus = group.destination
+            buses.append((f"{group.route} {terminus}", lat, lon, group.operator, heading))
     return buses
 
 
@@ -500,9 +527,7 @@ def _merged_public_stop_markers(
             continue
         lat, lon = float(stop.lat), float(stop.lon)
         x, y = project(lat, lon, center_lat, center_lon, zoom, size)
-        headings = headings_by_id.get(str(stop.stop_id)) or [
-            _nearest_road_heading(lat, lon, paths)
-        ]
+        headings = headings_by_id.get(str(stop.stop_id)) or [_nearest_road_heading(lat, lon, paths)]
         for heading in headings:
             candidates.append((x, y, heading, str(stop.stop_id), str(stop.name)))
     candidates.sort(key=lambda item: (round(item[1], 4), round(item[0], 4), item[3], item[2]))
@@ -525,8 +550,10 @@ def _rects_overlap(
     padding: float = 2,
 ) -> bool:
     return not (
-        first[2] + padding <= second[0] or second[2] + padding <= first[0]
-        or first[3] + padding <= second[1] or second[3] + padding <= first[1]
+        first[2] + padding <= second[0]
+        or second[2] + padding <= first[0]
+        or first[3] + padding <= second[1]
+        or second[3] + padding <= first[1]
     )
 
 
@@ -569,7 +596,6 @@ def _layout_bus_labels(
         marker_list[index] = nearby._replace(
             routes=tuple(sorted(set(nearby.routes) | set(marker.routes)))
         )
-    obstacles = [(m.x - 5, m.y - 5, m.x + 5, m.y + 5) for m in marker_list]
     placed: list[LabelPlacement] = []
     for marker in marker_list:
         text = "/".join(marker.routes)
@@ -589,11 +615,38 @@ def _layout_bus_labels(
             rect = (left, marker.y - pill_height / 2, right, marker.y + pill_height / 2)
             if rect[0] < 2 or rect[1] < 2 or rect[2] > size[0] - 2 or rect[3] > size[1] - 2:
                 continue
-            if any(
-                _rects_overlap(rect, obstacle)
-                for obstacle, other in zip(obstacles, marker_list, strict=True)
+            covers_other_anchor = any(
+                math.hypot(marker.x - other.x, marker.y - other.y) > 10
+                and _rects_overlap(
+                    rect,
+                    (other.x - 5, other.y - 5, other.x + 5, other.y + 5),
+                )
+                for other in marker_list
                 if other is not marker
-            ) or any(_rects_overlap(rect, existing.rect) for existing in placed):
+            )
+            conflicts = False
+            for existing in placed:
+                if not _rects_overlap(rect, existing.rect):
+                    continue
+                shares_anchor = (
+                    math.hypot(
+                        marker.x - existing.marker[0],
+                        marker.y - existing.marker[1],
+                    )
+                    <= 10
+                )
+                candidate_side = math.copysign(1, (left + right) / 2 - marker.x)
+                existing_side = math.copysign(
+                    1,
+                    (existing.rect[0] + existing.rect[2]) / 2 - existing.marker[0],
+                )
+                # Two operators at the same road point use opposite sides of
+                # their shared arrow compartment. Suppressing both was the
+                # source of apparently missing bus/minibus markers.
+                if not shares_anchor or candidate_side == existing_side:
+                    conflicts = True
+                    break
+            if covers_other_anchor or conflicts:
                 continue
             chosen = rect
             break
@@ -655,11 +708,12 @@ def _bus_direction_arrow_triangle(
 
 def _merge_bus_markers(
     predictions: Iterable[tuple[str, float, float, Operator, float]],
-    center_lat: float, center_lon: float, zoom: float, size: tuple[int, int],
+    center_lat: float,
+    center_lon: float,
+    zoom: float,
+    size: tuple[int, int],
 ) -> list[BusMarker]:
-    grouped: dict[
-        tuple[Operator, str, int, int, int], tuple[set[str], float, float, float]
-    ] = {}
+    grouped: dict[tuple[Operator, str, int, int, int], tuple[set[str], float, float, float]] = {}
     projected = []
     for route, lat, lon, operator, heading in predictions:
         x, y = project(lat, lon, center_lat, center_lon, zoom, size)
@@ -668,7 +722,10 @@ def _merge_bus_markers(
         projected.append((operator.value, route, x, y, operator, heading))
     for _operator_name, route, x, y, operator, heading in sorted(projected):
         key = (
-            operator, route, round(x / 4), round(y / 4),
+            operator,
+            route,
+            round(x / 4),
+            round(y / 4),
             round(heading / math.radians(10)),
         )
         routes, *_rest = grouped.setdefault(key, (set(), x, y, heading))
@@ -724,8 +781,10 @@ def _draw_legend(draw: ImageDraw.ImageDraw, size: tuple[int, int]) -> None:
     cursor_x = x + 158
     for operator, color in OPERATOR_COLORS.items():
         draw.rounded_rectangle(
-            (cursor_x, y + 1, cursor_x + 12, y + 10), radius=2,
-            fill=color + (255,), outline=(20, 20, 20, 255)
+            (cursor_x, y + 1, cursor_x + 12, y + 10),
+            radius=2,
+            fill=color + (255,),
+            outline=(20, 20, 20, 255),
         )
         draw.text((cursor_x + 15, y - 2), operator.value, fill=(30, 30, 30, 255), font=font)
         cursor_x += 23 + draw.textlength(operator.value, font=font)
@@ -746,7 +805,7 @@ def _draw_legend(draw: ImageDraw.ImageDraw, size: tuple[int, int]) -> None:
     draw.text((public_x + 13, row_y - 3), "public bus stop", fill=(30, 30, 30, 255), font=font)
     draw.text(
         (x, y + 54),
-        "Road geometry © OpenStreetMap contributors (ODbL), routed by OSRM",
+        "Route geometry © Transport Department HKeMobility",
         fill=(60, 60, 60, 255),
         font=font,
     )

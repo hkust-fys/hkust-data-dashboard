@@ -1,4 +1,6 @@
-"""HttpClient tests: TTL caching and stale-on-error without real network."""
+"""HttpClient tests: caching, stale-on-error, and per-origin pacing."""
+
+import asyncio
 
 import pytest
 
@@ -131,3 +133,22 @@ async def test_gather_any_isolates_exceptions():
     results = await _C().gather_any([boom(), ok()])
     assert isinstance(results[0], ValueError)
     assert results[1] == 42
+
+
+@pytest.mark.asyncio
+async def test_origin_pacing_spaces_one_host_without_blocking_another():
+    client = HttpClient(object(), origin_request_interval_seconds=0.04)
+    started: dict[str, float] = {}
+    loop = asyncio.get_running_loop()
+
+    async def paced(name: str, url: str) -> None:
+        await client._pace_origin(url)  # noqa: SLF001
+        started[name] = loop.time()
+
+    await asyncio.gather(
+        paced("one-first", "https://one.example/first"),
+        paced("two-first", "https://two.example/first"),
+        paced("one-second", "https://one.example/second"),
+    )
+    assert abs(started["one-first"] - started["two-first"]) < 0.02
+    assert started["one-second"] - started["one-first"] >= 0.025

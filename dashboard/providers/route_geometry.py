@@ -1,9 +1,9 @@
-"""Official TD route-stop sequences and OSM-backed road geometry.
+"""Official HKeMobility route geometry for estimated map markers.
 
-This provider loads official KMB/Citybus/GMB stop coordinates and ordered
-sequences, then routes those waypoints over OSM roads. The versioned cache is
-rooted in the caller's ``cache_dir``. There
-are no import-time network or filesystem side effects.
+The provider combines official operator stop sequences/coordinates with the
+route lines shown by HKeMobility. Requests to each upstream host are paced
+across the dashboard update window. Geometry is cached on disk for 12 hours;
+failed directions retain their last-good line without blocking other routes.
 """
 
 from __future__ import annotations
@@ -15,69 +15,70 @@ import logging
 import math
 import os
 import time
+from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import urlsplit
 
-import aiohttp
-
-from dashboard.http import USER_AGENT, CachedFetch, HttpClient
+from dashboard.http import CachedFetch, HttpClient
 
 log = logging.getLogger(__name__)
 
-TD_ROUTES_TTL_SECONDS = 12 * 3600.0  # 12 hours: route/stop lists change rarely
-GEOMETRY_CACHE_VERSION = 6
+ROUTE_TTL_SECONDS = 12 * 3600.0
+GEOMETRY_CACHE_VERSION = 10
 GEOMETRY_CACHE_NAME = "route-geometry.json"
-DEFAULT_OSRM_BASE_URL = "https://router.project-osrm.org"
-OSRM_BASE_URL_ENV = "OSRM_BASE_URL"
-OSRM_MAX_WAYPOINTS = 16
-# Geometry is an enhancement to the live dashboard, not a reason to hold an
-# update hostage.  A cold cache gets a short, whole-refresh budget; a last-good
-# disk cache is returned immediately and refreshed in the background.
-GEOMETRY_REFRESH_TIMEOUT_SECONDS = 12.0
+GEOMETRY_REFRESH_TIMEOUT_SECONDS = 45.0
 GEOMETRY_FAILURE_COOLDOWN_SECONDS = 5 * 60.0
-_refresh_tasks: dict[str, object] = {}
-_refresh_retry_after: dict[str, float] = {}
-
-# Reviewed local exclusion: Hang Hau Village (OSM node 7428926981) is not on
-# KMB 91's TD stop sequence.  OSRM's generic driving profile can otherwise
-# choose its local lanes between the adjacent CWB Road stops.  Reject rather
-# than inventing a straight replacement; the next refresh can use a better
-# routed path.
-HANG_HAU_VILLAGE = (22.3211924, 114.2668510)
-HANG_HAU_VILLAGE_EXCLUSION_METRES = 180.0
-
-# The routes we display, keyed by operator. "bounds" are the TD direction
-# values (outbound/inbound for KMB/CTB; route_seq 1/2 for GMB).
-KMB_ROUTES: dict[str, tuple[str, str]] = {
-    "91": ("outbound", "inbound"),
-    "91M": ("outbound", "inbound"),
-    "91P": ("outbound", "inbound"),
-    "291P": ("outbound", "inbound"),
-}
-CTB_ROUTES: dict[str, tuple[str, str]] = {
-    "792M": ("outbound", "inbound"),
-}
-# GMB route_id -> (route_code, route_seqs)
-GMB_ROUTES: dict[int, tuple[str, tuple[int, ...]]] = {
-    2004791: ("11", (1, 2)),
-    2004828: ("11B", (1,)),
-    2004825: ("11M", (2,)),
-    2004826: ("11S", (1, 2)),
-    2004764: ("12", (1, 2)),
-    2007200: ("104", (1,)),
-}
+PACE_WINDOW_SECONDS = 12.0
+PACE_MAX_INTERVAL_SECONDS = 0.35
+MAX_STOP_DISTANCE_METRES = 110.0
 
 KMB_ROUTE_STOP_URL = "https://data.etabus.gov.hk/v1/transport/kmb/route-stop/{route}/{bound}/1"
 KMB_STOP_URL = "https://data.etabus.gov.hk/v1/transport/kmb/stop/{stop_id}"
 CTB_ROUTE_STOP_URL = "https://rt.data.gov.hk/v2/transport/citybus/route-stop/CTB/{route}/{bound}"
 CTB_STOP_URL = "https://rt.data.gov.hk/v2/transport/citybus/stop/{stop_id}"
-GMB_ROUTE_STOP_URL = "https://data.etagmb.gov.hk/route-stop/{route_id}/{seq}"
+GMB_ROUTE_STOP_URL = "https://data.etagmb.gov.hk/route-stop/{route_id}/{sequence}"
 GMB_STOP_URL = "https://data.etagmb.gov.hk/stop/{stop_id}"
+HKEMOBILITY_SPATIAL_URL = (
+    "https://www.hkemobility.gov.hk/api/drss/public-transport-routes/"
+    "{route_id}/sequence/{sequence}/spatial"
+)
+
+
+@dataclass(frozen=True)
+class RouteSpec:
+    operator: str
+    route: str
+    bound: str
+    route_id: int
+    sequence: int
+
+
+ROUTE_SPECS: tuple[RouteSpec, ...] = (
+    RouteSpec("KMB", "91", "outbound", 1395, 1),
+    RouteSpec("KMB", "91", "inbound", 1395, 2),
+    RouteSpec("KMB", "91M", "outbound", 1398, 1),
+    RouteSpec("KMB", "91M", "inbound", 1398, 2),
+    RouteSpec("KMB", "91P", "outbound", 8093, 1),
+    RouteSpec("KMB", "91P", "inbound", 8426, 1),
+    RouteSpec("KMB", "291P", "outbound", 8710, 1),
+    RouteSpec("CTB", "792M", "outbound", 1616, 1),
+    RouteSpec("CTB", "792M", "inbound", 1616, 2),
+    RouteSpec("GMB", "11", "seq-1", 2004791, 1),
+    RouteSpec("GMB", "11", "seq-2", 2004791, 2),
+    RouteSpec("GMB", "11B", "seq-1", 2004828, 1),
+    RouteSpec("GMB", "11M", "seq-2", 2004825, 2),
+    RouteSpec("GMB", "11S", "seq-1", 2004826, 1),
+    RouteSpec("GMB", "11S", "seq-2", 2004826, 2),
+    RouteSpec("GMB", "12", "seq-1", 2004764, 1),
+    RouteSpec("GMB", "12", "seq-2", 2004764, 2),
+    RouteSpec("GMB", "104", "seq-1", 2007200, 1),
+)
 
 
 @dataclass(frozen=True)
 class Stop:
-    """One official TD stop on a route: id, name, WGS84 coords."""
-
     stop_id: str
     name: str
     lat: float
@@ -86,156 +87,28 @@ class Stop:
 
 @dataclass
 class RouteLine:
-    """One direction of one route: the ordered stop sequence."""
-
     route: str
     operator: str
-    bound: str  # "outbound"/"inbound" (KMB/CTB) or "seq-1"/"seq-2" (GMB)
+    bound: str
     stops: list[Stop] = field(default_factory=list)
     path: list[tuple[float, float]] = field(default_factory=list)
     stop_offsets: list[float] = field(default_factory=list)
+    destination: str = ""
+    path_source: str = ""
 
 
 @dataclass
 class RouteGeometry:
-    """Cached official route sequences and deduplicated public stops."""
-
     routes: list[RouteLine] = field(default_factory=list)
     stops: list[Stop] = field(default_factory=list)
     fetched_at: float = 0.0
 
 
-async def _fetch_stop(
-    client: HttpClient, url: str, cache_key: str
-) -> tuple[str, float, float] | None:
-    """Fetch one stop's coords (cached 12h). Returns (name, lat, lon)."""
-    spec = CachedFetch(url, TD_ROUTES_TTL_SECONDS, cache_key=cache_key)
-    try:
-        _, raw, _ = await client.fetch_json_cached(spec)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("TD stop %s fetch failed: %s", cache_key, exc)
-        return None
-    data = (raw or {}).get("data") if isinstance(raw, dict) else None
-    if not isinstance(data, dict):
-        return None
-    try:
-        name = data.get("name_en") or data.get("name_tc") or cache_key
-        lat = float(data.get("lat") or data.get("coordinates", {}).get("wgs84", {}).get("latitude"))
-        lon = float(
-            data.get("long") or data.get("coordinates", {}).get("wgs84", {}).get("longitude")
-        )
-        return name, lat, lon
-    except (TypeError, ValueError):
-        return None
-
-
-async def _fetch_kmb_route_stops(client: HttpClient, route: str, bound: str) -> list[str] | None:
-    spec = CachedFetch(
-        KMB_ROUTE_STOP_URL.format(route=route, bound=bound),
-        TD_ROUTES_TTL_SECONDS,
-        cache_key=f"td-kmb-route-stop-{route}-{bound}",
-    )
-    try:
-        _, raw, _ = await client.fetch_json_cached(spec)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("KMB %s %s route-stop failed: %s", route, bound, exc)
-        return None
-    data = (raw or {}).get("data") if isinstance(raw, dict) else None
-    if not isinstance(data, list):
-        return None
-    return [str(s.get("stop")) for s in data if isinstance(s, dict) and s.get("stop")]
-
-
-async def _fetch_ctb_route_stops(client: HttpClient, route: str, bound: str) -> list[str] | None:
-    spec = CachedFetch(
-        CTB_ROUTE_STOP_URL.format(route=route, bound=bound),
-        TD_ROUTES_TTL_SECONDS,
-        cache_key=f"td-ctb-route-stop-{route}-{bound}",
-    )
-    try:
-        _, raw, _ = await client.fetch_json_cached(spec)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("CTB %s %s route-stop failed: %s", route, bound, exc)
-        return None
-    data = (raw or {}).get("data") if isinstance(raw, dict) else None
-    if not isinstance(data, list):
-        return None
-    return [str(s.get("stop")) for s in data if isinstance(s, dict) and s.get("stop")]
-
-
-async def _fetch_gmb_route_stops(client: HttpClient, route_id: int, seq: int) -> list[str] | None:
-    spec = CachedFetch(
-        GMB_ROUTE_STOP_URL.format(route_id=route_id, seq=seq),
-        TD_ROUTES_TTL_SECONDS,
-        cache_key=f"td-gmb-route-stop-{route_id}-{seq}",
-    )
-    try:
-        _, raw, _ = await client.fetch_json_cached(spec)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("GMB %s seq %s route-stop failed: %s", route_id, seq, exc)
-        return None
-    data = (raw or {}).get("data") if isinstance(raw, dict) else None
-    route_stops = (data or {}).get("route_stops") if isinstance(data, dict) else None
-    if not isinstance(route_stops, list):
-        return None
-    return [str(s.get("stop_id")) for s in route_stops if isinstance(s, dict) and s.get("stop_id")]
-
-
-async def _load_route_lines(client: HttpClient) -> list[RouteLine]:
-    """Fetch every tracked route's stop sequences + stop coordinates."""
-    jobs: list[RouteLine] = []
-    # KMB
-    for route, (outb, inb) in KMB_ROUTES.items():
-        for bound in (outb, inb):
-            jobs.append(RouteLine(route, "KMB", bound))
-    # CTB
-    for route, (outb, inb) in CTB_ROUTES.items():
-        for bound in (outb, inb):
-            jobs.append(RouteLine(route, "CTB", bound))
-    # GMB
-    for _route_id, (code, seqs) in GMB_ROUTES.items():
-        for seq in seqs:
-            jobs.append(RouteLine(code, "GMB", f"seq-{seq}"))
-
-    # fetch all route-stop lists concurrently
-    stop_lists = await client.gather_any(
-        [
-            _fetch_kmb_route_stops(client, r.route, r.bound)
-            if r.operator == "KMB"
-            else _fetch_ctb_route_stops(client, r.route, r.bound)
-            if r.operator == "CTB"
-            else _fetch_gmb_route_stops(
-                client,
-                next(route_id for route_id, (code, _seqs) in GMB_ROUTES.items() if code == r.route),
-                int(r.bound.removeprefix("seq-")),
-            )
-            for r in jobs
-        ]
-    )
-    for line, stop_ids in zip(jobs, stop_lists, strict=True):
-        if not stop_ids:
-            continue
-        # fetch each stop's coords (cached)
-        for sid in stop_ids:
-            if line.operator == "KMB":
-                url = KMB_STOP_URL.format(stop_id=sid)
-            elif line.operator == "CTB":
-                url = CTB_STOP_URL.format(stop_id=sid)
-            else:
-                url = GMB_STOP_URL.format(stop_id=sid)
-            stop = await _fetch_stop(client, url, cache_key=f"td-stop-{sid}")
-            if stop:
-                line.stops.append(Stop(sid, stop[0], stop[1], stop[2]))
-    lines = [line for line in jobs if len(line.stops) >= 2]
-    geometry = await client.gather_any([_fetch_osrm_path(client, line) for line in lines])
-    for line, routed in zip(lines, geometry, strict=True):
-        if isinstance(routed, tuple):
-            line.path, line.stop_offsets = routed
-    return lines
+_refresh_tasks: dict[str, asyncio.Task[RouteGeometry]] = {}
+_refresh_retry_after: dict[str, float] = {}
 
 
 def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
-    """Approximate local WGS84 distance in metres."""
     lat_scale = 111_320.0
     lon_scale = lat_scale * math.cos(math.radians((a[0] + b[0]) / 2))
     return math.hypot((b[0] - a[0]) * lat_scale, (b[1] - a[1]) * lon_scale)
@@ -247,13 +120,11 @@ def _append_point(path: list[tuple[float, float]], point: tuple[float, float]) -
 
 
 def _path_length(path: list[tuple[float, float]]) -> float:
-    return sum(_distance(a, b) for a, b in zip(path, path[1:], strict=False))
+    return sum(_distance(first, second) for first, second in zip(path, path[1:], strict=False))
 
 
-def _point_at_offset(
-    path: list[tuple[float, float]], offset: float
-) -> tuple[float, float] | None:
-    if not path or not math.isfinite(offset) or offset < 0:
+def _point_at_offset(path: list[tuple[float, float]], offset: float) -> tuple[float, float] | None:
+    if len(path) < 2 or offset < 0:
         return None
     travelled = 0.0
     for first, second in zip(path, path[1:], strict=False):
@@ -268,264 +139,332 @@ def _point_at_offset(
     return path[-1] if math.isclose(offset, travelled, abs_tol=1.0) else None
 
 
-def _valid_path_offsets(
-    stops: list[Stop], path: list[tuple[float, float]], offsets: list[float]
-) -> bool:
-    """Reject incomplete, non-finite, or waypoint-detached routed geometry."""
-    if len(stops) < 2 or len(path) < 2 or len(offsets) != len(stops):
-        return False
-    if any(
-        not math.isfinite(value)
-        for point in path
-        for value in point
-    ) or any(not math.isfinite(value) for value in offsets):
-        return False
-    if any(not (-90 <= lat <= 90 and -180 <= lon <= 180) for lat, lon in path):
-        return False
-    if not math.isclose(offsets[0], 0.0, abs_tol=0.01):
-        return False
-    if any(second <= first for first, second in zip(offsets, offsets[1:], strict=False)):
-        return False
-    total = _path_length(path)
-    if not math.isclose(offsets[-1], total, rel_tol=0.001, abs_tol=1.0):
-        return False
-    for stop, offset in zip(stops, offsets, strict=True):
-        point = _point_at_offset(path, offset)
-        if point is None or _distance(point, (stop.lat, stop.lon)) > 110:
-            return False
-    return True
+def _segment_projection(
+    first: tuple[float, float], second: tuple[float, float], point: tuple[float, float]
+) -> tuple[float, float]:
+    lat_scale = 111_320.0
+    lon_scale = lat_scale * math.cos(math.radians((first[0] + second[0]) / 2))
+    dx, dy = (second[1] - first[1]) * lon_scale, (second[0] - first[0]) * lat_scale
+    px, py = (point[1] - first[1]) * lon_scale, (point[0] - first[0]) * lat_scale
+    length_sq = dx * dx + dy * dy
+    fraction = 0.0 if length_sq == 0 else min(1.0, max(0.0, (px * dx + py * dy) / length_sq))
+    projected = (
+        first[0] + (second[0] - first[0]) * fraction,
+        first[1] + (second[1] - first[1]) * fraction,
+    )
+    return _distance(first, projected), _distance(point, projected)
 
 
-def _valid_route_line(line: RouteLine) -> bool:
-    if not line.route or line.operator not in {"KMB", "CTB", "GMB"} or not line.bound:
-        return False
-    if any(
-        not stop.stop_id
-        or not math.isfinite(stop.lat)
-        or not math.isfinite(stop.lon)
-        or not (-90 <= stop.lat <= 90 and -180 <= stop.lon <= 180)
-        for stop in line.stops
+def _monotonic_stop_offsets(
+    path: list[tuple[float, float]], stops: list[Stop]
+) -> list[float] | None:
+    """Map ordered stops to later occurrences on an official route line."""
+    offsets: list[float] = []
+    minimum = -0.1
+    for stop in stops:
+        travelled = 0.0
+        candidates: list[tuple[float, float]] = []
+        for first, second in zip(path, path[1:], strict=False):
+            along, distance = _segment_projection(first, second, (stop.lat, stop.lon))
+            offset = travelled + along
+            if offset > minimum and distance <= MAX_STOP_DISTANCE_METRES:
+                candidates.append((distance, offset))
+            travelled += _distance(first, second)
+        if not candidates:
+            return None
+        _distance_to_line, selected = min(candidates)
+        offsets.append(selected)
+        minimum = selected + 0.1
+    return offsets
+
+
+def _valid_line(line: RouteLine) -> bool:
+    if (
+        line.path_source != "hkemobility"
+        or len(line.stops) < 2
+        or len(line.path) < 2
+        or len(line.stop_offsets) != len(line.stops)
+        or not line.destination
     ):
         return False
-    if not _valid_path_offsets(line.stops, line.path, line.stop_offsets):
+    if any(
+        second <= first
+        for first, second in zip(line.stop_offsets, line.stop_offsets[1:], strict=False)
+    ):
         return False
-    return not (
-        line.operator == "KMB"
-        and line.route == "91"
-        and any(_distance(point, HANG_HAU_VILLAGE) < HANG_HAU_VILLAGE_EXCLUSION_METRES for point in line.path)
-    )
+    for stop, offset in zip(line.stops, line.stop_offsets, strict=True):
+        point = _point_at_offset(line.path, offset)
+        if point is None or _distance(point, (stop.lat, stop.lon)) > MAX_STOP_DISTANCE_METRES:
+            return False
+    return all(-90 <= lat <= 90 and -180 <= lon <= 180 for lat, lon in line.path)
 
 
-async def _fetch_osrm_chunk(
-    client: HttpClient, stops: list[Stop], cache_key: str
-) -> tuple[list[tuple[float, float]], list[float]] | None:
-    coordinates = ";".join(f"{stop.lon:.7f},{stop.lat:.7f}" for stop in stops)
-    query = "?alternatives=false&steps=true&overview=false&geometries=geojson"
-    configured = _configured_osrm_base_url()
-    for index, base_url in enumerate(_osrm_base_urls()):
-        url = f"{base_url}/route/v1/driving/{coordinates}{query}"
-        try:
-            _, raw, _ = await client.fetch_json_cached(
-                CachedFetch(
-                    url,
-                    TD_ROUTES_TTL_SECONDS,
-                    cache_key=f"{cache_key}-transport-{index}",
-                    timeout=30.0,
-                ),
-                headers={"User-Agent": USER_AGENT},
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("OSRM route chunk failed over %s: %s", url.split(":", 1)[0], type(exc).__name__)
-            # The public project server has occasionally presented an expired
-            # certificate.  Keep verification for HTTPS and only use cleartext
-            # for this exact public, coordinate-only request and exact TLS
-            # failure.  A configured endpoint must never be silently downgraded.
-            if not (
-                index == 0
-                and configured == DEFAULT_OSRM_BASE_URL
-                and isinstance(exc, aiohttp.ClientConnectorCertificateError)
-            ):
-                break
-            continue
-        routed = _parse_osrm_response(raw, stops)
-        if routed is not None:
-            return routed
-        log.warning("OSRM returned invalid route geometry over %s", url.split(":", 1)[0])
-    return None
+async def _paced_gather(
+    jobs: list[tuple[str, Callable[[], Awaitable[Any]]]],
+) -> list[Any]:
+    """Launch requests to each origin gradually; different origins overlap."""
+    positions: dict[str, int] = defaultdict(int)
+    totals: dict[str, int] = defaultdict(int)
+    for url, _factory in jobs:
+        totals[urlsplit(url).netloc] += 1
 
-
-def _configured_osrm_base_url() -> str:
-    """Return the configured OSRM endpoint and its transport-only fallback.
-
-    OSRM requests contain only public TD coordinates and request public OSM
-    road geometry; they never contain credentials, cookies, or user data.  We
-    therefore permit HTTP only as a last-resort transport fallback when the
-    configured HTTPS endpoint cannot be used (for example, an expired public
-    server certificate).  TLS verification remains enabled for HTTPS.
-    """
-    configured = os.getenv(OSRM_BASE_URL_ENV, DEFAULT_OSRM_BASE_URL).strip().rstrip("/")
-    if not configured.startswith(("https://", "http://")):
-        log.warning("ignoring invalid %s; using the default endpoint", OSRM_BASE_URL_ENV)
-        configured = DEFAULT_OSRM_BASE_URL
-    return configured
-
-
-def _osrm_base_urls() -> tuple[str, ...]:
-    configured = _configured_osrm_base_url()
-    if configured == DEFAULT_OSRM_BASE_URL:
-        return (configured, "http://router.project-osrm.org")
-    return (configured,)
-
-
-def _parse_osrm_response(
-    raw: object, stops: list[Stop]
-) -> tuple[list[tuple[float, float]], list[float]] | None:
-    """Validate an OSRM route and retain arclength offsets for every TD stop."""
-    routes = raw.get("routes") if isinstance(raw, dict) and raw.get("code") == "Ok" else None
-    if not isinstance(routes, list) or not routes or not isinstance(routes[0], dict):
-        return None
-    waypoints = raw.get("waypoints")
-    if not isinstance(waypoints, list) or len(waypoints) != len(stops):
-        return None
-    for waypoint, stop in zip(waypoints, stops, strict=True):
-        location = waypoint.get("location") if isinstance(waypoint, dict) else None
-        if not isinstance(location, list) or len(location) < 2:
-            return None
-        try:
-            snapped = (float(location[1]), float(location[0]))
-        except (TypeError, ValueError):
-            return None
-        # Reject a route if OSRM had to snap an official TD stop to a remote
-        # road.  This is especially important around divided carriageways and
-        # hillside roads where the nearest drivable edge may be misleading.
-        if _distance(snapped, (stop.lat, stop.lon)) > 100:
-            return None
-    legs = routes[0].get("legs")
-    if not isinstance(legs, list) or len(legs) != len(stops) - 1:
-        return None
-    path: list[tuple[float, float]] = []
-    offsets = [0.0]
-    for leg in legs:
-        steps = leg.get("steps") if isinstance(leg, dict) else None
-        if not isinstance(steps, list) or not steps:
-            return None
-        before_leg = len(path)
-        for step in steps:
-            geometry = step.get("geometry") if isinstance(step, dict) else None
-            coords = geometry.get("coordinates") if isinstance(geometry, dict) else None
-            if not isinstance(coords, list):
-                return None
-            for coord in coords:
-                if not isinstance(coord, list) or len(coord) < 2:
-                    return None
-                try:
-                    _append_point(path, (float(coord[1]), float(coord[0])))
-                except (TypeError, ValueError):
-                    return None
-        if len(path) <= before_leg:
-            return None
-        offsets.append(_path_length(path))
-    if not _valid_path_offsets(stops, path, offsets):
-        return None
-    return path, offsets
-
-
-async def _fetch_osrm_path(
-    client: HttpClient, line: RouteLine
-) -> tuple[list[tuple[float, float]], list[float]] | None:
-    """Route every official TD stop through OSM roads in overlapping chunks."""
-    complete_path: list[tuple[float, float]] = []
-    complete_offsets: list[float] = []
-    start = 0
-    while start < len(line.stops) - 1:
-        end = min(len(line.stops), start + OSRM_MAX_WAYPOINTS)
-        chunk = line.stops[start:end]
-        digest = hashlib.sha256(
-            ";".join(f"{s.stop_id}:{s.lat:.6f}:{s.lon:.6f}" for s in chunk).encode()
-        ).hexdigest()[:20]
-        routed = await _fetch_osrm_chunk(
-            client, chunk, f"osm-osrm-route-{line.operator}-{line.route}-{line.bound}-{digest}"
+    tasks: list[Awaitable[Any]] = []
+    for url, factory in jobs:
+        origin = urlsplit(url).netloc
+        position = positions[origin]
+        positions[origin] += 1
+        interval = min(
+            PACE_MAX_INTERVAL_SECONDS,
+            PACE_WINDOW_SECONDS / max(1, totals[origin] - 1),
         )
-        if routed is None:
-            return None
-        chunk_path, chunk_offsets = routed
-        base = complete_offsets[-1] if complete_offsets else 0.0
-        for point in chunk_path:
-            _append_point(complete_path, point)
-        if not complete_offsets:
-            complete_offsets.extend(chunk_offsets)
-        else:
-            complete_offsets.extend(base + offset for offset in chunk_offsets[1:])
-        start = end - 1
-    if len(complete_offsets) != len(line.stops):
-        return None
-    if not _valid_path_offsets(line.stops, complete_path, complete_offsets):
-        return None
-    candidate = RouteLine(line.route, line.operator, line.bound, line.stops, complete_path, complete_offsets)
-    if not _valid_route_line(candidate):
-        log.warning("OSRM route %s %s entered excluded Hang Hau Village lanes", line.route, line.bound)
-        return None
-    return complete_path, complete_offsets
+
+        async def delayed(
+            delay: float = position * interval,
+            request: Callable[[], Awaitable[Any]] = factory,
+        ) -> Any:
+            if delay:
+                await asyncio.sleep(delay)
+            return await request()
+
+        tasks.append(delayed())
+    return await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _serialize(geo: RouteGeometry) -> dict:
+def _route_stop_url(spec: RouteSpec) -> str:
+    if spec.operator == "KMB":
+        return KMB_ROUTE_STOP_URL.format(route=spec.route, bound=spec.bound)
+    if spec.operator == "CTB":
+        return CTB_ROUTE_STOP_URL.format(route=spec.route, bound=spec.bound)
+    return GMB_ROUTE_STOP_URL.format(route_id=spec.route_id, sequence=spec.sequence)
+
+
+def _stop_url(operator: str, stop_id: str) -> str:
+    template = {"KMB": KMB_STOP_URL, "CTB": CTB_STOP_URL, "GMB": GMB_STOP_URL}[operator]
+    return template.format(stop_id=stop_id)
+
+
+async def _fetch_route_stop_ids(client: HttpClient, spec: RouteSpec) -> list[str] | None:
+    url = _route_stop_url(spec)
+    try:
+        _, raw, _ = await client.fetch_json_cached(
+            CachedFetch(
+                url,
+                ROUTE_TTL_SECONDS,
+                cache_key=f"route-stops-{spec.operator}-{spec.route}-{spec.bound}",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "route-stop list failed for %s/%s/%s: %s",
+            spec.operator,
+            spec.route,
+            spec.bound,
+            type(exc).__name__,
+        )
+        return None
+    data = raw.get("data") if isinstance(raw, dict) else None
+    values = data.get("route_stops") if spec.operator == "GMB" and isinstance(data, dict) else data
+    if not isinstance(values, list):
+        return None
+    key = "stop_id" if spec.operator == "GMB" else "stop"
+    return [str(item[key]) for item in values if isinstance(item, dict) and item.get(key)]
+
+
+async def _fetch_stop(client: HttpClient, operator: str, stop_id: str) -> Stop | None:
+    url = _stop_url(operator, stop_id)
+    try:
+        _, raw, _ = await client.fetch_json_cached(
+            CachedFetch(url, ROUTE_TTL_SECONDS, cache_key=f"stop-{operator}-{stop_id}")
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("stop %s/%s failed: %s", operator, stop_id, type(exc).__name__)
+        return None
+    data = raw.get("data") if isinstance(raw, dict) else None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict):
+        return None
+    coordinates = data.get("coordinates") if isinstance(data.get("coordinates"), dict) else {}
+    wgs84 = coordinates.get("wgs84") if isinstance(coordinates.get("wgs84"), dict) else {}
+    try:
+        return Stop(
+            stop_id,
+            str(data.get("name_en") or data.get("name_tc") or stop_id),
+            float(data.get("lat") or wgs84.get("latitude")),
+            float(data.get("long") or wgs84.get("longitude")),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+async def _fetch_spatial(client: HttpClient, spec: RouteSpec) -> dict[str, Any] | None:
+    url = HKEMOBILITY_SPATIAL_URL.format(route_id=spec.route_id, sequence=spec.sequence)
+    referer = (
+        "https://www.hkemobility.gov.hk/en/public-transport/gmb"
+        if spec.operator == "GMB"
+        else "https://www.hkemobility.gov.hk/en/public-transport/bus"
+    )
+    try:
+        _, raw, _ = await client.fetch_json_cached(
+            CachedFetch(
+                url, ROUTE_TTL_SECONDS, cache_key=f"hkemobility-{spec.route_id}-{spec.sequence}"
+            ),
+            headers={"Referer": referer},
+        )
+        return raw if isinstance(raw, dict) else None
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "HKeMobility line failed for %s/%s/%s: %s",
+            spec.operator,
+            spec.route,
+            spec.bound,
+            type(exc).__name__,
+        )
+        return None
+
+
+def _build_line(spec: RouteSpec, stops: list[Stop], raw: dict[str, Any] | None) -> RouteLine:
+    line = RouteLine(spec.route, spec.operator, spec.bound, stops=stops)
+    if not raw:
+        return line
+    shape = raw.get("sh")
+    coordinates = shape.get("coordinates") if isinstance(shape, dict) else None
+    path: list[tuple[float, float]] = []
+    if isinstance(coordinates, list):
+        for segment in coordinates:
+            if not isinstance(segment, list):
+                continue
+            for point in segment:
+                if isinstance(point, list) and len(point) >= 2:
+                    try:
+                        # HKeMobility uses latitude,longitude despite the
+                        # GeoJSON-like shape wrapper.
+                        _append_point(path, (float(point[0]), float(point[1])))
+                    except (TypeError, ValueError):
+                        continue
+    offsets = _monotonic_stop_offsets(path, stops)
+    line.path = path
+    line.stop_offsets = offsets or []
+    line.destination = str(raw.get("e") or "")
+    line.path_source = "hkemobility" if offsets else ""
+    return line
+
+
+async def _load_route_lines(client: HttpClient) -> list[RouteLine]:
+    route_jobs = [
+        (
+            _route_stop_url(spec),
+            lambda spec=spec: _fetch_route_stop_ids(client, spec),
+        )
+        for spec in ROUTE_SPECS
+    ]
+    stop_id_results = await _paced_gather(route_jobs)
+    stop_ids_by_spec = {
+        spec: value if isinstance(value, list) else []
+        for spec, value in zip(ROUTE_SPECS, stop_id_results, strict=True)
+    }
+
+    unique_stops = sorted(
+        {
+            (spec.operator, stop_id)
+            for spec, stop_ids in stop_ids_by_spec.items()
+            for stop_id in stop_ids
+        }
+    )
+    stop_jobs = [
+        (
+            _stop_url(operator, stop_id),
+            lambda operator=operator, stop_id=stop_id: _fetch_stop(client, operator, stop_id),
+        )
+        for operator, stop_id in unique_stops
+    ]
+    spatial_jobs = [
+        (
+            HKEMOBILITY_SPATIAL_URL.format(route_id=spec.route_id, sequence=spec.sequence),
+            lambda spec=spec: _fetch_spatial(client, spec),
+        )
+        for spec in ROUTE_SPECS
+    ]
+    stop_results, spatial_results = await asyncio.gather(
+        _paced_gather(stop_jobs),
+        _paced_gather(spatial_jobs),
+    )
+    stop_lookup = {
+        key: value
+        for key, value in zip(unique_stops, stop_results, strict=True)
+        if isinstance(value, Stop)
+    }
+
+    lines: list[RouteLine] = []
+    for spec, raw in zip(ROUTE_SPECS, spatial_results, strict=True):
+        expected_stop_ids = stop_ids_by_spec[spec]
+        stops = [
+            stop_lookup[(spec.operator, stop_id)]
+            for stop_id in expected_stop_ids
+            if (spec.operator, stop_id) in stop_lookup
+        ]
+        # A partial stop sequence is not official route geometry.  Reject only
+        # this direction so its last-good cache can survive independently.
+        complete_stops = bool(expected_stop_ids) and len(stops) == len(expected_stop_ids)
+        line = _build_line(
+            spec,
+            stops,
+            raw if complete_stops and isinstance(raw, dict) else None,
+        )
+        if not _valid_line(line):
+            log.warning(
+                "official geometry unavailable for %s/%s/%s", spec.operator, spec.route, spec.bound
+            )
+        lines.append(line)
+    return lines
+
+
+def _serialize(geometry: RouteGeometry) -> dict[str, Any]:
     return {
         "version": GEOMETRY_CACHE_VERSION,
         "fingerprint": _cache_fingerprint(),
-        "fetched_at": geo.fetched_at,
+        "fetched_at": geometry.fetched_at,
         "routes": [
             {
-                "route": r.route,
-                "operator": r.operator,
-                "bound": r.bound,
-                "stops": [[s.stop_id, s.name, s.lat, s.lon] for s in r.stops],
-                "path": [[lat, lon] for lat, lon in r.path],
-                "stop_offsets": r.stop_offsets,
+                "route": line.route,
+                "operator": line.operator,
+                "bound": line.bound,
+                "stops": [[stop.stop_id, stop.name, stop.lat, stop.lon] for stop in line.stops],
+                "path": line.path,
+                "stop_offsets": line.stop_offsets,
+                "destination": line.destination,
+                "path_source": line.path_source,
             }
-            for r in geo.routes
+            for line in geometry.routes
         ],
-        "stops": [[s.stop_id, s.name, s.lat, s.lon] for s in geo.stops],
+        "stops": [[stop.stop_id, stop.name, stop.lat, stop.lon] for stop in geometry.stops],
     }
 
 
-def _deserialize(data: dict) -> RouteGeometry:
-    geo = RouteGeometry(fetched_at=float(data.get("fetched_at") or 0))
-    for r in data.get("routes") or []:
-        line = RouteLine(r["route"], r["operator"], r["bound"])
-        line.stops = [Stop(s[0], s[1], float(s[2]), float(s[3])) for s in r.get("stops") or []]
-        line.path = [(float(p[0]), float(p[1])) for p in r.get("path") or []]
-        line.stop_offsets = [float(value) for value in r.get("stop_offsets") or []]
-        geo.routes.append(line)
-    geo.stops = [Stop(s[0], s[1], float(s[2]), float(s[3])) for s in data.get("stops") or []]
-    return geo
+def _deserialize(data: dict[str, Any]) -> RouteGeometry:
+    geometry = RouteGeometry(fetched_at=float(data.get("fetched_at") or 0))
+    for raw in data.get("routes") or []:
+        line = RouteLine(str(raw["route"]), str(raw["operator"]), str(raw["bound"]))
+        line.stops = [
+            Stop(str(s[0]), str(s[1]), float(s[2]), float(s[3])) for s in raw.get("stops") or []
+        ]
+        line.path = [(float(p[0]), float(p[1])) for p in raw.get("path") or []]
+        line.stop_offsets = [float(value) for value in raw.get("stop_offsets") or []]
+        line.destination = str(raw.get("destination") or "")
+        line.path_source = str(raw.get("path_source") or "")
+        geometry.routes.append(line)
+    geometry.stops = [
+        Stop(str(s[0]), str(s[1]), float(s[2]), float(s[3])) for s in data.get("stops") or []
+    ]
+    return geometry
 
 
 def _cache_fingerprint() -> str:
-    payload = json.dumps(
-        {"kmb": KMB_ROUTES, "ctb": CTB_ROUTES, "gmb": GMB_ROUTES},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()[:20]
-
-
-def _expected_route_keys() -> set[tuple[str, str, str]]:
-    keys = {
-        ("KMB", route, bound)
-        for route, bounds in KMB_ROUTES.items()
-        for bound in bounds
-    }
-    keys.update(
-        ("CTB", route, bound)
-        for route, bounds in CTB_ROUTES.items()
-        for bound in bounds
-    )
-    keys.update(
-        ("GMB", code, f"seq-{seq}")
-        for code, seqs in GMB_ROUTES.values()
-        for seq in seqs
-    )
-    return keys
+    payload = [
+        (spec.operator, spec.route, spec.bound, spec.route_id, spec.sequence)
+        for spec in ROUTE_SPECS
+    ]
+    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()[:20]
 
 
 def _cache_file(cache_dir: str) -> str:
@@ -533,41 +472,32 @@ def _cache_file(cache_dir: str) -> str:
 
 
 def _load_disk_cache(cache_dir: str = ".cache") -> RouteGeometry | None:
-    """Return structurally valid on-disk geometry, including expired last-good data."""
     try:
-        path = _cache_file(cache_dir)
-        if not os.path.isfile(path):
-            return None
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+        with open(_cache_file(cache_dir), encoding="utf-8") as file:
+            raw = json.load(file)
         if (
-            data.get("version") != GEOMETRY_CACHE_VERSION
-            or data.get("fingerprint") != _cache_fingerprint()
+            raw.get("version") != GEOMETRY_CACHE_VERSION
+            or raw.get("fingerprint") != _cache_fingerprint()
         ):
             return None
-        geo = _deserialize(data)
-        geo.routes = [line for line in geo.routes if _valid_route_line(line)]
-        if not geo.routes:
-            return None
-        return geo
+        geometry = _deserialize(raw)
+        geometry.routes = [line for line in geometry.routes if _valid_line(line)]
+        return geometry if geometry.routes else None
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    return None
 
 
-def _save_disk_cache(geo: RouteGeometry, cache_dir: str = ".cache") -> None:
-    valid_routes = [line for line in geo.routes if _valid_route_line(line)]
-    # A provider outage must never replace last-good geometry with an empty or
-    # structurally poisoned cache document.
-    if not valid_routes:
+def _save_disk_cache(geometry: RouteGeometry, cache_dir: str = ".cache") -> None:
+    valid = [line for line in geometry.routes if _valid_line(line)]
+    if not valid:
         return
-    serializable = RouteGeometry(valid_routes, geo.stops, geo.fetched_at)
+    serializable = RouteGeometry(valid, geometry.stops, geometry.fetched_at)
     try:
         path = _cache_file(cache_dir)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         temporary = f"{path}.tmp"
-        with open(temporary, "w", encoding="utf-8") as f:
-            json.dump(_serialize(serializable), f)
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(_serialize(serializable), file)
         os.replace(temporary, path)
     except OSError as exc:
         log.warning("route geometry cache write failed: %s", exc)
@@ -576,61 +506,49 @@ def _save_disk_cache(geo: RouteGeometry, cache_dir: str = ".cache") -> None:
 async def _refresh_route_geometry(
     client: HttpClient, cache_dir: str, cached: RouteGeometry | None
 ) -> RouteGeometry:
-    """Refresh geometry under one bounded attempt, retaining every last-good line."""
     try:
         refreshed = await asyncio.wait_for(
-            _load_route_lines(client), timeout=GEOMETRY_REFRESH_TIMEOUT_SECONDS
+            _load_route_lines(client), GEOMETRY_REFRESH_TIMEOUT_SECONDS
         )
     except Exception as exc:  # noqa: BLE001
         _refresh_retry_after[cache_dir] = time.monotonic() + GEOMETRY_FAILURE_COOLDOWN_SECONDS
-        log.warning("route geometry refresh deferred after %s", type(exc).__name__)
+        log.warning("route geometry refresh failed: %s", type(exc).__name__)
         return cached or RouteGeometry()
-    cached_by_route = {
+
+    cached_lines = {
         (line.operator, line.route, line.bound): line for line in (cached.routes if cached else [])
     }
+    refreshed_lines = {(line.operator, line.route, line.bound): line for line in refreshed}
     routes: list[RouteLine] = []
-    refresh_complete = True
-    seen: set[tuple[str, str, str]] = set()
-    for line in refreshed:
-        key = (line.operator, line.route, line.bound)
-        seen.add(key)
-        if _valid_route_line(line):
+    complete = True
+    for spec in ROUTE_SPECS:
+        key = (spec.operator, spec.route, spec.bound)
+        line = refreshed_lines.get(key)
+        if line is not None and _valid_line(line):
             routes.append(line)
-        elif key in cached_by_route:
-            routes.append(cached_by_route[key])
-            refresh_complete = False
-        else:
-            refresh_complete = False
-    for key, line in cached_by_route.items():
-        if key not in seen:
-            routes.append(line)
-            refresh_complete = False
-    if seen != _expected_route_keys():
-        refresh_complete = False
+            continue
+        complete = False
+        if key in cached_lines:
+            routes.append(cached_lines[key])
 
-    # Only fixed public-bus stops are map glyph candidates.  GMB sequences
-    # remain intact in ``routes`` for ETA interpolation, but publishing their
-    # stops here lets a partial geometry refresh accidentally turn a
-    # minibus-only stop into a public map glyph.  The renderer retains the
-    # same filter as defence in depth.
-    stop_map: dict[str, Stop] = {}
+    public_stops: dict[tuple[str, str], Stop] = {}
     for line in routes:
         if line.operator == "GMB":
             continue
-        for s in line.stops:
-            stop_map.setdefault(s.stop_id, s)
-    geo = RouteGeometry(
-        routes=routes,
-        stops=sorted(stop_map.values(), key=lambda s: s.name),
-        # Retaining an expired route keeps the aggregate cache expired so the
-        # next provider refresh will retry it rather than freshening stale data.
-        fetched_at=time.time() if refresh_complete and routes else (cached.fetched_at if cached else 0),
+        for stop in line.stops:
+            public_stops.setdefault((line.operator, stop.stop_id), stop)
+    geometry = RouteGeometry(
+        routes,
+        sorted(public_stops.values(), key=lambda stop: stop.name),
+        time.time()
+        if complete and len(routes) == len(ROUTE_SPECS)
+        else (cached.fetched_at if cached else 0),
     )
-    _save_disk_cache(geo, cache_dir)
-    return geo
+    _save_disk_cache(geometry, cache_dir)
+    return geometry
 
 
-def _finish_background_refresh(task: asyncio.Task, cache_dir: str) -> None:
+def _finish_refresh(task: asyncio.Task[RouteGeometry], cache_dir: str) -> None:
     _refresh_tasks.pop(cache_dir, None)
     try:
         task.result()
@@ -640,22 +558,18 @@ def _finish_background_refresh(task: asyncio.Task, cache_dir: str) -> None:
 
 
 async def fetch_route_geometry(client: HttpClient, cache_dir: str = ".cache") -> RouteGeometry:
-    """Return last-good disk geometry immediately and refresh it in the background.
-
-    A cold cache waits only for the short refresh budget.  Subsequent callers
-    never serially retry a failed public routing service on the 15-second map
-    cadence.
-    """
+    """Return fresh/last-good geometry and refresh expired cache in background."""
     cached = _load_disk_cache(cache_dir)
     if cached is not None:
-        if time.time() - cached.fetched_at <= TD_ROUTES_TTL_SECONDS:
+        if time.time() - cached.fetched_at <= ROUTE_TTL_SECONDS:
             return cached
-        task = _refresh_tasks.get(cache_dir)
-        if task is None and time.monotonic() >= _refresh_retry_after.get(cache_dir, 0.0):
+        if cache_dir not in _refresh_tasks and time.monotonic() >= _refresh_retry_after.get(
+            cache_dir, 0
+        ):
             task = asyncio.create_task(_refresh_route_geometry(client, cache_dir, cached))
             _refresh_tasks[cache_dir] = task
-            task.add_done_callback(lambda done: _finish_background_refresh(done, cache_dir))
+            task.add_done_callback(lambda done: _finish_refresh(done, cache_dir))
         return cached
-    if time.monotonic() < _refresh_retry_after.get(cache_dir, 0.0):
+    if time.monotonic() < _refresh_retry_after.get(cache_dir, 0):
         return RouteGeometry()
     return await _refresh_route_geometry(client, cache_dir, None)

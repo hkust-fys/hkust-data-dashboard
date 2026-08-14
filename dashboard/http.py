@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -28,6 +29,7 @@ MAX_BYTES_IMAGE = 4 * 1024 * 1024  # 4 MiB
 RETRY_BASE_DELAY = 0.5
 RETRY_MAX_DELAY = 8.0
 RETRY_ATTEMPTS = 3
+ORIGIN_REQUEST_INTERVAL_SECONDS = 0.06
 
 
 class FetchError(RuntimeError):
@@ -90,18 +92,36 @@ class HttpClient:
         timeout_seconds: float = 10.0,
         cache: TtlCache | None = None,
         retry_attempts: int = RETRY_ATTEMPTS,
+        origin_request_interval_seconds: float = ORIGIN_REQUEST_INTERVAL_SECONDS,
     ) -> None:
         self.session = session
         self.timeout_seconds = timeout_seconds
         self.cache = cache or TtlCache()
         self.retry_attempts = retry_attempts
+        self.origin_request_interval_seconds = max(0.0, origin_request_interval_seconds)
+        self._origin_locks: dict[str, asyncio.Lock] = {}
+        self._origin_next_request: dict[str, float] = {}
 
     # -- low-level ---------------------------------------------------------
+
+    async def _pace_origin(self, url: str) -> None:
+        """Space requests to one HTTP origin while leaving other origins free."""
+        if not self.origin_request_interval_seconds:
+            return
+        origin = urlsplit(url).netloc.lower()
+        lock = self._origin_locks.setdefault(origin, asyncio.Lock())
+        async with lock:
+            loop = asyncio.get_running_loop()
+            delay = self._origin_next_request.get(origin, 0.0) - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._origin_next_request[origin] = loop.time() + self.origin_request_interval_seconds
 
     async def _request_bytes(self, url: str, headers: dict[str, str] | None) -> bytes:
         """GET with bounded size; raises FetchError on bad status/content-type."""
         for attempt in range(1, self.retry_attempts + 1):
             try:
+                await self._pace_origin(url)
                 async with self.session.get(
                     url,
                     headers=headers or {},
@@ -123,8 +143,9 @@ class HttpClient:
                 if attempt >= self.retry_attempts:
                     raise
                 delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
-                log.warning("fetch %s failed (attempt %d): %s; retrying in %.1fs",
-                            url, attempt, exc, delay)
+                log.warning(
+                    "fetch %s failed (attempt %d): %s; retrying in %.1fs", url, attempt, exc, delay
+                )
                 await asyncio.sleep(delay)
         raise FetchError(f"Exhausted retries for {url}")
 

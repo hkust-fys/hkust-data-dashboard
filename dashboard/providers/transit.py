@@ -7,6 +7,7 @@ to call concurrently.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -67,6 +68,7 @@ TRANSIT_TTL_SECONDS = 25.0
 # Parsing helpers
 # --------------------------------------------------------------------------
 
+
 def _minutes_until(iso: str | None, now: datetime) -> int | None:
     if not iso:
         return None
@@ -109,10 +111,35 @@ def _gmb_kind(remarks: str | None) -> EtaKind:
 # Fetchers
 # --------------------------------------------------------------------------
 
+
+async def _fetch_many_json(
+    client: HttpClient, urls: list[str], source: str
+) -> dict[str, dict[str, Any]]:
+    """Fetch each distinct endpoint independently so one stop cannot hide an operator."""
+    unique_urls = list(dict.fromkeys(urls))
+    results = await asyncio.gather(
+        *(client.fetch_json(url) for url in unique_urls),
+        return_exceptions=True,
+    )
+    fetched: dict[str, dict[str, Any]] = {}
+    failures: list[Exception] = []
+    for url, result in zip(unique_urls, results, strict=True):
+        if isinstance(result, Exception):
+            failures.append(result)
+            log.warning("%s ETA request failed for %s: %s", source, url, result)
+        elif isinstance(result, dict):
+            fetched[url] = result
+    if not fetched and failures:
+        raise failures[0]
+    return fetched
+
+
 async def _fetch_kmb(client: HttpClient, now: datetime) -> list[EtaRow]:
     rows: list[EtaRow] = []
+    urls = [KMB_BASE.format(stop=spec["stop"]) for spec in KMB_STOPS]
+    responses = await _fetch_many_json(client, urls, "KMB")
     for spec in KMB_STOPS:
-        data = await client.fetch_json(KMB_BASE.format(stop=spec["stop"]))
+        data = responses.get(KMB_BASE.format(stop=spec["stop"]), {})
         entries = (data or {}).get("data", []) or []
         for entry in entries:
             if entry.get("route") != spec["route"]:
@@ -140,10 +167,10 @@ async def _fetch_kmb(client: HttpClient, now: datetime) -> list[EtaRow]:
 
 async def _fetch_citybus(client: HttpClient, now: datetime) -> list[EtaRow]:
     rows: list[EtaRow] = []
+    urls = [CTB_BASE.format(stop=spec["stop"], route=spec["route"]) for spec in CTB_STOPS]
+    responses = await _fetch_many_json(client, urls, "Citybus")
     for spec in CTB_STOPS:
-        data = await client.fetch_json(
-            CTB_BASE.format(stop=spec["stop"], route=spec["route"])
-        )
+        data = responses.get(CTB_BASE.format(stop=spec["stop"], route=spec["route"]), {})
         entries = (data or {}).get("data", []) or []
         for entry in entries:
             if entry.get("dir") != spec["gate"]:
@@ -171,8 +198,10 @@ async def _fetch_citybus(client: HttpClient, now: datetime) -> list[EtaRow]:
 
 async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
     rows: list[EtaRow] = []
+    urls = [GMB_BASE.format(stop=stop_id) for stop_id in GMB_STOPS]
+    responses = await _fetch_many_json(client, urls, "GMB")
     for stop_id, routes in GMB_STOPS.items():
-        data = await client.fetch_json(GMB_BASE.format(stop=stop_id))
+        data = responses.get(GMB_BASE.format(stop=stop_id), {})
         entries = (data or {}).get("data", []) or []
         # live schema (verified 2026-08-07):
         #   {"route_id": 2004828, "route_seq": 1, "stop_seq": 1,
@@ -224,9 +253,7 @@ async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
                             minutes=minutes,
                             kind=_gmb_kind(eta.get("remarks_en") or ""),
                             eta_time=_parse_iso(eta.get("timestamp")),
-                            source_time=_parse_iso(
-                                (data or {}).get("generated_timestamp")
-                            ),
+                            source_time=_parse_iso((data or {}).get("generated_timestamp")),
                             stop_seq=entry.get("stop_seq"),
                         )
                     )
@@ -245,6 +272,7 @@ def _parse_iso(value: str | None) -> datetime | None:
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
+
 
 def _route_sort_key(route: str) -> tuple[int, str]:
     """Order routes numerically (91 < 291P, 11 < 11B < 12 < 104) so the bus
@@ -273,10 +301,12 @@ def group_etas(rows: list[EtaRow]) -> list[RouteEtaGroup]:
     current: RouteEtaGroup | None = None
     for row in ordered:
         if current is None or (
-            current.route, current.destination, current.gate, current.operator, current.stop_seq
-        ) != (
-            row.route, row.destination, row.gate, row.operator, row.stop_seq
-        ):
+            current.route,
+            current.destination,
+            current.gate,
+            current.operator,
+            current.stop_seq,
+        ) != (row.route, row.destination, row.gate, row.operator, row.stop_seq):
             current = RouteEtaGroup(
                 route=row.route,
                 destination=row.destination,
@@ -289,7 +319,9 @@ def group_etas(rows: list[EtaRow]) -> list[RouteEtaGroup]:
     return groups
 
 
-async def fetch_transit_etas(client: HttpClient) -> tuple[list[RouteEtaGroup], datetime | None, list[str]]:
+async def fetch_transit_etas(
+    client: HttpClient,
+) -> tuple[list[RouteEtaGroup], datetime | None, list[str]]:
     """Fetch all three operators concurrently and return grouped, ordered ETAs.
 
     Returns (groups, latest_source_time, failed_operators). A single operator

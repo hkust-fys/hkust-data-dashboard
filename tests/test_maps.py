@@ -151,9 +151,7 @@ def test_bus_prediction_interpolates_on_matching_official_upstream_geometry():
         (gate.lat, gate.lon),
         (destination.lat, destination.lon),
     ]
-    lengths = [
-        renderer._path_segment_length(a, b) for a, b in zip(path, path[1:], strict=False)
-    ]
+    lengths = [renderer._path_segment_length(a, b) for a, b in zip(path, path[1:], strict=False)]
     offsets = [0.0, lengths[0] + lengths[1]]
     offsets.extend([offsets[-1] + lengths[2], offsets[-1] + lengths[2] + lengths[3]])
     lines = [
@@ -182,7 +180,10 @@ def test_bus_prediction_has_no_straight_chord_fallback_without_osm_path():
     destination = Stop("D", "Destination", 22.333360, 114.272881)
     line = RouteLine("X", "KMB", "outbound", [upstream, gate, destination])
     group = RouteEtaGroup(
-        route="X", destination="Destination", gate="S", operator=Operator.KMB,
+        route="X",
+        destination="Destination",
+        gate="S",
+        operator=Operator.KMB,
         rows=[EtaRow("X", "Destination", "S", Operator.KMB, 1, EtaKind.REALTIME)],
     )
     assert renderer.predict_buses([group], [line]) == []
@@ -214,9 +215,16 @@ def test_bus_prediction_never_renders_at_official_route_termini():
     destination = Stop("D", "Destination", 22.333360, 114.272881)
     path = [(s.lat, s.lon) for s in (upstream, gate, destination)]
     first = renderer._path_segment_length(path[0], path[1])
-    lines = [RouteLine("X", "KMB", "outbound", [upstream, gate, destination], path, [0, first, first * 2])]
+    lines = [
+        RouteLine(
+            "X", "KMB", "outbound", [upstream, gate, destination], path, [0, first, first * 2]
+        )
+    ]
     group = RouteEtaGroup(
-        route="X", destination="Destination", gate="S", operator=Operator.KMB,
+        route="X",
+        destination="Destination",
+        gate="S",
+        operator=Operator.KMB,
         rows=[EtaRow("X", "Destination", "S", Operator.KMB, 2, EtaKind.REALTIME)],
     )
     # Two minutes would put this estimate precisely on the upstream terminus.
@@ -226,11 +234,15 @@ def test_bus_prediction_never_renders_at_official_route_termini():
 def test_public_stop_markers_are_offset_on_opposite_road_sides(tmp_path, monkeypatch):
     lines = [
         RouteLine(
-            "X", "KMB", "outbound",
+            "X",
+            "KMB",
+            "outbound",
             [Stop("W", "West", 22.3340, 114.2290), Stop("C", "Centre", 22.3340, 114.2300)],
         ),
         RouteLine(
-            "X", "KMB", "inbound",
+            "X",
+            "KMB",
+            "inbound",
             [Stop("C", "Centre", 22.3340, 114.2300), Stop("W", "West", 22.3340, 114.2290)],
         ),
     ]
@@ -318,8 +330,7 @@ def test_bus_label_layout_never_overlaps_is_in_bounds_and_deterministic():
         assert 0 <= left < right <= canvas.width
         assert 0 <= top < bottom <= canvas.height
         assert all(
-            not renderer._rects_overlap(placement.rect, other.rect)
-            for other in first[index + 1 :]
+            not renderer._rects_overlap(placement.rect, other.rect) for other in first[index + 1 :]
         )
         assert (top + bottom) / 2 == placement.marker[1]
 
@@ -336,9 +347,7 @@ def test_public_stops_merge_by_place_and_direction_but_keep_opposite_direction()
         RouteLine("3", "KMB", "in", [east, opposite, west]),
     ]
     paths = [[(stop.lat, stop.lon) for stop in line.stops] for line in lines]
-    markers = renderer._merged_public_stop_markers(
-        [same_a, same_b, opposite], lines, paths
-    )
+    markers = renderer._merged_public_stop_markers([same_a, same_b, opposite], lines, paths)
     assert len(markers) == 2
     assert math.isclose(renderer._angular_distance(markers[0][2], markers[1][2]), math.pi)
 
@@ -382,15 +391,97 @@ def test_gmb_stops_do_not_emit_public_glyphs_but_keep_geometry_for_eta():
     destination = Stop("G-D", "Minibus destination", 22.333360, 114.272881)
     path = [(stop.lat, stop.lon) for stop in (upstream, gate, destination)]
     first = renderer._path_segment_length(path[0], path[1])
-    line = RouteLine("11", "GMB", "seq-1", [upstream, gate, destination], path, [0, first, first * 2])
+    line = RouteLine(
+        "11", "GMB", "seq-1", [upstream, gate, destination], path, [0, first, first * 2]
+    )
 
     # The provider's GMB geometry remains available to ETA interpolation.
     group = RouteEtaGroup(
-        route="11", destination="Minibus destination", gate="S", operator=Operator.GMB,
+        route="11",
+        destination="Minibus destination",
+        gate="S",
+        operator=Operator.GMB,
         rows=[EtaRow("11", "Minibus destination", "S", Operator.GMB, 1, EtaKind.REALTIME)],
     )
     assert renderer.predict_buses([group], [line])
     assert renderer._merged_public_stop_markers([gate], [line], [path]) == []
+
+
+def test_gmb_104_uses_repeated_gate_and_stop_13_to_label_each_loop_side():
+    gate = (22.333360, 114.262881)
+    points = [gate]
+    points.extend((gate[0], gate[1] - index * 0.001) for index in range(1, 13))
+    points.extend((gate[0], gate[1] - (23 - index) * 0.001) for index in range(13, 24))
+    stops = [
+        Stop("G" if index in (0, 23) else str(index + 1), f"Stop {index + 1}", *point)
+        for index, point in enumerate(points)
+    ]
+    offsets = [0.0]
+    for first, second in zip(points, points[1:], strict=False):
+        offsets.append(offsets[-1] + renderer._path_segment_length(first, second))
+    line = RouteLine("104", "GMB", "seq-1", stops, points, offsets)
+    group = RouteEtaGroup(
+        route="104",
+        destination="Kwun Tong",
+        gate="S",
+        operator=Operator.GMB,
+        rows=[
+            EtaRow("104", "Kwun Tong", "S", Operator.GMB, 20, EtaKind.REALTIME),
+            EtaRow("104", "Kwun Tong", "S", Operator.GMB, 30, EtaKind.REALTIME),
+        ],
+    )
+    labels = [prediction[0] for prediction in renderer.predict_buses([group], [line])]
+    assert labels == ["104 HKUST", "104 Kwun Tong"]
+
+
+def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_path, monkeypatch):
+    def route_line(route: str, operator: str, latitude: float) -> RouteLine:
+        stops = [
+            Stop(f"{route}-{index}", f"Stop {index}", latitude, longitude)
+            for index, longitude in enumerate((114.242881, 114.252881, 114.262881, 114.272881))
+        ]
+        path = [(stop.lat, stop.lon) for stop in stops]
+        offsets = [0.0]
+        for first, second in zip(path, path[1:], strict=False):
+            offsets.append(offsets[-1] + renderer._path_segment_length(first, second))
+        return RouteLine(route, operator, "outbound", stops, path, offsets)
+
+    lines = [route_line("91", "KMB", 22.333360), route_line("11", "GMB", 22.333361)]
+    groups = [
+        RouteEtaGroup(
+            route="91",
+            destination="Diamond Hill",
+            gate="S",
+            operator=Operator.KMB,
+            rows=[EtaRow("91", "Diamond Hill", "S", Operator.KMB, 1, EtaKind.REALTIME)],
+        ),
+        RouteEtaGroup(
+            route="11",
+            destination="Choi Hung",
+            gate="S",
+            operator=Operator.GMB,
+            rows=[EtaRow("11", "Choi Hung", "S", Operator.GMB, 1, EtaKind.REALTIME)],
+        ),
+    ]
+    drawn: list[renderer.LabelPlacement] = []
+    original = renderer._draw_bus_route_marker
+
+    def tracking(draw, placement, color, font):
+        drawn.append(placement)
+        return original(draw, placement, color, font)
+
+    monkeypatch.setattr(renderer, "_draw_bus_route_marker", tracking)
+    renderer.render_map(
+        groups,
+        str(tmp_path),
+        route_lines=lines,
+        base_image=Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white"),
+    )
+    assert {placement.operator for placement in drawn} == {Operator.KMB, Operator.GMB}
+    assert {placement.text for placement in drawn} == {
+        "91 Diamond Hill",
+        "11 Choi Hung",
+    }
 
 
 def test_bus_markers_merge_matching_route_operator_at_same_position():
@@ -400,8 +491,11 @@ def test_bus_markers_merge_matching_route_operator_at_same_position():
         ("91M", 22.334, 114.230, Operator.KMB, 0.0),
     ]
     markers = renderer._merge_bus_markers(
-        predictions, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
-        renderer.BASE_MAP_ZOOM, (renderer.MAP_WIDTH, renderer.MAP_HEIGHT)
+        predictions,
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM,
+        (renderer.MAP_WIDTH, renderer.MAP_HEIGHT),
     )
     assert len(markers) == 2
     assert [marker.routes for marker in markers] == [("91",), ("91M",)]

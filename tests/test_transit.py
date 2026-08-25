@@ -2,10 +2,12 @@
 verified GMB directional-variant IDs."""
 
 from datetime import UTC
+from types import SimpleNamespace
 
 import pytest
 
 from dashboard.models import EtaKind, Operator
+from dashboard.providers import transit
 from dashboard.providers.transit import (
     GMB_STOPS,
     KMB_STOPS,
@@ -15,6 +17,97 @@ from dashboard.providers.transit import (
     group_etas,
 )
 from tests.fixtures import sample_data as s
+
+
+def test_probe_cache_expires_only_after_multi_sweep_ceiling():
+    """A long TTL keeps sweep rungs together but bounds outage staleness."""
+    now = [100.0]
+    cache = transit.ProbeEtaCache(ttl_seconds=420, clock=lambda: now[0])
+    eta = transit.ProbeEta("KMB", "91M", "inbound", "stop", 3, 4)
+    cache.set("probe", [eta])
+
+    now[0] += 419
+    assert cache.get("probe") == [eta]
+    now[0] += 2
+    assert cache.get("probe") is None
+    assert "probe" not in cache._store  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_gmb_probe_cap_rotates_across_all_groups(monkeypatch):
+    probes = [
+        SimpleNamespace(
+            operator="GMB", route=f"R{index}", bound="seq-1", stop_id=f"stop-{index}",
+            route_id=1, sequence=1, index=0,
+        )
+        for index in range(35)
+    ]
+    calls: list[str] = []
+
+    async def fetch(_client, probe):
+        calls.append(probe.stop_id)
+        return {"data": [{"enabled": True, "route_id": 1, "route_seq": 1, "eta": [{"diff": 1}]}]}
+
+    monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
+    monkeypatch.setattr(transit, "_gmb_cursor", 0)
+    monkeypatch.setattr(transit, "_probe_cursor", 0)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    for _ in range(4):
+        await transit.fetch_probe_etas(object(), probes)
+
+    assert set(calls) == {f"stop-{index}" for index in range(35)}
+
+
+@pytest.mark.asyncio
+async def test_gmb_probe_cap_respects_smaller_cycle_budget(monkeypatch):
+    probes = [
+        SimpleNamespace(
+            operator="GMB", route=f"R{index}", bound="seq-1", stop_id=f"stop-{index}",
+            route_id=1, sequence=1, index=0,
+        )
+        for index in range(20)
+    ]
+    calls: list[str] = []
+
+    async def fetch(_client, probe):
+        calls.append(probe.stop_id)
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
+    monkeypatch.setattr(transit, "_gmb_cursor", 0)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+
+    await transit.fetch_probe_etas(object(), probes, max_per_cycle=5)
+
+    assert len(calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_gmb_probe_sweep_stops_after_first_403(monkeypatch):
+    from dashboard.http import FetchError
+
+    probes = [
+        SimpleNamespace(
+            operator="GMB", route=f"R{index}", bound="seq-1", stop_id=f"stop-{index}",
+            route_id=1, sequence=1, index=0,
+        )
+        for index in range(5)
+    ]
+    calls: list[str] = []
+
+    async def fetch(_client, probe):
+        calls.append(probe.stop_id)
+        raise FetchError("HTTP 403 for GMB", status_code=403)
+
+    monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
+    monkeypatch.setattr(transit, "_gmb_cursor", 0)
+    monkeypatch.setattr(transit, "_gmb_cooldown_until", 0)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+
+    await transit.fetch_probe_etas(object(), probes)
+
+    assert len(calls) == 1
+    assert transit._gmb_cooldown_until > transit.time.monotonic()  # noqa: SLF001
 
 
 class _StubClient:

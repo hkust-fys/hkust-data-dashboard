@@ -8,6 +8,7 @@ There are no import-time side effects and no module-level network calls.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -22,6 +23,19 @@ log = logging.getLogger(__name__)
 
 USER_AGENT = "hkust-data-dashboard/2.0 (+https://github.com/hkust-fys/hkust-data-dashboard)"
 
+
+def _with_user_agent(headers: dict[str, str] | None) -> dict[str, str]:
+    """Return a copy of ``headers`` with the dashboard User-Agent set if absent.
+
+    Some sources (HKeMobility) reject aiohttp's default Python user agent with
+    HTTP 403, so every request must identify itself as the dashboard.
+    """
+    merged = dict(headers or {})
+    if not any(key.lower() == "user-agent" for key in merged):
+        merged["User-Agent"] = USER_AGENT
+    return merged
+
+
 # Bound response sizes to keep memory sane.
 MAX_BYTES_TEXT = 2 * 1024 * 1024  # 2 MiB
 MAX_BYTES_IMAGE = 4 * 1024 * 1024  # 4 MiB
@@ -30,10 +44,20 @@ RETRY_BASE_DELAY = 0.5
 RETRY_MAX_DELAY = 8.0
 RETRY_ATTEMPTS = 3
 ORIGIN_REQUEST_INTERVAL_SECONDS = 0.06
+ORIGIN_REQUEST_INTERVAL_OVERRIDES_SECONDS = {
+    # The GMB host returns 403 for short bursts well below our generic pace.
+    # Five starts/second keeps gate, probe, and route-metadata calls on one
+    # shared origin budget.
+    "data.etagmb.gov.hk": 0.2,
+}
 
 
 class FetchError(RuntimeError):
     """Raised when a fetch fails validation (status, size, content type)."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass
@@ -93,12 +117,20 @@ class HttpClient:
         cache: TtlCache | None = None,
         retry_attempts: int = RETRY_ATTEMPTS,
         origin_request_interval_seconds: float = ORIGIN_REQUEST_INTERVAL_SECONDS,
+        origin_request_interval_overrides_seconds: dict[str, float] | None = None,
     ) -> None:
         self.session = session
         self.timeout_seconds = timeout_seconds
         self.cache = cache or TtlCache()
         self.retry_attempts = retry_attempts
         self.origin_request_interval_seconds = max(0.0, origin_request_interval_seconds)
+        self.origin_request_interval_overrides_seconds = dict(
+            ORIGIN_REQUEST_INTERVAL_OVERRIDES_SECONDS
+        )
+        if origin_request_interval_overrides_seconds:
+            self.origin_request_interval_overrides_seconds.update(
+                origin_request_interval_overrides_seconds
+            )
         self._origin_locks: dict[str, asyncio.Lock] = {}
         self._origin_next_request: dict[str, float] = {}
 
@@ -106,16 +138,20 @@ class HttpClient:
 
     async def _pace_origin(self, url: str) -> None:
         """Space requests to one HTTP origin while leaving other origins free."""
-        if not self.origin_request_interval_seconds:
-            return
         origin = urlsplit(url).netloc.lower()
+        interval = max(
+            self.origin_request_interval_seconds,
+            self.origin_request_interval_overrides_seconds.get(origin, 0.0),
+        )
+        if not interval:
+            return
         lock = self._origin_locks.setdefault(origin, asyncio.Lock())
         async with lock:
             loop = asyncio.get_running_loop()
             delay = self._origin_next_request.get(origin, 0.0) - loop.time()
             if delay > 0:
                 await asyncio.sleep(delay)
-            self._origin_next_request[origin] = loop.time() + self.origin_request_interval_seconds
+            self._origin_next_request[origin] = loop.time() + interval
 
     async def _request_bytes(self, url: str, headers: dict[str, str] | None) -> bytes:
         """GET with bounded size; raises FetchError on bad status/content-type."""
@@ -124,11 +160,13 @@ class HttpClient:
                 await self._pace_origin(url)
                 async with self.session.get(
                     url,
-                    headers=headers or {},
+                    headers=_with_user_agent(headers),
                     timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
                 ) as resp:
                     if resp.status != 200:
-                        raise FetchError(f"HTTP {resp.status} for {url}")
+                        raise FetchError(
+                            f"HTTP {resp.status} for {url}", status_code=resp.status
+                        )
                     ct = resp.headers.get("Content-Type", "")
                     if not ct or ct.lower().startswith("text/html"):
                         # Some providers send HTML error pages on failure; treat as error.
@@ -140,6 +178,16 @@ class HttpClient:
                         raise FetchError(f"Response too large for {url}")
                     return data
             except (TimeoutError, aiohttp.ClientError, FetchError) as exc:
+                # Retrying a forbidden request immediately amplifies an origin
+                # rate limit. Other terminal client errors are equally unlikely
+                # to recover without changing the request.
+                if (
+                    isinstance(exc, FetchError)
+                    and exc.status_code is not None
+                    and 400 <= exc.status_code < 500
+                    and exc.status_code not in {408, 429}
+                ):
+                    raise
                 if attempt >= self.retry_attempts:
                     raise
                 delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
@@ -193,6 +241,64 @@ class HttpClient:
         if "<" not in text[:200]:
             raise FetchError(f"Not XML from {url}")
         return text
+
+    async def post_form_json(
+        self,
+        url: str,
+        data: dict[str, str],
+        headers: dict[str, str] | None = None,
+        max_bytes: int = MAX_BYTES_TEXT,
+        timeout_seconds: float | None = None,
+        attempts: int | None = None,
+    ) -> Any:
+        """POST form-encoded data and parse the JSON response."""
+        total_timeout = aiohttp.ClientTimeout(
+            total=timeout_seconds or max(self.timeout_seconds, 30.0)
+        )
+        tries = attempts or self.retry_attempts
+        body = b""
+        for attempt in range(1, tries + 1):
+            try:
+                await self._pace_origin(url)
+                async with self.session.post(
+                    url,
+                    data=data,
+                    headers=_with_user_agent(headers),
+                    timeout=total_timeout,
+                ) as resp:
+                    if resp.status != 200:
+                        raise FetchError(
+                            f"HTTP {resp.status} for {url}", status_code=resp.status
+                        )
+                    ct = resp.headers.get("Content-Type", "")
+                    if "json" not in ct.lower():
+                        raise FetchError(f"Unexpected content type {ct!r} for {url}")
+                    body = await resp.read()
+                    if len(body) > max_bytes:
+                        raise FetchError(f"Response too large for {url}")
+                    break
+            except (TimeoutError, aiohttp.ClientError, FetchError) as exc:
+                if (
+                    isinstance(exc, FetchError)
+                    and exc.status_code is not None
+                    and 400 <= exc.status_code < 500
+                    and exc.status_code not in {408, 429}
+                ):
+                    raise
+                if attempt >= tries:
+                    raise
+                delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
+                log.warning(
+                    "POST %s failed (attempt %d): %s; retrying in %.1fs",
+                    url, attempt, exc, delay,
+                )
+                await asyncio.sleep(delay)
+        else:
+            raise FetchError(f"Exhausted retries for {url}")
+        try:
+            return json.loads(body.decode("utf-8", errors="replace"))
+        except ValueError as exc:
+            raise FetchError(f"Invalid JSON from {url}") from exc
 
     # -- cached fetch with stale-on-error ------------------------------------
 

@@ -60,6 +60,7 @@ WARNING_NAMES: dict[str, str] = {
     "TC8SW": "Gale Signal No. 8 SW",
     "TC9": "Gale Signal No. 9",
     "TC10": "Hurricane Signal No. 10",
+    "TC8PRE": "Pre-No. 8 Special Announcement",
     "RAIN": "Rainstorm",
     "WRAINA": "Amber Rainstorm",
     "WRAINR": "Red Rainstorm",
@@ -88,6 +89,57 @@ WARNING_NAMES: dict[str, str] = {
 HKO_ICON_BASE = "https://www.hko.gov.hk/en/wxinfo/dailywx/images/{name}.issuing.gif"
 WARNTODAY_URL = "https://www.hko.gov.hk/wxinfo/dailywx/wxwarntoday.json"
 WARNTODAY_TTL_SECONDS = 5 * 60.0
+
+# The Pre-No. 8 Special Announcement is HKO's ~2-hour advance notice before
+# Tropical Cyclone Warning Signal No. 8. It appears as a statement in the
+# warningInfo feed rather than a warnsum code, so it is surfaced as a synthetic
+# warning code for the alert monitor's edge-triggered diffing.
+PRE_NO8_CODE = "TC8PRE"
+_PRE_NO8_PHRASES: tuple[str, ...] = (
+    "pre-no. 8 special announcement",
+    "pre-no 8 special announcement",
+    "pre-no.8 special announcement",
+    "pre-no 8",
+)
+_PRE_NO8_NAME = "Pre-No. 8 Special Announcement"
+
+
+def _pre_no8_from_warning_info(warning_info: dict[str, Any] | None) -> WeatherWarning | None:
+    """Detect the Pre-No. 8 statement in the warningInfo payload."""
+    if not isinstance(warning_info, dict):
+        return None
+    details = warning_info.get("details")
+    candidates: list[Any] = []
+    if isinstance(details, dict):
+        candidates.extend(details.values())
+    for key in ("statement", "statements", "desc", "description"):
+        value = warning_info.get(key)
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, list):
+            candidates.extend(value)
+    for candidate in candidates:
+        if not isinstance(candidate, (str, dict)):
+            continue
+        if isinstance(candidate, str):
+            text = candidate
+        else:
+            text = " ".join(str(v) for v in candidate.values() if isinstance(v, str))
+        lowered = text.lower()
+        if any(phrase in lowered for phrase in _PRE_NO8_PHRASES):
+            issued = None
+            if isinstance(candidate, dict):
+                issued = as_datetime(candidate.get("issueTime")) or as_datetime(
+                    candidate.get("updateTime")
+                )
+            return WeatherWarning(
+                code=PRE_NO8_CODE,
+                name=_PRE_NO8_NAME,
+                summary=text[:200],
+                icon_url="",
+                issued_at=issued,
+            )
+    return None
 
 
 def _icon_urls_from_warntoday(raw: dict[str, Any]) -> dict[str, str]:
@@ -243,7 +295,11 @@ def parse_warnings(
         )
         return (known, w.code)
 
-    return sorted(active, key=sort_key)
+    active = sorted(active, key=sort_key)
+    pre_no8 = _pre_no8_from_warning_info(warning_info)
+    if pre_no8 is not None and all(w.code != PRE_NO8_CODE for w in active):
+        active.append(pre_no8)
+    return active
 
 
 async def fetch_weather_conditions(

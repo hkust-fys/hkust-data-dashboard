@@ -78,6 +78,7 @@ class EtaRow:
     eta_time: datetime | None = None
     source_time: datetime | None = None
     stop_seq: int | None = None  # GMB loop stop index; None for KMB/Citybus
+    bound: str | None = None  # official direction ("outbound"/"seq-1"...)
 
 
 @dataclass
@@ -90,6 +91,7 @@ class RouteEtaGroup:
     operator: Operator
     rows: list[EtaRow] = field(default_factory=list)
     stop_seq: int | None = None  # GMB loop stop index; None for KMB/Citybus
+    bound: str | None = None  # official direction, when derivable
 
 
 # --------------------------------------------------------------------------

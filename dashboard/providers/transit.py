@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from dashboard.http import HttpClient
+from dashboard.http import FetchError, HttpClient
 from dashboard.models import EtaKind, EtaRow, Operator, RouteEtaGroup
 
 log = logging.getLogger(__name__)
@@ -20,6 +23,10 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 # Stop/route configuration (verified 2024-09-23, see private transport-mappings.md)
 # --------------------------------------------------------------------------
+
+# KMB bound letters: the API returns "O"/"I"; tracked directions are named
+# "outbound"/"inbound".
+_KMB_DIR_TO_BOUND = {"o": "outbound", "i": "inbound"}
 
 KMB_STOPS: tuple[dict[str, str], ...] = (
     {"gate": "S", "route": "91", "dest": "Diamond Hill", "stop": "B002CEF0DBC568F5"},
@@ -150,6 +157,9 @@ async def _fetch_kmb(client: HttpClient, now: datetime) -> list[EtaRow]:
             minutes = _minutes_until(eta_iso, now)
             if minutes is None and eta_iso:
                 continue  # unparseable timestamp; skip rather than crash
+            bound = _KMB_DIR_TO_BOUND.get(
+                str(entry.get("dir") or "")[:1].lower()
+            )
             rows.append(
                 EtaRow(
                     route=spec["route"],
@@ -160,9 +170,13 @@ async def _fetch_kmb(client: HttpClient, now: datetime) -> list[EtaRow]:
                     kind=_kmb_kind(entry.get("rmk_en") or ""),
                     eta_time=_parse_iso(eta_iso),
                     source_time=_parse_iso(entry.get("data_timestamp")),
+                    bound=bound,
                 )
             )
     return rows
+
+
+_CTB_DIR_TO_BOUND = {"O": "outbound", "I": "inbound"}
 
 
 async def _fetch_citybus(client: HttpClient, now: datetime) -> list[EtaRow]:
@@ -191,6 +205,7 @@ async def _fetch_citybus(client: HttpClient, now: datetime) -> list[EtaRow]:
                     kind=_ctb_kind(entry.get("rmk_en") or ""),
                     eta_time=_parse_iso(eta_iso),
                     source_time=_parse_iso(entry.get("data_timestamp")),
+                    bound=_CTB_DIR_TO_BOUND.get(str(entry.get("dir") or "")),
                 )
             )
     return rows
@@ -255,6 +270,7 @@ async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
                             eta_time=_parse_iso(eta.get("timestamp")),
                             source_time=_parse_iso((data or {}).get("generated_timestamp")),
                             stop_seq=entry.get("stop_seq"),
+                            bound=f"seq-{seq}",
                         )
                     )
     return rows
@@ -306,13 +322,22 @@ def group_etas(rows: list[EtaRow]) -> list[RouteEtaGroup]:
             current.gate,
             current.operator,
             current.stop_seq,
-        ) != (row.route, row.destination, row.gate, row.operator, row.stop_seq):
+            current.bound,
+        ) != (
+            row.route,
+            row.destination,
+            row.gate,
+            row.operator,
+            row.stop_seq,
+            row.bound,
+        ):
             current = RouteEtaGroup(
                 route=row.route,
                 destination=row.destination,
                 gate=row.gate,
                 operator=row.operator,
                 stop_seq=row.stop_seq,
+                bound=row.bound,
             )
             groups.append(current)
         current.rows.append(row)
@@ -350,3 +375,299 @@ async def fetch_transit_etas(
             if row.source_time and (latest is None or row.source_time > latest):
                 latest = row.source_time
     return group_etas(rows), latest, failed
+
+
+# --------------------------------------------------------------------------
+# Probe-stop ETAs (downstream bus-position estimates)
+# --------------------------------------------------------------------------
+
+# Probe cache holds the last value per fetch group. The ceiling is deliberately
+# longer than a complete sweep so early and late groups coexist, while still
+# removing departed vehicles during a prolonged provider outage.
+PROBE_TTL_SECONDS = 420.0
+
+
+@dataclass(frozen=True)
+class ProbeEta:
+    """One ETA observation at a probe stop along a tracked direction."""
+
+    operator: str
+    route: str
+    bound: str
+    stop_id: str
+    index: int  # official stop-sequence index of the probe stop
+    minutes: int | None
+    kind: EtaKind = EtaKind.REALTIME
+
+
+def _probe_cache_key(probe) -> str:
+    return f"{probe.operator}:{probe.route}:{probe.bound}:{probe.stop_id}"
+
+
+def _fetch_group_key(probe) -> str:
+    """Group probes by the single HTTP request that serves them.
+
+    KMB/GMB ETA feeds are per-stop (all routes at once); Citybus is per
+    (stop, route). One fetch per group covers every probe in it.
+    """
+    if probe.operator == "CTB":
+        return f"CTB:{probe.stop_id}:{probe.route}"
+    return f"{probe.operator}:{probe.stop_id}"
+
+
+class ProbeEtaCache:
+    """Last-value cache so the map can render between staggered sweeps.
+
+    The TTL spans several normal sweeps, preventing mid-sweep ladder splits,
+    but bounds staleness when repeated failures leave an entry untouched.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = PROBE_TTL_SECONDS,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._ttl = ttl_seconds
+        self._clock = clock
+        self._store: dict[str, tuple[float, list[ProbeEta]]] = {}
+
+    def get(self, key: str) -> list[ProbeEta] | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        if self._ttl > 0 and self._clock() - entry[0] > self._ttl:
+            self._store.pop(key, None)
+            return None
+        return entry[1]
+
+    def set(self, key: str, value: list[ProbeEta]) -> None:
+        self._store[key] = (self._clock(), value)
+
+
+_probe_cache = ProbeEtaCache()
+
+
+_probe_cursor = 0
+_gmb_cursor = 0
+
+# data.etagmb.gov.hk rate-limits bursts with 403s. GMB groups are capped per
+# cycle and the whole GMB sweep backs off for a cooldown when a 403 appears;
+# the probe cache keeps last-good values meanwhile.
+GMB_GROUPS_PER_CYCLE = 10
+GMB_COOLDOWN_SECONDS = 180.0
+_gmb_cooldown_until = 0.0
+
+
+async def _fetch_raw_stop_eta(client: HttpClient, probe) -> Any:
+    """Fetch the raw ETA payload covering ``probe`` (one request per group)."""
+    if probe.operator == "KMB":
+        return await client.fetch_json(KMB_BASE.format(stop=probe.stop_id))
+    if probe.operator == "CTB":
+        return await client.fetch_json(
+            CTB_BASE.format(stop=probe.stop_id, route=probe.route)
+        )
+    return await client.fetch_json(GMB_BASE.format(stop=probe.stop_id))
+
+
+def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
+    """Filter a raw stop payload down to this probe's route/direction."""
+    entries = (raw or {}).get("data", []) or []
+    out: list[ProbeEta] = []
+    _CTB_BOUND_DIRS = {"outbound": "O", "inbound": "I"}
+    if probe.operator == "KMB":
+        for entry in entries:
+            if entry.get("route") != probe.route:
+                continue
+            if entry.get("service_type", 1) != 1:
+                continue
+            # KMB marks bounds "o"/"i"; compare case-insensitively — the API
+            # returns uppercase letters.
+            entry_dir = str(entry.get("dir") or "")[:1].lower()
+            if entry_dir and entry_dir != probe.bound[:1].lower():
+                continue
+            minutes = _minutes_until(entry.get("eta"), now)
+            if minutes is None:
+                continue
+            out.append(
+                ProbeEta(
+                    operator=probe.operator,
+                    route=probe.route,
+                    bound=probe.bound,
+                    stop_id=probe.stop_id,
+                    index=probe.index,
+                    minutes=minutes,
+                    kind=_kmb_kind(entry.get("rmk_en") or ""),
+                )
+            )
+        return out
+    if probe.operator == "CTB":
+        expected_dir = _CTB_BOUND_DIRS.get(probe.bound, "")
+        for entry in entries:
+            # Both 792M directions share stops; the dir letter keeps this
+            # probe's estimates on their own direction.
+            if expected_dir and entry.get("dir") != expected_dir:
+                continue
+            eta_iso = entry.get("eta")
+            if not eta_iso:
+                continue
+            minutes = _minutes_until(eta_iso, now)
+            if minutes is None:
+                continue
+            out.append(
+                ProbeEta(
+                    operator=probe.operator,
+                    route=probe.route,
+                    bound=probe.bound,
+                    stop_id=probe.stop_id,
+                    index=probe.index,
+                    minutes=minutes,
+                    kind=_ctb_kind(entry.get("rmk_en") or ""),
+                )
+            )
+        return out
+    for entry in entries:
+        if not entry.get("enabled", True):
+            continue
+        if entry.get("route_id") != probe.route_id:
+            continue
+        if entry.get("route_seq") != probe.sequence:
+            continue
+        last = -1
+        for eta in entry.get("eta") or []:
+            diff = eta.get("diff")
+            try:
+                minutes = int(diff) if diff is not None else None
+            except (TypeError, ValueError):
+                minutes = None
+            if minutes is None or minutes < last:
+                continue
+            last = minutes
+            out.append(
+                ProbeEta(
+                    operator=probe.operator,
+                    route=probe.route,
+                    bound=probe.bound,
+                    stop_id=probe.stop_id,
+                    index=probe.index,
+                    minutes=minutes,
+                    kind=_gmb_kind(eta.get("remarks_en") or ""),
+                )
+            )
+    return out
+
+
+async def fetch_probe_etas(
+    client: HttpClient,
+    probes: Sequence[Any],
+    max_per_cycle: int = 60,
+) -> list[ProbeEta]:
+    """Poll up to ``max_per_cycle`` fetch groups round-robin; cache results.
+
+    Probes sharing one HTTP request (same physical stop for KMB/GMB; same
+    stop+route for Citybus) are fetched ONCE per sweep step and parsed once
+    per probe, so dense probing stays cheap. Cached values are returned for
+    probes outside this cycle's window. GMB groups are additionally capped
+    per cycle and the GMB sweep backs off for a cooldown when the host
+    rate-limits (HTTP 403), serving last-good cache meanwhile.
+    """
+    global _probe_cursor, _gmb_cursor, _gmb_cooldown_until
+    if not probes:
+        return []
+    unique: dict[str, Any] = {}
+    for probe in probes:
+        unique.setdefault(_probe_cache_key(probe), probe)
+
+    # Fetch-group table: one raw request serves every probe in its bucket.
+    groups: dict[str, list[Any]] = {}
+    for key in sorted(unique):
+        probe = unique[key]
+        groups.setdefault(_fetch_group_key(probe), []).append(probe)
+
+    group_keys = sorted(groups)
+    gmb_paused = time.monotonic() < _gmb_cooldown_until
+
+    def selectable(group_key: str) -> bool:
+        if not group_key.startswith("GMB:"):
+            return True
+        return not gmb_paused
+
+    selectable_keys = [key for key in group_keys if selectable(key)]
+    gmb_count = len(group_keys) - len(selectable_keys)
+    if gmb_count and gmb_paused:
+        log.info(
+            "GMB probe sweep paused for %.0fs (rate-limit cooldown); "
+            "serving last-good cache",
+            _gmb_cooldown_until - time.monotonic(),
+        )
+    # Cap GMB groups per cycle, but rotate the cap across the complete sorted
+    # set.  Slicing before round-robin would permanently starve groups after
+    # the first 30. Non-GMB groups retain their independent round-robin.
+    other = [key for key in selectable_keys if not key.startswith("GMB:")]
+    gmb = [key for key in selectable_keys if key.startswith("GMB:")]
+    cycle_budget = max(0, max_per_cycle)
+    gmb_window = min(GMB_GROUPS_PER_CYCLE, cycle_budget, len(gmb))
+    selected_gmb: list[str] = []
+    if gmb_window:
+        gmb_start = (_gmb_cursor * gmb_window) % len(gmb)
+        selected_gmb = [gmb[(gmb_start + i) % len(gmb)] for i in range(gmb_window)]
+        _gmb_cursor += 1
+    if not other and not selected_gmb:
+        return [
+            eta
+            for key in unique
+            if (cached := _probe_cache.get(key)) is not None
+            for eta in cached
+        ]
+
+    remaining = cycle_budget - len(selected_gmb)
+    other_window = min(remaining, len(other))
+    selected_other = []
+    if other_window:
+        other_start = (_probe_cursor * other_window) % len(other)
+        selected_other = [other[(other_start + i) % len(other)] for i in range(other_window)]
+        _probe_cursor += 1
+    async def refresh_group(group_key: str) -> bool:
+        global _gmb_cooldown_until
+        probes_in_group = groups[group_key]
+        now = datetime.now(UTC)
+        try:
+            raw = await _fetch_raw_stop_eta(client, probes_in_group[0])
+        except FetchError as exc:
+            if "HTTP 403" in str(exc) and group_key.startswith("GMB:"):
+                _gmb_cooldown_until = time.monotonic() + GMB_COOLDOWN_SECONDS
+                log.warning(
+                    "GMB ETA rate-limited (403); pausing GMB probes for %.0fs",
+                    GMB_COOLDOWN_SECONDS,
+                )
+                return True
+            else:
+                log.warning(
+                    "probe ETA fetch failed for %s: %s",
+                    group_key, type(exc).__name__,
+                )
+            return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "probe ETA fetch failed for %s: %s", group_key, type(exc).__name__
+            )
+            return False
+        for probe in probes_in_group:
+            key = _probe_cache_key(probe)
+            _probe_cache.set(key, _parse_probe_etas(probe, raw, now))
+        return False
+
+    # Non-GMB origins can overlap. GMB requests are deliberately sequential:
+    # once one returns 403, stop this sweep instead of draining an already
+    # queued burst into the provider during its cooldown.
+    await asyncio.gather(*(refresh_group(group_key) for group_key in selected_other))
+    for group_key in selected_gmb:
+        if await refresh_group(group_key):
+            break
+
+    collected: list[ProbeEta] = []
+    for key in unique:
+        cached = _probe_cache.get(key)
+        if cached is not None:
+            collected.extend(cached)
+    return collected

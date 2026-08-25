@@ -8,11 +8,117 @@ import math
 import sys
 import types
 
+import pytest
 from PIL import Image
 
 from dashboard.maps import renderer, tiles
-from dashboard.models import EtaKind, EtaRow, Operator, RouteEtaGroup
+from dashboard.models import EtaRow, Operator, RouteEtaGroup
 from dashboard.providers.route_geometry import RouteLine, Stop
+
+
+def test_authoritative_gate_mapping_uses_verified_direction_variants():
+    import dashboard.maps as maps
+
+    def line(operator, route, bound, stop_id):
+        return RouteLine(
+            route, operator, bound,
+            [Stop(stop_id, "gate", 22.33, 114.26), Stop("x", "x", 22.331, 114.261)],
+        )
+
+    groups = [
+        RouteEtaGroup("91", "Diamond Hill", "S", Operator.KMB,
+                      [EtaRow("91", "Diamond Hill", "S", Operator.KMB, 14)],
+                      bound="outbound"),
+        RouteEtaGroup("792M", "TKO", "N", Operator.CITYBUS,
+                      [EtaRow("792M", "TKO", "N", Operator.CITYBUS, 8)],
+                      bound="inbound"),
+        RouteEtaGroup("11B", "Choi Hung", "S", Operator.GMB,
+                      [EtaRow("11B", "Choi Hung", "S", Operator.GMB, 5)],
+                      bound="seq-1"),
+    ]
+    rows = maps._authoritative_etas(
+        groups,
+        [
+            line("KMB", "91", "outbound", "B002CEF0DBC568F5"),
+            line("CTB", "792M", "inbound", "003130"),
+            line("GMB", "11B", "seq-1", "20013011"),
+        ],
+    )
+    assert [(row.operator, row.route, row.bound, row.index) for row in rows] == [
+        ("KMB", "91", "outbound", 0),
+        ("CTB", "792M", "inbound", 0),
+        ("GMB", "11B", "seq-1", 0),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_still_renders_google_base(monkeypatch):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+    line = RouteLine(
+        "91", "KMB", "outbound",
+        [Stop("a", "A", 22.33, 114.26), Stop("b", "B", 22.331, 114.261)],
+    )
+    base = b"google-base"
+
+    async def capture(*_args, **_kwargs):
+        return base
+
+    async def geometry(*_args, **_kwargs):
+        return RouteGeometry(routes=[line])
+
+    async def failed_probes(*_args, **_kwargs):
+        raise RuntimeError("probe unavailable")
+
+    captured: dict[str, object] = {}
+
+    def render(*args, **kwargs):
+        captured["base"] = args[4]
+        return b"rendered"
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", capture)
+    monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
+    monkeypatch.setattr(maps, "fetch_probe_etas", failed_probes)
+    monkeypatch.setattr(maps, "render_map", render)
+
+    png, _ = await maps.fetch_traffic_map(object())
+    assert png == b"rendered"
+    assert captured["base"] == base
+
+
+@pytest.mark.asyncio
+async def test_map_cancellation_cleans_up_capture_and_geometry(monkeypatch):
+    import asyncio
+
+    import dashboard.maps as maps
+    capture_cancelled = asyncio.Event()
+    geometry_cancelled = asyncio.Event()
+
+    async def blocked_capture(**_kwargs):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            capture_cancelled.set()
+            raise
+
+    async def blocked_geometry(*_args, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            geometry_cancelled.set()
+            raise
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", blocked_capture)
+    monkeypatch.setattr(maps, "fetch_route_geometry", blocked_geometry)
+
+    operation = asyncio.create_task(maps.fetch_traffic_map(object()))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert capture_cancelled.is_set()
+    assert geometry_cancelled.is_set()
 
 
 def _png_data_url(image: Image.Image) -> str:
@@ -128,67 +234,6 @@ async def test_invalid_black_cache_is_not_reused(tmp_path, monkeypatch):
     assert result.getpixel((20, 10)) == (240, 242, 245)
 
 
-def test_fit_view_returns_fixed_base_map_bounds():
-    center_lat, center_lon, zoom = renderer.fit_view()
-    assert (center_lat, center_lon, zoom) == (
-        renderer.BASE_MAP_LAT,
-        renderer.BASE_MAP_LON,
-        renderer.BASE_MAP_ZOOM,
-    )
-
-
-def test_bus_prediction_interpolates_on_matching_official_upstream_geometry():
-    farther_upstream = Stop("F", "Farther upstream", 22.333360, 114.242881)
-    upstream = Stop("U", "Upstream", 22.333360, 114.252881)
-    gate = Stop("G", "H.K.U.S.T. SOUTH", 22.333360, 114.262881)
-    destination = Stop("D", "Destination", 22.333360, 114.272881)
-    # The road bends north between the upstream TD stops.  The estimate must
-    # follow this routed shape, not the straight stop-to-stop chord.
-    path = [
-        (farther_upstream.lat, farther_upstream.lon),
-        (22.343360, 114.242881),
-        (upstream.lat, upstream.lon),
-        (gate.lat, gate.lon),
-        (destination.lat, destination.lon),
-    ]
-    lengths = [renderer._path_segment_length(a, b) for a, b in zip(path, path[1:], strict=False)]
-    offsets = [0.0, lengths[0] + lengths[1]]
-    offsets.extend([offsets[-1] + lengths[2], offsets[-1] + lengths[2] + lengths[3]])
-    lines = [
-        RouteLine(
-            "X", "KMB", "outbound", [farther_upstream, upstream, gate, destination], path, offsets
-        )
-    ]
-    group = RouteEtaGroup(
-        route="X",
-        destination="Destination",
-        gate="S",
-        operator=Operator.KMB,
-        rows=[EtaRow("X", "Destination", "S", Operator.KMB, 3, EtaKind.REALTIME)],
-    )
-    bus = renderer.predict_buses([group], lines)[0]
-    # Three minutes at two minutes per official stop is halfway from the
-    # previous TD stop to the one before it, rather than a snapped stop.
-    assert bus[1] > upstream.lat  # on the northward road bend
-    assert not math.isclose(bus[2], (farther_upstream.lon + upstream.lon) / 2, abs_tol=2e-5)
-    assert not math.isclose(bus[-1], 0.0, abs_tol=0.05)
-
-
-def test_bus_prediction_has_no_straight_chord_fallback_without_osm_path():
-    upstream = Stop("U", "Upstream", 22.333360, 114.252881)
-    gate = Stop("G", "H.K.U.S.T. SOUTH", 22.333360, 114.262881)
-    destination = Stop("D", "Destination", 22.333360, 114.272881)
-    line = RouteLine("X", "KMB", "outbound", [upstream, gate, destination])
-    group = RouteEtaGroup(
-        route="X",
-        destination="Destination",
-        gate="S",
-        operator=Operator.KMB,
-        rows=[EtaRow("X", "Destination", "S", Operator.KMB, 1, EtaKind.REALTIME)],
-    )
-    assert renderer.predict_buses([group], [line]) == []
-
-
 def test_interpolated_bus_arrow_uses_the_local_curved_road_tangent():
     # Eastbound road turns north: a bus after the bend must not keep the
     # route-wide eastbound heading.
@@ -207,28 +252,6 @@ def test_interpolated_bus_arrow_uses_the_local_curved_road_tangent():
     assert math.isclose(reverse[2], -math.pi / 2, abs_tol=0.01)
     reverse_arrow = renderer._bus_direction_arrow_triangle((100, 100), reverse[2])
     assert reverse_arrow[0][1] > 100
-
-
-def test_bus_prediction_never_renders_at_official_route_termini():
-    upstream = Stop("U", "Upstream", 22.333360, 114.252881)
-    gate = Stop("G", "H.K.U.S.T. SOUTH", 22.333360, 114.262881)
-    destination = Stop("D", "Destination", 22.333360, 114.272881)
-    path = [(s.lat, s.lon) for s in (upstream, gate, destination)]
-    first = renderer._path_segment_length(path[0], path[1])
-    lines = [
-        RouteLine(
-            "X", "KMB", "outbound", [upstream, gate, destination], path, [0, first, first * 2]
-        )
-    ]
-    group = RouteEtaGroup(
-        route="X",
-        destination="Destination",
-        gate="S",
-        operator=Operator.KMB,
-        rows=[EtaRow("X", "Destination", "S", Operator.KMB, 2, EtaKind.REALTIME)],
-    )
-    # Two minutes would put this estimate precisely on the upstream terminus.
-    assert renderer.predict_buses([group], lines) == []
 
 
 def test_public_stop_markers_are_offset_on_opposite_road_sides(tmp_path, monkeypatch):
@@ -312,7 +335,7 @@ def test_bus_direction_arrow_is_centred_in_the_pill_at_the_road_anchor():
     assert placement.rect[0] < marker.x < placement.rect[2]
 
 
-def test_bus_label_layout_never_overlaps_is_in_bounds_and_deterministic():
+def test_bus_label_layout_stacks_collisions_without_overlap_and_deterministic():
     canvas = Image.new("RGBA", (360, 180), (255, 255, 255, 255))
     draw = renderer.ImageDraw.Draw(canvas)
     font = renderer._font(13)
@@ -323,16 +346,40 @@ def test_bus_label_layout_never_overlaps_is_in_bounds_and_deterministic():
     first = renderer._layout_bus_labels(markers, draw, font, canvas.size)
     second = renderer._layout_bus_labels(markers, draw, font, canvas.size)
     assert first == second
-    assert len(first) == 1
-    assert first[0].text == "0/1/2/3/4"
-    for index, placement in enumerate(first):
+    # Every marker keeps a pill (nothing dropped) and every pill keeps its
+    # white pointer inside its own box.
+    assert len(first) == len(markers)
+    for placement in first:
         left, top, right, bottom = placement.rect
         assert 0 <= left < right <= canvas.width
         assert 0 <= top < bottom <= canvas.height
+        assert right - left >= 20  # full-size pill, never squashed
+        pointer_x, pointer_y = placement.marker
+        assert left + 2 <= pointer_x <= right - 2
+        assert top + 2 <= pointer_y <= bottom - 2
+    # Stacked pills never overlap each other.
+    for index, placement in enumerate(first):
         assert all(
-            not renderer._rects_overlap(placement.rect, other.rect) for other in first[index + 1 :]
+            not renderer._rects_overlap(placement.rect, other.rect)
+            for other in first[index + 1 :]
         )
-        assert (top + bottom) / 2 == placement.marker[1]
+
+
+def test_bus_label_layout_merges_convoy_on_the_road_row():
+    canvas = Image.new("RGBA", (360, 180), (255, 255, 255, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    font = renderer._font(13)
+    markers = [
+        renderer.BusMarker(("91", "91M"), 150, 80, Operator.KMB, 0),
+    ]
+    placed = renderer._layout_bus_labels(markers, draw, font, canvas.size)
+    assert len(placed) == 1
+    placement = placed[0]
+    # Road row: pill vertically centred on the anchor with the white triangle
+    # exactly at the road point.
+    assert (placement.rect[1] + placement.rect[3]) / 2 == 80
+    assert placement.marker == (150, 80)
+    assert placement.rect[0] < 150 < placement.rect[2]
 
 
 def test_public_stops_merge_by_place_and_direction_but_keep_opposite_direction():
@@ -389,52 +436,79 @@ def test_gmb_stops_do_not_emit_public_glyphs_but_keep_geometry_for_eta():
     upstream = Stop("G-U", "Minibus upstream", 22.333360, 114.252881)
     gate = Stop("G-G", "H.K.U.S.T. SOUTH", 22.333360, 114.262881)
     destination = Stop("G-D", "Minibus destination", 22.333360, 114.272881)
-    path = [(stop.lat, stop.lon) for stop in (upstream, gate, destination)]
+    extra = Stop("G-X", "Minibus extra", 22.333360, 114.282881)
+    path = [
+        (stop.lat, stop.lon)
+        for stop in (upstream, gate, destination, extra)
+    ]
     first = renderer._path_segment_length(path[0], path[1])
+    second = renderer._path_segment_length(path[1], path[2])
+    third = renderer._path_segment_length(path[2], path[3])
     line = RouteLine(
-        "11", "GMB", "seq-1", [upstream, gate, destination], path, [0, first, first * 2]
+        "11",
+        "GMB",
+        "seq-1",
+        [upstream, gate, destination, extra],
+        path,
+        [0, first, first + second, first + second + third],
     )
 
     # The provider's GMB geometry remains available to ETA interpolation.
-    group = RouteEtaGroup(
-        route="11",
-        destination="Minibus destination",
-        gate="S",
-        operator=Operator.GMB,
-        rows=[EtaRow("11", "Minibus destination", "S", Operator.GMB, 1, EtaKind.REALTIME)],
-    )
-    assert renderer.predict_buses([group], [line])
+    from dashboard.maps.positions import estimate_bus_positions
+    from tests.test_positions import Probe
+
+    probes = [
+        Probe("GMB", "11", "seq-1", 1, 1),
+        Probe("GMB", "11", "seq-1", 2, 0),
+    ]
+    assert estimate_bus_positions(probes, [line])
     assert renderer._merged_public_stop_markers([gate], [line], [path]) == []
 
 
-def test_gmb_104_uses_repeated_gate_and_stop_13_to_label_each_loop_side():
-    gate = (22.333360, 114.262881)
-    points = [gate]
-    points.extend((gate[0], gate[1] - index * 0.001) for index in range(1, 13))
-    points.extend((gate[0], gate[1] - (23 - index) * 0.001) for index in range(13, 24))
+def test_alerted_route_gets_amber_casing_on_map(tmp_path, monkeypatch):
+    from PIL import Image as PILImage
+
     stops = [
-        Stop("G" if index in (0, 23) else str(index + 1), f"Stop {index + 1}", *point)
-        for index, point in enumerate(points)
+        Stop(f"{index}", f"Stop {index}", 22.333360, 114.26 + index * 0.002)
+        for index in range(5)
     ]
-    offsets = [0.0]
-    for first, second in zip(points, points[1:], strict=False):
-        offsets.append(offsets[-1] + renderer._path_segment_length(first, second))
-    line = RouteLine("104", "GMB", "seq-1", stops, points, offsets)
-    group = RouteEtaGroup(
-        route="104",
-        destination="Kwun Tong",
-        gate="S",
-        operator=Operator.GMB,
-        rows=[
-            EtaRow("104", "Kwun Tong", "S", Operator.GMB, 20, EtaKind.REALTIME),
-            EtaRow("104", "Kwun Tong", "S", Operator.GMB, 30, EtaKind.REALTIME),
-        ],
+    path = [(stop.lat, stop.lon) for stop in stops]
+    line = RouteLine("91", "KMB", "outbound", stops, path, list(range(5)))
+    other = RouteLine(
+        "11", "GMB", "seq-1", stops, [(lat + 0.001, lon) for lat, lon in path], list(range(5))
     )
-    labels = [prediction[0] for prediction in renderer.predict_buses([group], [line])]
-    assert labels == ["104 HKUST", "104 Kwun Tong"]
+    base = PILImage.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white")
+
+    plain = Image.open(
+        io.BytesIO(renderer.render_map([], str(tmp_path), [], [line, other], base))
+    )
+    highlighted = Image.open(
+        io.BytesIO(
+            renderer.render_map([], str(tmp_path), [], [line, other], base, ["91"])
+        )
+    )
+
+    # The alerted corridor's midpoint must gain amber pixels vs the plain map.
+    x_mid, y_mid = renderer.project(path[2][0], path[2][1], 22.3274138, 114.2331738, 15.0,
+                                    (renderer.MAP_WIDTH, renderer.MAP_HEIGHT))
+    region_plain = plain.crop((int(x_mid) - 20, int(y_mid) - 20, int(x_mid) + 20, int(y_mid) + 20))
+    region_hl = highlighted.crop((int(x_mid) - 20, int(y_mid) - 20, int(x_mid) + 20, int(y_mid) + 20))
+
+    def amber_count(image):
+        return sum(
+            count
+            for count, (r, g, b) in image.getcolors(maxcolors=1_000_000)
+            if r > 200 and 90 < g < 190 and b < 120
+        )
+
+    assert amber_count(region_hl) > amber_count(region_plain)
+    # the un-alerted route stays untouched
+    assert amber_count(region_plain) == 0
 
 
 def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_path, monkeypatch):
+    from dashboard.maps.positions import BusEstimate
+
     def route_line(route: str, operator: str, latitude: float) -> RouteLine:
         stops = [
             Stop(f"{route}-{index}", f"Stop {index}", latitude, longitude)
@@ -447,32 +521,20 @@ def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_pa
         return RouteLine(route, operator, "outbound", stops, path, offsets)
 
     lines = [route_line("91", "KMB", 22.333360), route_line("11", "GMB", 22.333361)]
-    groups = [
-        RouteEtaGroup(
-            route="91",
-            destination="Diamond Hill",
-            gate="S",
-            operator=Operator.KMB,
-            rows=[EtaRow("91", "Diamond Hill", "S", Operator.KMB, 1, EtaKind.REALTIME)],
-        ),
-        RouteEtaGroup(
-            route="11",
-            destination="Choi Hung",
-            gate="S",
-            operator=Operator.GMB,
-            rows=[EtaRow("11", "Choi Hung", "S", Operator.GMB, 1, EtaKind.REALTIME)],
-        ),
+    estimates = [
+        BusEstimate("91 Diamond Hill", 22.333360, 114.252881, Operator.KMB, 0.0),
+        BusEstimate("11 Choi Hung", 22.333361, 114.252881, Operator.GMB, 0.0),
     ]
     drawn: list[renderer.LabelPlacement] = []
     original = renderer._draw_bus_route_marker
 
-    def tracking(draw, placement, color, font):
+    def tracking(draw, placement, color, font, unreliable=False):
         drawn.append(placement)
-        return original(draw, placement, color, font)
+        return original(draw, placement, color, font, unreliable=unreliable)
 
     monkeypatch.setattr(renderer, "_draw_bus_route_marker", tracking)
     renderer.render_map(
-        groups,
+        estimates,
         str(tmp_path),
         route_lines=lines,
         base_image=Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white"),
@@ -485,25 +547,29 @@ def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_pa
 
 
 def test_bus_markers_merge_matching_route_operator_at_same_position():
-    predictions = [
-        ("91", 22.334, 114.230, Operator.KMB, 0.0),
-        ("91", 22.334, 114.230, Operator.KMB, 0.0),
-        ("91M", 22.334, 114.230, Operator.KMB, 0.0),
+    from dashboard.maps.positions import BusEstimate
+
+    estimates = [
+        BusEstimate("91 Diamond Hill", 22.334, 114.230, Operator.KMB, 0.0),
+        BusEstimate("91 Diamond Hill", 22.334, 114.230, Operator.KMB, 0.0),
+        BusEstimate("91M Po Lam", 22.334, 114.230, Operator.KMB, 0.0),
     ]
     markers = renderer._merge_bus_markers(
-        predictions,
+        estimates,
         renderer.BASE_MAP_LAT,
         renderer.BASE_MAP_LON,
         renderer.BASE_MAP_ZOOM,
         (renderer.MAP_WIDTH, renderer.MAP_HEIGHT),
     )
     assert len(markers) == 2
-    assert [marker.routes for marker in markers] == [("91",), ("91M",)]
+    assert [marker.routes for marker in markers] == [("91 Diamond Hill",), ("91M Po Lam",)]
 
 
 def test_off_map_bus_prediction_has_no_marker_or_label():
+    from dashboard.maps.positions import BusEstimate
+
     markers = renderer._merge_bus_markers(
-        [("91", 90.0, 0.0, Operator.KMB, 0.0)],
+        [BusEstimate("91 Diamond Hill", 90.0, 0.0, Operator.KMB, 0.0)],
         renderer.BASE_MAP_LAT,
         renderer.BASE_MAP_LON,
         renderer.BASE_MAP_ZOOM,

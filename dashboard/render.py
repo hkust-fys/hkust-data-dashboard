@@ -257,6 +257,30 @@ def _delay_text(delay_min: float) -> str:
     return f"{rounded} min" if abs(delay_min - rounded) < 0.05 else f"{delay_min:.1f} min"
 
 
+def _affected_routes_line(
+    text: str, roads: object | None
+) -> str:
+    """Suffix line naming the tracked routes serving roads matched in ``text``."""
+    if roads is None:
+        return ""
+    routes = roads.routes_for_text(text)
+    if not routes:
+        return ""
+    return f"  ↳ affects: {', '.join(routes)}"
+
+
+def _matched_road_names(text: str, roads: object | None) -> list[str]:
+    """Display names of tracked roads matched in ``text``."""
+    if roads is None:
+        return []
+    names = []
+    for key in roads.match(text):
+        name = roads.display_name(key)
+        if name not in names:
+            names.append(name)
+    return names
+
+
 def _build_traffic_summary_embed(
     statuses: list[TrafficCorridorStatus] | None,
     incidents: list[TrafficIncident] | None,
@@ -265,6 +289,7 @@ def _build_traffic_summary_embed(
     stale_sources: list[str] | None = None,
     td_source_time: datetime | None = None,
     traffic_source_times: dict[str, datetime] | None = None,
+    roads: object | None = None,
 ) -> discord.Embed:
     """List matched TD traffic-news and relevant roadwork evidence.
 
@@ -276,8 +301,8 @@ def _build_traffic_summary_embed(
     displayed_source_times: list[datetime] = []
     td_times = traffic_source_times or {}
     if incidents:
+        evidence_times.append("TD traffic news")
         news_time = td_times.get("traffic_news") or td_source_time
-        evidence_times.append(f"TD traffic news updated {_fmt_timestamp(news_time, 'f')}")
         if news_time is not None:
             displayed_source_times.append(news_time)
     if roadworks:
@@ -293,18 +318,33 @@ def _build_traffic_summary_embed(
     notices = list(incidents or [])
     if notices:
         lines.append("\n**Active traffic notices**")
-        lines.extend(f"• {_esc(incident.title)}" for incident in notices)
-
+        for incident in notices:
+            text = f"{incident.title} {incident.description} {incident.location} {incident.road}"
+            lines.append(f"• {_esc(incident.title)}")
+            road_names = _matched_road_names(text, roads)
+            if road_names:
+                lines.append(f"  ↳ road: {', '.join(_esc(name) for name in road_names)}")
+            affected = _affected_routes_line(text, roads)
+            if affected:
+                lines.append(_esc(affected))
     works = list(roadworks or [])
     if works:
         lines.append("\n**Relevant roadworks**")
-        lines.extend(f"• {_esc(work.description)}" for work in works)
+        for work in works:
+            text = f"{work.description} {work.road}"
+            lines.append(f"• {_esc(work.description)}")
+            road_names = _matched_road_names(text, roads)
+            if road_names:
+                lines.append(f"  ↳ road: {', '.join(_esc(name) for name in road_names)}")
+            affected = _affected_routes_line(text, roads)
+            if affected:
+                lines.append(_esc(affected))
 
     description = "\n".join(lines)
     if len(description) > DESC_MAX:
         description = description[: DESC_MAX - 1] + "…"
     embed = discord.Embed(
-        title="🚦 Traffic summary",
+        title="🚦 Traffic news",
         color=0xF59E0B if notices or works else 0x16A34A,
         description=description,
     )
@@ -316,19 +356,6 @@ def _build_traffic_summary_embed(
     return _set_source_timestamp(
         embed, "Transport Department · traffic notices", footer_time
     )
-
-
-def _build_camera_embeds(images: list[ImageAsset]) -> list[discord.Embed]:
-    embeds = []
-    for asset in images:
-        embed = discord.Embed(title=f"📷 {asset.label}", color=0x0F766E)
-        embed.set_image(url=f"attachment://{asset.filename}")
-        if asset.source_time:
-            _set_source_timestamp(embed, "HKUST live view", asset.source_time)
-        else:
-            _set_source_timestamp(embed, "HKUST live view", None)
-        embeds.append(embed)
-    return embeds
 
 
 def _embed(name: str, value: str, inline: bool = False) -> discord.Embed:
@@ -369,26 +396,20 @@ def build_payload(
     traffic_stale_sources: list[str] | None = None,
     traffic_source_times: dict[str, datetime] | None = None,
     traffic_source_time: datetime | None = None,
-    bus_stop_images: list[ImageAsset] | None = None,
     errors: list[str] | None = None,
+    roads: object | None = None,
     now: datetime | None = None,
 ) -> DashboardPayload:
     """Compose the dashboard payload, enforcing every Discord limit.
 
-    Embed order follows the user's reading flow: cameras → map → traffic →
-    weather → bus ETA (bottom, most actionable).
+    Embed order follows the user's reading flow: map → traffic → weather →
+    bus ETA (bottom, most actionable).  Bus-stop live frames are no longer
+    dashboard embeds; they live behind the "Bus stops live" button.
     """
     payload = DashboardPayload()
     checked_at = now or datetime.now(UTC)
 
-    # 1. HKUST bus-stop live cameras (North/South Gate HLS).
-    live_images = bus_stop_images or []
-    live_embeds = _build_camera_embeds(live_images)
-    for embed, asset in zip(live_embeds, live_images, strict=True):
-        payload.embeds.append(embed)
-        payload.files.append(asset)
-
-    # 2. Image-first traffic map.
+    # 1. Image-first traffic map.
     if traffic_map_png:
         map_embed = _build_traffic_map_embed(
             traffic_map_png,
@@ -416,6 +437,7 @@ def build_payload(
             stale_sources=traffic_stale_sources,
             td_source_time=traffic_source_time or capture_time,
             traffic_source_times=traffic_source_times,
+            roads=roads,
         )
     )
 

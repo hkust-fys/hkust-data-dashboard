@@ -4,7 +4,13 @@ import asyncio
 
 import pytest
 
-from dashboard.http import CachedFetch, FetchError, HttpClient, TtlCache
+from dashboard.http import (
+    USER_AGENT,
+    CachedFetch,
+    FetchError,
+    HttpClient,
+    TtlCache,
+)
 
 
 def test_ttl_cache_hit_and_expiry():
@@ -152,3 +158,141 @@ async def test_origin_pacing_spaces_one_host_without_blocking_another():
     )
     assert abs(started["one-first"] - started["two-first"]) < 0.02
     assert started["one-second"] - started["one-first"] >= 0.025
+
+
+@pytest.mark.asyncio
+async def test_origin_specific_pacing_override():
+    client = HttpClient(
+        object(),
+        origin_request_interval_seconds=0,
+        origin_request_interval_overrides_seconds={"slow.example": 0.04},
+    )
+    started: list[float] = []
+    loop = asyncio.get_running_loop()
+
+    async def paced() -> None:
+        await client._pace_origin("https://slow.example/data")  # noqa: SLF001
+        started.append(loop.time())
+
+    await asyncio.gather(paced(), paced())
+
+    assert started[1] - started[0] >= 0.025
+
+
+@pytest.mark.asyncio
+async def test_http_403_is_not_retried():
+    class ForbiddenResponse:
+        status = 403
+        headers: dict[str, str] = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class ForbiddenSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            return ForbiddenResponse()
+
+    session = ForbiddenSession()
+    client = HttpClient(
+        session,
+        retry_attempts=3,
+        origin_request_interval_seconds=0,
+        origin_request_interval_overrides_seconds={"data.etagmb.gov.hk": 0},
+    )
+
+    with pytest.raises(FetchError, match="HTTP 403"):
+        await client.fetch_json("https://example.test/data")
+
+    assert session.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_post_http_403_is_not_retried():
+    class ForbiddenResponse:
+        status = 403
+        headers: dict[str, str] = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class ForbiddenSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def post(self, *_args, **_kwargs):
+            self.calls += 1
+            return ForbiddenResponse()
+
+    session = ForbiddenSession()
+    client = HttpClient(session, retry_attempts=3, origin_request_interval_seconds=0)
+
+    with pytest.raises(FetchError, match="HTTP 403"):
+        await client.post_form_json(
+            "https://example.test/data", {"data": "query"}, attempts=3
+        )
+
+    assert session.calls == 1
+
+
+class _UserAgentResponse:
+    status = 200
+    headers = {"Content-Type": "application/json"}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def read(self):
+        return b"{}"
+
+
+class _UserAgentSession:
+    def __init__(self) -> None:
+        self.seen_headers: list[dict[str, str]] = []
+
+    def get(self, _url, headers=None, **_kwargs):
+        self.seen_headers.append(dict(headers))
+        return _UserAgentResponse()
+
+
+@pytest.mark.asyncio
+async def test_requests_carry_the_dashboard_user_agent():
+    session = _UserAgentSession()
+    client = HttpClient(
+        session,
+        retry_attempts=1,
+        origin_request_interval_seconds=0,
+    )
+
+    headers = {"Referer": "https://hkemobility.example/"}
+
+    await client.fetch_json("https://hkemobility.example/data", headers=headers)
+
+    sent = session.seen_headers[0]
+    assert sent["User-Agent"] == USER_AGENT
+    # caller-supplied headers are preserved alongside the dashboard user agent.
+    assert sent["Referer"] == "https://hkemobility.example/"
+
+
+@pytest.mark.asyncio
+async def test_explicit_user_agent_override_is_case_insensitive():
+    session = _UserAgentSession()
+    client = HttpClient(session, retry_attempts=1, origin_request_interval_seconds=0)
+
+    await client.fetch_json(
+        "https://example.test/data", headers={"user-agent": "explicit-client/1.0"}
+    )
+
+    assert session.seen_headers[0] == {"user-agent": "explicit-client/1.0"}

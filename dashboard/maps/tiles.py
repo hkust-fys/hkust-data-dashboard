@@ -8,6 +8,7 @@ import binascii
 import io
 import logging
 import os
+import time
 
 from PIL import Image, ImageStat
 
@@ -19,6 +20,12 @@ GMAPS_BASE_URL = (
 VIEWPORT_WIDTH = 1920
 VIEWPORT_HEIGHT = 1080
 TILE_SIZE = 256
+
+# Repeated launch failures (dead system proxy/PAC) would otherwise warn on
+# every presenter tick. Back off before trying again; the cached base map
+# keeps rendering meanwhile.
+CAPTURE_FAILURE_BACKOFF_SECONDS = 10 * 60.0
+_capture_retry_after = 0.0
 
 # Google Maps changes its DOM names regularly. Find the map bitmap without
 # relying on any of those names: a candidate must be visible, occupy most of
@@ -187,13 +194,22 @@ async def capture_gmaps_base(
     viewport: tuple[int, int] = (VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
 ) -> Image.Image:
     """Export Google Maps' visible map canvas with its traffic layer."""
+    global _capture_retry_after
     cache_path = os.path.join(cache_dir, "gmaps_base.png")
     os.makedirs(cache_dir, exist_ok=True)
+    if time.monotonic() < _capture_retry_after:
+        return _cached_or_placeholder(cache_path, viewport)
     try:
         from playwright.async_api import async_playwright
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(
+                headless=True,
+                # Chromium otherwise reads the OS/registry proxy; a dead system
+                # proxy must not break a plain screenshot the HTTP layer can
+                # make directly.
+                args=["--no-proxy-server"],
+            )
             try:
                 page = await browser.new_page(
                     viewport={"width": viewport[0], "height": viewport[1]}
@@ -221,23 +237,54 @@ async def capture_gmaps_base(
                 if image is None:
                     raise ValueError("Google Maps canvas did not finish rendering")
             finally:
-                await browser.close()
+                # Closing Chromium can involve IPC and must still be given a
+                # bounded chance to finish when the capture task is cancelled.
+                # Keep cancellation as the operation's outcome; never turn it
+                # into a cached/placeholder map.
+                close_task = asyncio.create_task(browser.close())
+                try:
+                    await asyncio.wait_for(asyncio.shield(close_task), timeout=5.0)
+                except TimeoutError:
+                    close_task.cancel()
+                    await asyncio.gather(close_task, return_exceptions=True)
+                except asyncio.CancelledError:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(close_task), timeout=5.0)
+                    except (TimeoutError, asyncio.CancelledError):
+                        close_task.cancel()
+                        await asyncio.gather(close_task, return_exceptions=True)
+                    raise
 
         temporary_path = cache_path + ".tmp"
         image.save(temporary_path, format="PNG")
         os.replace(temporary_path, cache_path)
         return image
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001
-        log.warning("Playwright Google Maps canvas export failed (%s), loading cache", exc)
-        if os.path.exists(cache_path):
-            try:
-                with Image.open(cache_path) as cached:
-                    cached.load()
-                    return _normalize_canvas_image(cached, viewport)
-            except Exception:  # noqa: BLE001
-                pass
-        # Never fall back to a full-page screenshot: it would reintroduce UI.
-        return Image.new("RGB", viewport, (240, 242, 245))
+        _capture_retry_after = time.monotonic() + CAPTURE_FAILURE_BACKOFF_SECONDS
+        log.warning(
+            "Playwright Google Maps canvas export failed (%s); backing off %d min, "
+            "loading cache",
+            exc,
+            int(CAPTURE_FAILURE_BACKOFF_SECONDS / 60),
+        )
+        return _cached_or_placeholder(cache_path, viewport)
+
+
+def _cached_or_placeholder(
+    cache_path: str, viewport: tuple[int, int]
+) -> Image.Image:
+    """Last-good base map, or a neutral placeholder when nothing is cached."""
+    if os.path.exists(cache_path):
+        try:
+            with Image.open(cache_path) as cached:
+                cached.load()
+                return _normalize_canvas_image(cached, viewport)
+        except Exception:  # noqa: BLE001
+            pass
+    # Never fall back to a full-page screenshot: it would reintroduce UI.
+    return Image.new("RGB", viewport, (240, 242, 245))
 
 
 def load_tile(_cache_dir: str, _zoom: int, _x: int, _y: int) -> Image.Image | None:

@@ -56,7 +56,7 @@ class Settings:
     http_timeout_seconds: float = 10.0
     log_level: str = "INFO"
     cache_dir: str = field(default=".cache")
-    alert_role_id: int | None = None
+    alert_role_id: int | None = None  # pinged on heavy congestion only
     ffmpeg_executable: str | None = field(default=None, repr=False)
 
     @classmethod

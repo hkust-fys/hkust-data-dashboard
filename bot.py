@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import copy
 import inspect
 import io
 import logging
@@ -65,7 +66,14 @@ async def collect_all(
     Each entry is either the provider's result object or an exception (callers
     isolate failures).
     """
+    from dashboard.providers import tracked_roads as tracked_roads_provider
+
     tasks: dict[str, asyncio.Task] = {}
+
+    async def _tracked_roads():
+        return await tracked_roads_provider.fetch_tracked_roads(
+            client, cache_dir=settings.cache_dir
+        )
 
     async def _transit():
         return await transit.fetch_transit_etas(client)
@@ -74,7 +82,40 @@ async def collect_all(
         return await weather_provider.fetch_weather_conditions(client)
 
     async def _traffic():
-        return await traffic_provider.fetch_traffic_data(client)
+        # Road matching needs the tracked-roads table. A cold derivation can
+        # take a while, so give it a short grace period and fall back to the
+        # curated seed rather than delaying TD news.
+        try:
+            roads = await asyncio.wait_for(
+                asyncio.shield(tasks["tracked_roads"]), timeout=5
+            )
+        except Exception:  # noqa: BLE001
+            roads = tracked_roads_provider.fallback_roads()
+        return await traffic_provider.fetch_traffic_data(client, roads)
+
+    async def _affected_routes() -> list[str]:
+        """Route numbers named in the current TD news/roadworks selection."""
+        try:
+            traffic_result = await tasks["traffic"]
+        except Exception:  # noqa: BLE001
+            return []
+        if not (isinstance(traffic_result, tuple) and len(traffic_result) >= 3):
+            return []
+        try:
+            roads = await asyncio.wait_for(
+                asyncio.shield(tasks["tracked_roads"]), timeout=5
+            )
+        except Exception:  # noqa: BLE001
+            roads = tracked_roads_provider.fallback_roads()
+        incidents = traffic_result[1] or []
+        roadworks = traffic_result[2] or []
+        texts = [
+            f"{i.title} {i.description} {i.location} {i.road}" for i in incidents
+        ] + [f"{w.description} {w.road}" for w in roadworks]
+        affected: set[str] = set()
+        for text in texts:
+            affected.update(roads.routes_for_text(text))
+        return sorted(affected)
 
     async def _traffic_map():
         # Transit ETA groups still drive retained estimated bus markers.
@@ -85,25 +126,19 @@ async def collect_all(
                 groups = transit_result[0]
         except Exception as exc:  # noqa: BLE001
             log.warning("traffic map: transit groups unavailable: %s", exc)
+        affected = await _affected_routes()
         return await maps.fetch_traffic_map(
             client,
             groups=groups,
             cache_dir=settings.cache_dir,
-        )
-
-    async def _bus_stops():
-        if not settings.ffmpeg_executable:
-            raise RuntimeError("camera support disabled by startup preflight")
-        return await cameras.fetch_bus_stop_frames(
-            client,
-            ffmpeg_executable=settings.ffmpeg_executable,
+            affected_routes=affected,
         )
 
     for name, coro in (
+        ("tracked_roads", _tracked_roads()),
         ("transit", _transit()),
         ("weather", _weather()),
         ("traffic", _traffic()),
-        ("bus_stops", _bus_stops()),
     ):
         tasks[name] = asyncio.create_task(coro)
 
@@ -113,24 +148,33 @@ async def collect_all(
     results: dict[str, object] = {}
     task_names = {task: name for name, task in tasks.items()}
     pending = set(tasks.values())
-    # Publish every provider as soon as it settles.  In particular, a slow
-    # browser capture no longer prevents weather/traffic/transit from reaching
-    # the snapshot used by the fixed-cadence presenter.
-    while pending:
-        done, pending = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in done:
-            name = task_names[task]
-            try:
-                value = task.result()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("provider %s failed: %s", name, exc)
-                value = exc
-            results[name] = value
-            if on_result is not None:
-                on_result(name, value)
-    return results
+    try:
+        # Publish every provider as soon as it settles.  In particular, a slow
+        # browser capture no longer prevents weather/traffic/transit from reaching
+        # the snapshot used by the fixed-cadence presenter.
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                name = task_names[task]
+                try:
+                    value = task.result()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("provider %s failed: %s", name, exc)
+                    value = exc
+                results[name] = value
+                if on_result is not None:
+                    on_result(name, value)
+        return results
+    finally:
+        # A cancelled collection must not leave provider tasks (especially the
+        # Playwright map capture) running after the caller has shut down.
+        remaining = [task for task in tasks.values() if not task.done()]
+        for task in remaining:
+            task.cancel()
+        if remaining:
+            await asyncio.gather(*remaining, return_exceptions=True)
 
 
 def _to_payload(results: dict[str, object]) -> DashboardPayload:
@@ -196,27 +240,12 @@ def _to_payload(results: dict[str, object]) -> DashboardPayload:
         errors.append("traffic map unavailable")
     map_source_time = None
 
-    # Bus-stop camera frames (HKUST HLS live view).
-    bus_stops_result = results.get("bus_stops")
-    if isinstance(bus_stops_result, Exception):
-        errors.append("bus-stop cameras unavailable")
-        bus_stop_images: list[ImageAsset] = []
-    elif isinstance(bus_stops_result, list):
-        bus_stop_images = []
-        for frame in bus_stops_result:
-            if isinstance(frame, CameraFrame) and frame.data:
-                bus_stop_images.append(
-                    ImageAsset(
-                        filename=f"busstop-{len(bus_stop_images)}.jpg",
-                        data=frame.data,
-                        content_type="image/jpeg",
-                        label=frame.label,
-                        caption="live view",
-                        source_time=frame.source_time,
-                    )
-                )
-    else:
-        bus_stop_images = []
+    # Bus-stop live view moved behind the dashboard button; the dashboard
+    # message itself no longer carries always-on camera embeds.
+    # Tracked-roads table (OSM-derived) drives affected-route listings.
+    roads_table = results.get("tracked_roads")
+    if isinstance(roads_table, Exception):
+        roads_table = None
 
     return build_payload(
         weather=weather,
@@ -231,14 +260,332 @@ def _to_payload(results: dict[str, object]) -> DashboardPayload:
         traffic_stale_sources=traffic_stale,
         traffic_source_times=traffic_source_times,
         traffic_source_time=capture_time,
-        bus_stop_images=bus_stop_images,
         errors=errors,
+        roads=roads_table,
     )
 
 
 # --------------------------------------------------------------------------
 # Message lifecycle
 # --------------------------------------------------------------------------
+
+LIVE_VIEW_BUTTON_ID = "busstop:live"
+LIVE_VIEW_SNAPSHOT_SECONDS = 60
+LIVE_VIEW_COOLDOWN_SECONDS = 30
+LIVE_FRAME_MAX_AGE_SECONDS = 45.0
+LIVE_FRAME_REFRESH_SECONDS = 20.0
+LIVE_COUNTDOWN_REFRESH_SECONDS = 15
+
+
+class LiveFrameCache:
+    """Rolling latest camera frames, refreshed in the background.
+
+    HLS segment fetch + ffmpeg decode takes seconds; a button press must be
+    answered within three. So the cache refreshes continuously and presses
+    answer instantly from the latest decoded frames.
+    """
+
+    def __init__(self) -> None:
+        self.frames: list[CameraFrame] = []
+        self.updated_monotonic: float = 0.0
+        self._task: asyncio.Task | None = None
+
+    @property
+    def fresh(self) -> bool:
+        return (
+            bool(self.frames)
+            and time.monotonic() - self.updated_monotonic <= LIVE_FRAME_MAX_AGE_SECONDS
+        )
+
+    def start(self, updater: DashboardUpdater) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._task = asyncio.create_task(_frame_refresh_loop(self, updater))
+
+    async def stop(self) -> None:
+        if self._task is not None and not self._task.done():
+            # Give a freshly-created task one turn to enter its coroutine so
+            # its cancellation cleanup is guaranteed to run.
+            await asyncio.sleep(0)
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._task
+        self._task = None
+
+
+async def _frame_refresh_loop(cache: LiveFrameCache, updater: DashboardUpdater) -> None:
+    """Decode camera frames continuously so button presses are instant."""
+    while True:
+        try:
+            assert updater.client is not None and updater.settings.ffmpeg_executable
+            frames = await cameras.fetch_bus_stop_frames(
+                updater.client,
+                ffmpeg_executable=updater.settings.ffmpeg_executable,
+            )
+            good = [f for f in frames if isinstance(f, CameraFrame) and f.data]
+            if good:
+                cache.frames = good
+                cache.updated_monotonic = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("live-frame refresh failed: %s", type(exc).__name__)
+        await asyncio.sleep(LIVE_FRAME_REFRESH_SECONDS)
+
+
+@dataclass(frozen=True)
+class _SnapshotParts:
+    """Immutable snapshot assets; upload objects are created per Discord call."""
+
+    assets: tuple[tuple[bytes, str], ...]
+    embeds: tuple[discord.Embed, ...]
+
+    def files(self) -> list[discord.File]:
+        return [discord.File(io.BytesIO(data), filename=name) for data, name in self.assets]
+
+
+def _snapshot_parts_from_frames(frames: list[CameraFrame]) -> _SnapshotParts:
+    assets: list[tuple[bytes, str]] = []
+    embeds: list[discord.Embed] = []
+    for index, frame in enumerate(frames):
+        filename = f"busstop-{index}.jpg"
+        assets.append((bytes(frame.data), filename))
+        embed = discord.Embed(title=f"📷 {frame.label} — live snapshot", color=0x0F766E)
+        embed.set_image(url=f"attachment://{filename}")
+        stamp = frame.source_time
+        if stamp is not None:
+            if isinstance(stamp, (int, float)):
+                from datetime import UTC as _UTC
+                from datetime import datetime as _dt
+
+                stamp = _dt.fromtimestamp(float(stamp), tz=_UTC)
+            if stamp.tzinfo is None:
+                from datetime import UTC as _UTC
+
+                stamp = stamp.replace(tzinfo=_UTC)
+            embed.timestamp = stamp
+            embed.set_footer(text="HKUST live view")
+        embeds.append(embed)
+    return _SnapshotParts(tuple(assets), tuple(embeds))
+
+
+class LiveViewSnapshotView(discord.ui.View):
+    """Persistent button answering instantly with the cached live frames.
+
+    A press while a snapshot is showing REFRESHES it: newest frames plus a
+    restarted disappearance countdown, instead of an error.
+    """
+
+    def __init__(self, updater: DashboardUpdater) -> None:
+        super().__init__(timeout=None)
+        self.updater = updater
+
+    @discord.ui.button(label="Bus stops live", style=discord.ButtonStyle.primary,
+                       custom_id=LIVE_VIEW_BUTTON_ID, emoji="📷")
+    async def snapshot(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # Acknowledge within the 3-second window no matter how busy the loop
+        # is; every outcome is delivered as an ephemeral followup.
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        updater = self.updater
+        cache: LiveFrameCache | None = getattr(updater, "live_frames", None)
+        now = time.monotonic()
+
+        # Refresh-in-place: if a snapshot window is live, swap in the newest
+        # frames and restart its countdown rather than erroring.
+        running = updater.live_snapshot_task
+        if running is not None and not running.done():
+            # The initial followup send yields before it publishes its webhook
+            # message handle. Do not cancel that send if another press lands
+            # in this small window: there is no message to refresh yet.
+            if updater.live_snapshot_message is None:
+                with contextlib.suppress(Exception):
+                    await interaction.followup.send(
+                        "The snapshot is opening; try again in a moment to refresh it.",
+                        ephemeral=True,
+                    )
+                return
+            if cache is None or not cache.fresh:
+                with contextlib.suppress(Exception):
+                    await interaction.followup.send(
+                        "No fresher frames yet; try again in a few seconds.",
+                        ephemeral=True,
+                    )
+                return
+            parts = _snapshot_parts_from_frames(cache.frames)
+            generation = updater.live_snapshot_generation + 1
+            updater.live_snapshot_generation = generation
+            updater.live_snapshot_task = asyncio.create_task(
+                _refresh_ephemeral_snapshot(running, parts, updater, generation)
+            )
+            with contextlib.suppress(Exception):
+                await interaction.followup.send(
+                    "Refreshed the snapshot and restarted the countdown.",
+                    ephemeral=True,
+                )
+            return
+
+        if now - updater.last_live_snapshot < LIVE_VIEW_COOLDOWN_SECONDS:
+            with contextlib.suppress(Exception):
+                await interaction.followup.send(
+                    "The last snapshot just ended; try again shortly.",
+                    ephemeral=True,
+                )
+            return
+        if cache is None or not cache.fresh or updater.client is None or (
+            not updater.settings.ffmpeg_executable
+        ):
+            with contextlib.suppress(Exception):
+                await interaction.followup.send(
+                    "Live frames are still loading; try again in a few seconds.",
+                    ephemeral=True,
+                )
+            return
+
+        parts = _snapshot_parts_from_frames(cache.frames)
+        generation = updater.live_snapshot_generation + 1
+        updater.live_snapshot_generation = generation
+        updater.live_snapshot_task = asyncio.create_task(
+            _send_ephemeral_snapshot(interaction, parts, updater, generation)
+        )
+
+
+def _snapshot_embeds_with_countdown(
+    embeds: list[discord.Embed] | tuple[discord.Embed, ...],
+    ends_monotonic: float,
+    frame_count: int,
+) -> list[discord.Embed]:
+    """Stamp each embed with a visible disappearance countdown line."""
+    remaining = max(0, int(round(ends_monotonic - time.monotonic())))
+    note = (
+        f"⏳ disappears in <t:{int(time.time()) + remaining}:R> — "
+        "press **Bus stops live** again to refresh"
+    )
+    out: list[discord.Embed] = []
+    for embed in embeds:
+        embed = copy.deepcopy(embed)
+        embed.description = note
+        if frame_count > 1:
+            pass
+        out.append(embed)
+    return out
+
+
+async def _send_ephemeral_snapshot(
+    interaction: discord.Interaction,
+    parts: _SnapshotParts,
+    updater: DashboardUpdater,
+    generation: int | None = None,
+) -> None:
+    """Answer the deferred button with the snapshot, delete it after a minute."""
+    message = None
+    if generation is None:
+        generation = updater.live_snapshot_generation + 1
+        updater.live_snapshot_generation = generation
+    try:
+        ends = time.monotonic() + LIVE_VIEW_SNAPSHOT_SECONDS
+        message = await interaction.followup.send(
+            embeds=_snapshot_embeds_with_countdown(
+                parts.embeds, ends, len(parts.assets)
+            ),
+            files=parts.files(),
+            ephemeral=True,
+            wait=True,
+        )
+        updater.live_snapshot_message_id = message.id
+        updater.live_snapshot_message = message
+        updater.last_live_snapshot = time.monotonic()
+        # Refresh the countdown line periodically so it visibly counts down.
+        # Attachments must be re-passed on every edit or Discord detaches the
+        # images the embeds still reference.
+        ticks = int(LIVE_VIEW_SNAPSHOT_SECONDS // LIVE_COUNTDOWN_REFRESH_SECONDS)
+        for _ in range(ticks):
+            await asyncio.sleep(LIVE_COUNTDOWN_REFRESH_SECONDS)
+            remaining = max(0, int(round(ends - time.monotonic())))
+            if remaining <= 0 or message is None:
+                break
+            with contextlib.suppress(Exception):
+                await message.edit(
+                    embeds=_snapshot_embeds_with_countdown(
+                        parts.embeds, ends, len(parts.assets)
+                    ),
+                    attachments=parts.files(),
+                )
+        await asyncio.sleep(max(0.0, ends - time.monotonic()))
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+
+        log.warning(
+            "ephemeral snapshot delivery failed: %s\n%s",
+            exc,
+            traceback.format_exc(limit=5),
+        )
+        with contextlib.suppress(Exception):
+            await interaction.followup.send(
+                "Snapshot delivery failed; please try again.", ephemeral=True
+            )
+    finally:
+        if (
+            message is not None
+            and updater.live_snapshot_message is message
+            and updater.live_snapshot_generation == generation
+        ):
+            updater.live_snapshot_message_id = None
+            updater.live_snapshot_message = None
+            with contextlib.suppress(Exception):
+                await message.delete()
+
+
+async def _refresh_ephemeral_snapshot(
+    old_task: asyncio.Task,
+    parts: _SnapshotParts,
+    updater: DashboardUpdater,
+    generation: int | None = None,
+) -> None:
+    """Replace the running snapshot's frames and restart its countdown."""
+    # Stop the old window WITHOUT deleting its message, then reuse it.
+    message = updater.live_snapshot_message
+    if generation is None:
+        generation = updater.live_snapshot_generation + 1
+        updater.live_snapshot_generation = generation
+    old_task.cancel()
+    updater.last_live_snapshot = time.monotonic()
+    with contextlib.suppress(asyncio.CancelledError):
+        await old_task
+    if message is None:
+        return
+    updater.live_snapshot_message = message
+    try:
+        ends = time.monotonic() + LIVE_VIEW_SNAPSHOT_SECONDS
+        await message.edit(
+            embeds=_snapshot_embeds_with_countdown(parts.embeds, ends, len(parts.assets)),
+            attachments=parts.files(),
+        )
+        ticks = int(LIVE_VIEW_SNAPSHOT_SECONDS // LIVE_COUNTDOWN_REFRESH_SECONDS)
+        for _ in range(ticks):
+            await asyncio.sleep(LIVE_COUNTDOWN_REFRESH_SECONDS)
+            remaining = max(0, int(round(ends - time.monotonic())))
+            if remaining <= 0:
+                break
+            with contextlib.suppress(Exception):
+                await message.edit(
+                        embeds=_snapshot_embeds_with_countdown(
+                        parts.embeds, ends, len(parts.assets)
+                    ),
+                    attachments=parts.files(),
+                )
+        await asyncio.sleep(max(0.0, ends - time.monotonic()))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ephemeral snapshot refresh failed: %s", exc)
+    finally:
+        if message is not None and (
+            updater.live_snapshot_message is message
+            and updater.live_snapshot_generation == generation
+        ):
+            with contextlib.suppress(Exception):
+                await message.delete()
+            updater.live_snapshot_message = None
+            updater.live_snapshot_message_id = None
+
 
 def _is_dashboard_message(message, expected_author) -> bool:
     """Return whether ``message`` is this bot's exact dashboard marker."""
@@ -295,13 +642,13 @@ async def _resolve_dashboard_message(
     return await _find_dashboard_message(channel, expected_author)
 
 
-async def _ensure_dashboard_message(channel, payload: DashboardPayload) -> object:
+async def _ensure_dashboard_message(channel, payload: DashboardPayload, view=None) -> object:
     """Reuse the known message or find/create exactly one."""
     message = await _find_dashboard_message(channel)
     if message is not None:
         return message
     # create exactly one
-    message = await channel.send(content=DASHBOARD_MESSAGE_MARKER)
+    message = await channel.send(content=DASHBOARD_MESSAGE_MARKER, view=view)
     log.info("created dashboard message %s in %s", message.id, getattr(channel, "id", "?"))
     return message
 
@@ -310,7 +657,7 @@ def discord_file(asset: ImageAsset) -> discord.File:
     return discord.File(io.BytesIO(asset.data), filename=asset.filename)
 
 
-async def _apply_payload(message, payload: DashboardPayload) -> None:
+async def _apply_payload(message, payload: DashboardPayload, view=None) -> None:
     """Edit embeds + attachments atomically; replace images to avoid CDN cache."""
     embeds = [e for e in payload.embeds if e is not None]
     files = [discord_file(asset) for asset in payload.files]
@@ -318,6 +665,7 @@ async def _apply_payload(message, payload: DashboardPayload) -> None:
         content=DASHBOARD_MESSAGE_MARKER,
         embeds=embeds,
         attachments=files,
+        view=view,
     )
 
 
@@ -358,6 +706,13 @@ class DashboardUpdater:
         self._loop_task: asyncio.Task | None = None
         self._running = False
         self._start_lock = asyncio.Lock()
+        self.live_snapshot_task: asyncio.Task | None = None
+        self.last_live_snapshot = float("-inf")
+        self.live_snapshot_message_id: int | None = None
+        self.live_snapshot_message = None
+        self.live_snapshot_generation = 0
+        self.live_view = LiveViewSnapshotView(self)
+        self.live_frames = LiveFrameCache()
         from dashboard.alerts import AlertMonitor
 
         self.alerts = AlertMonitor()
@@ -373,6 +728,7 @@ class DashboardUpdater:
             self.client = HttpClient(
                 self.session, timeout_seconds=self.settings.http_timeout_seconds
             )
+            self.live_frames.start(self)
             self._running = True
             self._loop_task = asyncio.create_task(self._update_loop(channel))
 
@@ -418,6 +774,9 @@ class DashboardUpdater:
                 incidents = traffic_result[1]
             if len(traffic_result) > 2:
                 roadworks = traffic_result[2]
+        roads = results.get("tracked_roads")
+        if roads is not None and not isinstance(roads, Exception):
+            self.alerts.roads = roads
         events = self.alerts.update(warnings, statuses, incidents, roadworks)
         if not events or self._thread is None:
             return
@@ -548,9 +907,11 @@ class DashboardUpdater:
 
         # ensure message exists (create once)
         if self._message is None:
-            self._message = await _ensure_dashboard_message(channel, payload)
+            self._message = await _ensure_dashboard_message(
+                channel, payload, view=self.live_view
+            )
         try:
-            await _apply_payload(self._message, payload)
+            await _apply_payload(self._message, payload, view=self.live_view)
             self._last_good_payload = payload
         except Exception as exc:  # noqa: BLE001
             log.warning("edit failed (keeping last good): %s", exc)
@@ -563,16 +924,24 @@ class DashboardUpdater:
 
     async def stop(self) -> None:
         self._running = False
+        await self.live_frames.stop()
+        if self.live_snapshot_task is not None and not self.live_snapshot_task.done():
+            self.live_snapshot_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.live_snapshot_task
+        self.live_snapshot_task = None
         if self._loop_task is not None:
             self._loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._loop_task
             self._loop_task = None
-        if self._collection_task is not None:
-            self._collection_task.cancel()
+        collection_task = self._collection_task
+        if collection_task is not None and not collection_task.done():
+            collection_task.cancel()
+        if collection_task is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._collection_task
-            self._collection_task = None
+                await collection_task
+        self._collection_task = None
         if self.session is not None:
             await self.session.close()
             self.session = None
@@ -593,6 +962,8 @@ async def run_discord_bot(settings: Settings) -> None:
     bot = commands.Bot(command_prefix="d.", intents=intents, help_command=None)
 
     updater = DashboardUpdater(settings)
+    # Persistent component: survives restarts via the custom_id registration.
+    bot.add_view(updater.live_view)
 
     @bot.event
     async def on_ready() -> None:

@@ -222,6 +222,81 @@ def test_traffic_summary_includes_relevant_roadworks():
     assert embed.timestamp == s.utc()
 
 
+def test_traffic_summary_lists_affected_routes_for_news_and_roadworks():
+    from dashboard.models import Roadwork, TrafficIncident
+    from dashboard.providers.route_geometry import RouteLine
+    from dashboard.providers.tracked_roads import build_tracked_roads
+    from dashboard.render import _build_traffic_summary_embed
+
+    lines = [
+        RouteLine("91M", "KMB", "outbound"),
+        RouteLine("792M", "CTB", "outbound"),
+    ]
+    roads = build_tracked_roads(lines, [["Hang Hau Road"], ["Hang Hau Road"]])
+    incident = TrafficIncident(
+        identifier="tn",
+        title="Lane closure on Hang Hau Road",
+        description="One lane closed",
+        road="Hang Hau Road",
+        location="Hang Hau",
+        direction="",
+        status="active",
+    )
+    embed = _build_traffic_summary_embed(
+        [],
+        [incident],
+        None,
+        roadworks=[Roadwork("rw", "Resurfacing on Hang Hau Road", "Hang Hau Road")],
+        roads=roads,
+    )
+    assert "affects: 91M, 792M" in embed.description
+    assert embed.description.count("affects:") == 2
+
+    # without a road table, no suffix renders
+    plain = _build_traffic_summary_embed([], [incident], None)
+    assert "affects:" not in plain.description
+
+
+def test_traffic_summary_names_affected_road_per_item():
+    from dashboard.models import Roadwork, TrafficIncident
+    from dashboard.providers.route_geometry import RouteLine
+    from dashboard.providers.tracked_roads import build_tracked_roads
+    from dashboard.render import _build_traffic_summary_embed
+
+    lines = [RouteLine("91M", "KMB", "outbound"), RouteLine("792M", "CTB", "outbound")]
+    roads = build_tracked_roads(lines, [["Hang Hau Road"], ["Hang Hau Road"]])
+    incident = TrafficIncident(
+        identifier="tn",
+        title="Lane closure on Hang Hau Road",
+        description="One lane closed",
+        road="Hang Hau Road",
+        location="Hang Hau",
+        direction="",
+        status="active",
+    )
+    embed = _build_traffic_summary_embed(
+        [], [incident], None,
+        roadworks=[Roadwork("rw", "Resurfacing near Hang Hau Road", "")],
+        roads=roads,
+    )
+    # each item carries its matched road display name
+    assert embed.description.count("↳ road: Hang Hau Road") == 2
+    # longest-match-wins still applies for overlapping names
+    cwb_roads = build_tracked_roads(
+        [RouteLine("91", "KMB", "outbound")],
+        [["New Clear Water Bay Road"]],
+    )
+    cwb_incident = TrafficIncident(
+        identifier="tn2", title="Works on New Clear Water Bay Road",
+        description="", road="", location="", direction="", status="active",
+    )
+    cwb_embed = _build_traffic_summary_embed([], [cwb_incident], None, roads=cwb_roads)
+    assert "↳ road: New Clear Water Bay Road" in cwb_embed.description
+    assert "Clear Water Bay Road\n" not in cwb_embed.description.replace(
+        "New Clear Water Bay Road", ""
+    )
+
+
 def test_traffic_summary_links_to_official_td_traffic_news():
     from dashboard.render import TD_TRAFFIC_NEWS_URL, _build_traffic_summary_embed
 
@@ -254,11 +329,11 @@ def test_traffic_summary_keeps_each_displayed_source_time_separate():
 
     assert "TD detectors" not in embed.description
     assert "TD monitored slow points" not in embed.description
+    # The news timestamp lives only in the footer now (no duplicated line).
+    assert "TD traffic news updated" not in embed.description
     assert (
-        f"TD traffic news updated <t:{int(news_time.timestamp())}:f>"
-        in embed.description
+        f"TD roadworks <t:{int(roadworks_time.timestamp())}:t>" in embed.description
     )
-    assert f"TD roadworks <t:{int(roadworks_time.timestamp())}:t>" in embed.description
     assert embed.timestamp == roadworks_time
     assert embed.footer.text == "Transport Department · traffic notices"
 
@@ -363,7 +438,6 @@ def test_build_payload_respects_embed_caps():
         traffic_map_png=b"\x89PNG\r\n" + b"\x00" * 100,
         transit_source_time=s.utc(),
         map_source_time=s.utc(),
-        bus_stop_images=s.bus_stop_assets(),
     )
     assert len(payload.embeds) <= EMBEDS_PER_MESSAGE_MAX
     assert len(payload.files) <= EMBEDS_PER_MESSAGE_MAX

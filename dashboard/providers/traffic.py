@@ -70,24 +70,10 @@ ROADWORKS_SPEC = CachedFetch(
 )
 
 # --------------------------------------------------------------------------
-# Corridor aliases (dashboard heuristics, not TD classifications)
-# --------------------------------------------------------------------------
-
-CORRIDOR_ALIASES: dict[str, tuple[str, ...]] = {
-    "Clear Water Bay Road": ("clear water bay", "new clear water bay"),
-    "Lung Cheung Road": ("lung cheung",),
-    "Hiram's Highway": ("hiram",),
-    "Sai Kung Road": ("sai kung road",),
-    "Hang Hau Road": ("hang hau",),
-    "Ying Yip Road": ("ying yip",),
-    "Tai Po Tsai Road": ("tai po tsai",),
-    "University Road": ("university road",),
-    "Po Lam Road": ("po lam road",),
-    "Chun Ying Street": ("chun ying",),
-}
-
 # Direction words that appear in TD detector descriptions ("Westbound",
 # "Eastbound") and in special-news text.
+# --------------------------------------------------------------------------
+
 DIRECTION_HINTS: tuple[tuple[str, str], ...] = (
     ("eastbound", "→ E"),
     ("westbound", "← W"),
@@ -233,46 +219,47 @@ def parse_detector_observations(xml_text: str) -> dict[str, dict[str, Any]]:
 
     date_text = _local_text(root, "date")
     out: dict[str, dict[str, Any]] = {}
-    for detector in root.iter():
-        if _local_name(detector.tag) != "detector":
+    # Single pass over <period> groups: each period's from-time applies to its
+    # own detectors. (The previous per-detector ancestor rescan was O(n^2) and
+    # large enough to stall the event loop and block the Discord heartbeat.)
+    for period in root.iter():
+        if _local_name(period.tag) != "period":
             continue
-        did = _local_text(detector, "detector_id")
-        if not did:
-            continue
-        # capture time: the period_from of the ancestor <period>
-        period_from = ""
-        for node in root.iter():
-            if detector in node.iter() and node is not detector and _local_name(node.tag) == "period":
-                period_from = _local_text(node, "period_from")
-                break
+        period_from = _local_text(period, "period_from")
         capture = _build_capture_time(date_text, period_from)
+        for detector in period.iter():
+            if _local_name(detector.tag) != "detector":
+                continue
+            did = _local_text(detector, "detector_id")
+            if not did:
+                continue
 
-        speeds: list[float] = []
-        volumes: list[int] = []
-        occupancies: list[float] = []
-        for lane in detector.iter():
-            if _local_name(lane.tag) != "lane":
+            speeds: list[float] = []
+            volumes: list[int] = []
+            occupancies: list[float] = []
+            for lane in detector.iter():
+                if _local_name(lane.tag) != "lane":
+                    continue
+                valid = (_local_text(lane, "valid") or "").strip().upper()
+                if valid == "N":
+                    continue
+                speed = _to_float(_local_text(lane, "speed"))
+                if speed is not None:
+                    speeds.append(speed)
+                volume = _to_int(_local_text(lane, "volume"))
+                if volume is not None:
+                    volumes.append(volume)
+                occ = _to_float(_local_text(lane, "occupancy"))
+                if occ is not None:
+                    occupancies.append(occ)
+            if not speeds and not volumes:
                 continue
-            valid = (_local_text(lane, "valid") or "").strip().upper()
-            if valid == "N":
-                continue
-            speed = _to_float(_local_text(lane, "speed"))
-            if speed is not None:
-                speeds.append(speed)
-            volume = _to_int(_local_text(lane, "volume"))
-            if volume is not None:
-                volumes.append(volume)
-            occ = _to_float(_local_text(lane, "occupancy"))
-            if occ is not None:
-                occupancies.append(occ)
-        if not speeds and not volumes:
-            continue
-        out[did] = {
-            "speed": round(sum(speeds) / len(speeds), 1) if speeds else None,
-            "volume": sum(volumes) if volumes else None,
-            "occupancy": round(sum(occupancies) / len(occupancies), 1) if occupancies else None,
-            "capture_time": capture,
-        }
+            out[did] = {
+                "speed": round(sum(speeds) / len(speeds), 1) if speeds else None,
+                "volume": sum(volumes) if volumes else None,
+                "occupancy": round(sum(occupancies) / len(occupancies), 1) if occupancies else None,
+                "capture_time": capture,
+            }
     return out
 
 
@@ -307,17 +294,18 @@ def _to_int(value: str | None) -> int | None:
 
 
 # --------------------------------------------------------------------------
-# Corridor matching
+# Road matching (the road table comes from dashboard.providers.tracked_roads)
 # --------------------------------------------------------------------------
 
-def match_corridors(text: str) -> list[str]:
-    """Return canonical corridor names whose aliases appear in ``text``."""
-    lowered = text.lower()
-    matched = []
-    for canonical, aliases in CORRIDOR_ALIASES.items():
-        if any(alias in lowered for alias in aliases):
-            matched.append(canonical)
-    return matched
+def match_roads(text: str, roads: Any) -> list[str]:
+    """Return canonical road keys whose aliases appear in ``text``.
+
+    ``roads`` is a ``TrackedRoads`` table; passing ``None`` matches nothing so
+    callers without a loaded road table stay silent rather than over-matching.
+    """
+    if roads is None:
+        return []
+    return roads.match(text)
 
 
 def _direction_from(text: str, meta_direction: str = "") -> str:
@@ -334,18 +322,19 @@ def _direction_from(text: str, meta_direction: str = "") -> str:
 def build_corridor_statuses(
     observations: dict[str, dict[str, Any]],
     meta: dict[str, _DetectorMeta],
+    roads: Any = None,
     max_observations: int = 6,
 ) -> list[TrafficCorridorStatus]:
-    """Group detector observations by matched corridor and summarize."""
+    """Group detector observations by matched road and summarize."""
     groups: dict[str, list[TrafficObservation]] = {}
     for did, obs in observations.items():
         m = meta.get(did)
         if m is None:
             continue
-        corridors = match_corridors(m.description)
+        corridors = match_roads(m.description, roads)
         if not corridors:
             continue
-        # a detector may serve multiple corridors; attach to the first match
+        # a detector may serve multiple roads; attach to the first match
         corridor = corridors[0]
         speed = obs.get("speed")
         stale = obs.get("capture_time") is None
@@ -483,13 +472,13 @@ def _dedupe_incidents(incidents: list[TrafficIncident]) -> list[TrafficIncident]
 
 
 def filter_relevant_incidents(
-    incidents: list[TrafficIncident], limit: int = 3
+    incidents: list[TrafficIncident], roads: Any = None, limit: int = 3
 ) -> list[TrafficIncident]:
-    """Keep only incidents whose text matches our corridors; dedupe already done."""
+    """Keep only incidents whose text matches our tracked roads; dedupe already done."""
     relevant = [
         inc
         for inc in incidents
-        if match_corridors(f"{inc.title} {inc.description} {inc.location} {inc.road}")
+        if match_roads(f"{inc.title} {inc.description} {inc.location} {inc.road}", roads)
     ]
     return relevant[:limit]
 
@@ -498,8 +487,8 @@ def filter_relevant_incidents(
 # Roadworks GeoJSON
 # --------------------------------------------------------------------------
 
-def parse_roadworks(geojson: dict[str, Any]) -> list[Roadwork]:
-    """Parse TD roadworks GeoJSON; match against our corridors."""
+def parse_roadworks(geojson: dict[str, Any], roads: Any = None) -> list[Roadwork]:
+    """Parse TD roadworks GeoJSON; match against our tracked roads."""
     out: list[Roadwork] = []
     features = geojson.get("features") or []
     for feature in features:
@@ -508,7 +497,7 @@ def parse_roadworks(geojson: dict[str, Any]) -> list[Roadwork]:
             str(props.get(k) or "")
             for k in ("description", "name", "location", "road")
         )
-        if not match_corridors(description):
+        if not match_roads(description, roads):
             continue
         identifier = str(props.get("id") or props.get("identifier") or "")
         out.append(
@@ -529,6 +518,7 @@ def parse_roadworks(geojson: dict[str, Any]) -> list[Roadwork]:
 
 async def fetch_traffic_data(
     client: HttpClient,
+    roads: Any = None,
 ) -> tuple[
     list[TrafficCorridorStatus],
     list[TrafficIncident],
@@ -538,6 +528,9 @@ async def fetch_traffic_data(
     dict[str, datetime],
 ]:
     """Fetch detectors, special news, and roadworks (metadata is cached daily).
+
+    ``roads`` is the loaded ``TrackedRoads`` table used to match TD text; with
+    ``None`` no road matches and only empty statuses/notices are returned.
 
     Returns ``(statuses, incidents, roadworks, detector_capture_time,
     stale_sources, source_times)``.  ``source_times`` preserves the cached
@@ -568,7 +561,7 @@ async def fetch_traffic_data(
         if stale:
             stale_sources.append("TD detector observations")
         obs = parse_detector_observations(obs_text)
-        statuses = build_corridor_statuses(obs, meta)
+        statuses = build_corridor_statuses(obs, meta, roads)
         capture_time = max(
             (o.capture_time for s in statuses for o in s.observations if o.capture_time),
             default=None,
@@ -586,7 +579,7 @@ async def fetch_traffic_data(
         )
         if stale:
             stale_sources.append("TD traffic news")
-        incidents = filter_relevant_incidents(parse_special_news(news_text))
+        incidents = filter_relevant_incidents(parse_special_news(news_text), roads)
         official_time = max(
             (incident.announcement_time for incident in incidents if incident.announcement_time),
             default=None,
@@ -602,7 +595,7 @@ async def fetch_traffic_data(
         stale, rw, fetched_at = await client.fetch_json_cached(ROADWORKS_SPEC)
         if stale:
             stale_sources.append("TD roadworks")
-        roadworks = parse_roadworks(rw)
+        roadworks = parse_roadworks(rw, roads)
         source_times["roadworks"] = datetime.fromtimestamp(fetched_at, UTC)
     except Exception as exc:  # noqa: BLE001
         log.warning("TD roadworks fetch failed: %s", exc)

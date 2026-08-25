@@ -86,6 +86,46 @@ def test_hkemobility_lat_lon_shape_builds_monotonic_stop_offsets():
     assert route_geometry._valid_line(line)
 
 
+def test_trailing_extension_stops_outside_spatial_line_keep_verified_prefix():
+    spec = RouteSpec("KMB", "91P", "outbound", 8093, 1)
+    stops = [
+        Stop("a", "Current start", 22.3000, 114.1000),
+        Stop("b", "Current terminus", 22.3000, 114.1020),
+        Stop("c", "Future extension", 22.3050, 114.1050),
+        Stop("d", "Future terminus", 22.3070, 114.1070),
+    ]
+    raw = {
+        "e": "HKUST",
+        "sh": {"coordinates": [[[22.3000, 114.1000], [22.3000, 114.1020]]]},
+    }
+
+    line = route_geometry._build_line(spec, stops, raw)
+
+    assert [stop.stop_id for stop in line.stops] == ["a", "b"]
+    assert len(line.stop_offsets) == 2
+    assert route_geometry._valid_line(line)
+
+
+def test_mid_route_stop_gap_does_not_create_partial_geometry():
+    spec = RouteSpec("KMB", "91P", "outbound", 8093, 1)
+    stops = [
+        Stop("a", "Start", 22.3000, 114.1000),
+        Stop("b", "Before gap", 22.3000, 114.1010),
+        Stop("c", "Bad middle stop", 22.3050, 114.1050),
+        Stop("d", "Later existing stop", 22.3000, 114.1020),
+    ]
+    raw = {
+        "e": "HKUST",
+        "sh": {"coordinates": [[[22.3000, 114.1000], [22.3000, 114.1020]]]},
+    }
+
+    line = route_geometry._build_line(spec, stops, raw)
+
+    assert line.stops == stops
+    assert line.stop_offsets == []
+    assert not route_geometry._valid_line(line)
+
+
 class _SpatialClient:
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict[str, str] | None]] = []
@@ -204,3 +244,16 @@ async def test_public_stops_include_bus_operators_and_exclude_gmb(monkeypatch, t
         (stop.name, stop.stop_id) for line in (kmb, ctb) for stop in line.stops
     }
     assert all("gmb" not in stop.name for stop in result.stops)
+
+
+async def test_cancelled_background_refresh_is_normal_shutdown(monkeypatch):
+    task = asyncio.create_task(asyncio.sleep(60))
+    route_geometry._refresh_tasks["cancel-test"] = task
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    route_geometry._finish_refresh(task, "cancel-test")
+
+    assert "cancel-test" not in route_geometry._refresh_tasks
+    assert "cancel-test" not in route_geometry._refresh_retry_after

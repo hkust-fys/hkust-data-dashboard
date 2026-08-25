@@ -56,10 +56,11 @@ async def test_live_td_detectors_parse():
         obs_text = await client.fetch_xml_text(DETECTOR_OBS_URL)
         obs = parse_detector_observations(obs_text)
         assert obs, "detector observations should parse"
-        # at least one matched corridor has fresh data
+        # at least one matched road has fresh data
+        from dashboard.providers.tracked_roads import fallback_roads
         from dashboard.providers.traffic import build_corridor_statuses
 
-        statuses = build_corridor_statuses(obs, meta)
+        statuses = build_corridor_statuses(obs, meta, fallback_roads())
         assert any(st.observations for st in statuses)
 
 

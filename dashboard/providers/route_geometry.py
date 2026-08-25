@@ -16,7 +16,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -26,7 +26,7 @@ from dashboard.http import CachedFetch, HttpClient
 log = logging.getLogger(__name__)
 
 ROUTE_TTL_SECONDS = 12 * 3600.0
-GEOMETRY_CACHE_VERSION = 10
+GEOMETRY_CACHE_VERSION = 11
 GEOMETRY_CACHE_NAME = "route-geometry.json"
 GEOMETRY_REFRESH_TIMEOUT_SECONDS = 45.0
 GEOMETRY_FAILURE_COOLDOWN_SECONDS = 5 * 60.0
@@ -104,6 +104,56 @@ class RouteGeometry:
     fetched_at: float = 0.0
 
 
+@dataclass(frozen=True)
+class ProbeStop:
+    """An official stop chosen for downstream ETA polling."""
+
+    operator: str
+    route: str
+    bound: str
+    stop_id: str
+    route_id: int | None
+    sequence: int | None
+    index: int  # position in the official stop sequence
+
+
+def _spec_for_line(line: RouteLine) -> RouteSpec | None:
+    for spec in ROUTE_SPECS:
+        if (spec.operator, spec.route, spec.bound) == (line.operator, line.route, line.bound):
+            return spec
+    return None
+
+
+def select_probe_stops(lines: Iterable[RouteLine]) -> list[ProbeStop]:
+    """Probe EVERY stop of each tracked direction, termini included.
+
+    There is no interior/exterior distinction any more: the route is just a
+    sequence of stops with ETAs, and every ETA refines where a bus is. The
+    termini are polled too — a departure board there is exactly the evidence
+    that a bus has left the terminus. Fetches are deduplicated per physical
+    stop by the transit layer.
+    """
+    probes: list[ProbeStop] = []
+    for line in lines:
+        stops = line.stops
+        if len(stops) < 2:
+            continue
+        spec = _spec_for_line(line)
+        for index in range(len(stops)):
+            probes.append(
+                ProbeStop(
+                    operator=line.operator,
+                    route=line.route,
+                    bound=line.bound,
+                    stop_id=stops[index].stop_id,
+                    route_id=spec.route_id if spec else None,
+                    sequence=spec.sequence if spec else None,
+                    index=index,
+                )
+            )
+    return probes
+
+
 _refresh_tasks: dict[str, asyncio.Task[RouteGeometry]] = {}
 _refresh_retry_after: dict[str, float] = {}
 
@@ -159,6 +209,14 @@ def _monotonic_stop_offsets(
     path: list[tuple[float, float]], stops: list[Stop]
 ) -> list[float] | None:
     """Map ordered stops to later occurrences on an official route line."""
+    offsets = _monotonic_stop_prefix_offsets(path, stops)
+    return offsets if len(offsets) == len(stops) else None
+
+
+def _monotonic_stop_prefix_offsets(
+    path: list[tuple[float, float]], stops: list[Stop]
+) -> list[float]:
+    """Return offsets for the longest leading stop sequence the line covers."""
     offsets: list[float] = []
     minimum = -0.1
     for stop in stops:
@@ -171,11 +229,40 @@ def _monotonic_stop_offsets(
                 candidates.append((distance, offset))
             travelled += _distance(first, second)
         if not candidates:
-            return None
+            break
         _distance_to_line, selected = min(candidates)
         offsets.append(selected)
         minimum = selected + 0.1
     return offsets
+
+
+def _minimum_stop_distance(path: list[tuple[float, float]], stop: Stop) -> float:
+    """Shortest distance from one official stop to any segment of the line."""
+    return min(
+        (
+            _segment_projection(first, second, (stop.lat, stop.lon))[1]
+            for first, second in zip(path, path[1:], strict=False)
+        ),
+        default=float("inf"),
+    )
+
+
+def _covered_stop_prefix(
+    path: list[tuple[float, float]], stops: list[Stop]
+) -> tuple[list[Stop], list[float]] | None:
+    """Accept a verified prefix only when every omitted stop lies off the line.
+
+    This supports an announced trailing route extension whose stops have entered
+    the operator sequence before HKeMobility extends its spatial line. A middle
+    mismatch remains invalid because a later stop still matches the current line.
+    """
+    offsets = _monotonic_stop_prefix_offsets(path, stops)
+    if len(offsets) < 2 or len(offsets) == len(stops):
+        return None
+    omitted = stops[len(offsets) :]
+    if any(_minimum_stop_distance(path, stop) <= MAX_STOP_DISTANCE_METRES for stop in omitted):
+        return None
+    return stops[: len(offsets)], offsets
 
 
 def _valid_line(line: RouteLine) -> bool:
@@ -343,6 +430,18 @@ def _build_line(spec: RouteSpec, stops: list[Stop], raw: dict[str, Any] | None) 
                     except (TypeError, ValueError):
                         continue
     offsets = _monotonic_stop_offsets(path, stops)
+    if offsets is None and (covered := _covered_stop_prefix(path, stops)) is not None:
+        covered_stops, offsets = covered
+        log.info(
+            "HKeMobility line %s/%s/%s currently covers %d/%d stops; "
+            "omitting trailing stops outside the spatial line",
+            spec.operator,
+            spec.route,
+            spec.bound,
+            len(covered_stops),
+            len(stops),
+        )
+        line.stops = covered_stops
     line.path = path
     line.stop_offsets = offsets or []
     line.destination = str(raw.get("e") or "")
@@ -550,6 +649,10 @@ async def _refresh_route_geometry(
 
 def _finish_refresh(task: asyncio.Task[RouteGeometry], cache_dir: str) -> None:
     _refresh_tasks.pop(cache_dir, None)
+    if task.cancelled():
+        # Cancellation is normal during shutdown; it must not schedule a
+        # failure cooldown or emit an unhandled done-callback exception.
+        return
     try:
         task.result()
     except Exception as exc:  # noqa: BLE001

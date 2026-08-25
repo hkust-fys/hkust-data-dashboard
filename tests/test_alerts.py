@@ -75,14 +75,14 @@ def test_rainstorm_escalation_amber_to_red():
     assert all(not e.critical for e in events)
 
 
-def test_black_rainstorm_pings():
+def test_black_rainstorm_posts_without_role_ping():
     mon = AlertMonitor()
     mon.update([], [])
     events = mon.update([_warning("WRAINB")], [])
     assert events and events[0].critical
-    # ping rendering with a role
+    # Weather is prominent but never pings the role.
     msg = mon.ping_for(events[0], role_id=123456789)
-    assert "<@&123456789>" in msg
+    assert "<@&123456789>" not in msg
 
 
 def test_cancel_posts_event():
@@ -91,17 +91,88 @@ def test_cancel_posts_event():
     events = mon.update([], [])
     assert len(events) == 1
     assert "cancelled" in events[0].text
-    assert events[0].critical  # black rainstorm removal also pings
+    assert events[0].critical  # black rainstorm removal is prominent (no ping)
+    assert mon.ping_for(events[0], role_id=123456789) == events[0].text
 
 
-def test_detector_congestion_does_not_post_thread_events():
+def test_pre_no8_announcement_is_critical_code():
+    assert "TC8PRE" in CRITICAL_WARNING_CODES
+    mon = AlertMonitor()
+    mon.update([], [])
+    events = mon.update([_warning("TC8PRE")], [])
+    assert events and events[0].critical
+    assert "Pre-No. 8 Special Announcement" in events[0].text
+    assert "<@&123456789>" not in mon.ping_for(events[0], role_id=123456789)
+
+
+def test_congestion_requires_two_consecutive_red_updates():
     mon = AlertMonitor()
     mon.update([], [])
     slow = _status("Clear Water Bay Road", SpeedBand.RED, speed=10)
+    assert mon.update([], [slow]) == []  # first red: not yet
+    events = mon.update([], [slow])  # second consecutive red: alert
+    assert len(events) == 1
+    assert events[0].ping
+    assert "Heavy congestion" in events[0].text
+    assert "<@&123456789>" in mon.ping_for(events[0], role_id=123456789)
+
+
+def test_congestion_streak_resets_on_nonconsecutive_red():
+    mon = AlertMonitor()
+    mon.update([], [])
+    slow = _status("Clear Water Bay Road", SpeedBand.RED, speed=10)
+    clear = _status("Clear Water Bay Road", SpeedBand.GREEN, speed=60)
+    assert mon.update([], [slow]) == []
+    assert mon.update([], [clear]) == []  # streak resets
+    assert mon.update([], [slow]) == []  # needs two in a row again
+    events = mon.update([], [slow])
+    assert len(events) == 1 and events[0].ping
+
+
+def test_congestion_cooldown_suppresses_repeat_ping():
+    mon = AlertMonitor()
+    mon.update([], [])
+    slow = _status("Clear Water Bay Road", SpeedBand.RED, speed=10)
+    mon.update([], [slow])
+    first = mon.update([], [slow])
+    assert len(first) == 1
+    # stays red: active, no repeat
+    assert mon.update([], [slow]) == []
+    # clears, then jams again within the cooldown: no new ping
+    clear = _status("Clear Water Bay Road", SpeedBand.GREEN, speed=60)
+    cleared = mon.update([], [clear])
+    assert len(cleared) == 1 and "easing" in cleared[0].text
+    assert mon.update([], [slow]) == []
     assert mon.update([], [slow]) == []
 
+
+def test_congestion_alert_names_affected_routes():
+    from dashboard.providers.route_geometry import RouteLine
+    from dashboard.providers.tracked_roads import build_tracked_roads
+
+    line = RouteLine("91", "KMB", "outbound")
+    roads = build_tracked_roads(
+        [line], [["Clear Water Bay Road", "Lung Cheung Road"]]
+    )
+    mon = AlertMonitor(roads=roads)
+    mon.update([], [])
+    slow = _status("clear water bay road", SpeedBand.RED, speed=8)
+    mon.update([], [slow])
+    events = mon.update([], [slow])
+    assert events and "affects: 91" in events[0].text
+
+
+def test_congestion_clears_when_band_leaves_red():
+    mon = AlertMonitor()
+    mon.update([], [])
+    slow = _status("Clear Water Bay Road", SpeedBand.RED, speed=10)
+    mon.update([], [slow])
+    mon.update([], [slow])
     clear = _status("Clear Water Bay Road", SpeedBand.GREEN, speed=60)
-    assert mon.update([], [clear]) == []
+    events = mon.update([], [clear])
+    assert len(events) == 1
+    assert "easing" in events[0].text
+    assert not events[0].ping
 
 
 def test_relevant_td_traffic_notice_posts_and_clears():

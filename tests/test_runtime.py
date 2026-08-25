@@ -179,10 +179,11 @@ def test_to_payload_uses_news_and_roadwork_times_without_detector_legend():
             )
         }
     )
-    summary = next(embed for embed in payload.embeds if embed.title == "🚦 Traffic summary")
+    summary = next(embed for embed in payload.embeds if embed.title == "🚦 Traffic news")
 
     assert "TD detectors" not in summary.description
-    assert f"TD traffic news updated <t:{int(news_time.timestamp())}:f>" in summary.description
+    # The news timestamp lives only in the footer now (no duplicated line).
+    assert "TD traffic news updated" not in summary.description
     assert f"TD roadworks <t:{int(roadworks_time.timestamp())}:t>" in summary.description
     assert summary.timestamp == roadworks_time
 
@@ -342,6 +343,53 @@ async def test_stop_cancels_inflight_collection(monkeypatch):
     await updater.stop()
     assert cancelled.is_set()
     assert updater._collection_task is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_collect_all_cancellation_awaits_provider_children(monkeypatch):
+    import asyncio
+
+    import bot as bot_module
+    from dashboard.providers import tracked_roads as tracked_roads_provider
+
+    cancelled: list[str] = []
+
+    def blocking(name):
+        async def run(*_args, **_kwargs):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(name)
+                raise
+
+        return run
+
+    class Roads:
+        def routes_for_text(self, _text):
+            return []
+
+    async def roads(*_args, **_kwargs):
+        return Roads()
+
+    async def transit(*_args, **_kwargs):
+        return ([], None, [])
+
+    async def traffic(*_args, **_kwargs):
+        return ([], [], [], None)
+
+    monkeypatch.setattr(tracked_roads_provider, "fetch_tracked_roads", roads)
+    monkeypatch.setattr(bot_module.transit, "fetch_transit_etas", transit)
+    monkeypatch.setattr(bot_module.weather_provider, "fetch_weather_conditions", blocking("weather"))
+    monkeypatch.setattr(bot_module.traffic_provider, "fetch_traffic_data", traffic)
+    monkeypatch.setattr(bot_module.maps, "fetch_traffic_map", blocking("map"))
+
+    operation = asyncio.create_task(bot_module.collect_all(object(), _fake_settings()))
+    for _ in range(4):
+        await asyncio.sleep(0)
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert set(cancelled) == {"weather", "map"}
 
 
 @pytest.mark.asyncio

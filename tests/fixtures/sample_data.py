@@ -5,7 +5,6 @@ from datetime import UTC, datetime, timedelta, timezone
 from dashboard.models import (
     EtaKind,
     EtaRow,
-    ImageAsset,
     Operator,
     Roadwork,
     RouteEtaGroup,
@@ -401,12 +400,3 @@ def roadworks() -> list[Roadwork]:
 
 def jpeg_bytes() -> bytes:
     return b"\xff\xd8\xff\xe0" + b"\x00" * 128
-
-
-def bus_stop_assets() -> list[ImageAsset]:
-    return [
-        ImageAsset(
-            filename="busstop-0.jpg", data=jpeg_bytes(), content_type="image/jpeg",
-            label="North Gate bus stop", caption="live view", source_time=utc(),
-        )
-    ]

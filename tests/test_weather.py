@@ -71,6 +71,37 @@ def test_parse_warnings_null_fields_tolerated():
     assert warnings[0].action == ""
 
 
+def test_pre_no8_statement_becomes_synthetic_warning():
+    from dashboard.providers.weather import PRE_NO8_CODE
+
+    info = {
+        "details": {
+            "TC": {
+                "code": "TC",
+                "statement": (
+                    "The Hong Kong Observatory issues the Pre-No. 8 Special "
+                    "Announcement at 6:15 p.m."
+                ),
+                "issueTime": "2026-08-21T18:15:00+08:00",
+            }
+        }
+    }
+    warnings = parse_warnings({"TC": {"code": "TC"}}, info)
+    codes = [w.code for w in warnings]
+    assert PRE_NO8_CODE in codes
+    pre = next(w for w in warnings if w.code == PRE_NO8_CODE)
+    assert pre.name == "Pre-No. 8 Special Announcement"
+    assert pre.issued_at == datetime.fromisoformat("2026-08-21T18:15:00+08:00")
+
+
+def test_no_pre_no8_without_the_statement():
+    warnings = parse_warnings(
+        {"TC": {"code": "TC"}},
+        {"details": {"TC": {"code": "TC", "summary": "Gale Signal No. 8 NE in force"}}},
+    )
+    assert [w.code for w in warnings] == ["TC"]
+
+
 def test_parse_warning_issued_time_does_not_use_later_update_time():
     warnings = parse_warnings(
         {

@@ -11,28 +11,15 @@ from typing import NamedTuple
 from PIL import Image, ImageDraw, ImageFont
 
 from dashboard.maps.tiles import TILE_SIZE
-from dashboard.models import Operator, RouteEtaGroup
+from dashboard.models import Operator
 
 MAP_WIDTH = 1920
 MAP_HEIGHT = 1080
 BASE_MAP_LAT = 22.3274138
 BASE_MAP_LON = 114.2331738
 BASE_MAP_ZOOM = 15.0
-HKUST_LAT, HKUST_LON = 22.3364, 114.2656
 STOP_MARKER_SIZE = 8
-DIRECTION_OFFSET_PX = 3.5
 
-CONGESTION_COLORS = {
-    "green": (34, 197, 94),
-    "amber": (245, 158, 11),
-    "red": (239, 68, 68),
-    "unknown": (107, 114, 128),
-}
-SPEED_COLORS = {
-    "NORMAL": CONGESTION_COLORS["green"],
-    "SLOW": CONGESTION_COLORS["amber"],
-    "TRAFFIC_JAM": CONGESTION_COLORS["red"],
-}
 OPERATOR_COLORS = {
     Operator.KMB: (225, 29, 72),
     Operator.CITYBUS: (250, 204, 21),
@@ -64,6 +51,7 @@ class BusMarker(NamedTuple):
     y: float
     operator: Operator
     heading: float
+    unreliable: bool = False
 
 
 class LabelPlacement(NamedTuple):
@@ -72,17 +60,11 @@ class LabelPlacement(NamedTuple):
     marker: tuple[float, float]
     operator: Operator
     heading: float
+    unreliable: bool = False
 
 
 def mercator_y(lat: float) -> float:
     return (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2
-
-
-def fit_view(
-    points: list[tuple[float, float]] | None = None,
-    size: tuple[int, int] = (MAP_WIDTH, MAP_HEIGHT),
-) -> tuple[float, float, float]:
-    return BASE_MAP_LAT, BASE_MAP_LON, BASE_MAP_ZOOM
 
 
 def project(
@@ -97,185 +79,6 @@ def project(
     x = (lon - center_lon) / 360 * scale + size[0] / 2
     y = (mercator_y(lat) - mercator_y(center_lat)) * scale + size[1] / 2
     return x, y
-
-
-def congestion_color(delay_min: float | None) -> tuple[int, int, int]:
-    if delay_min is None:
-        return CONGESTION_COLORS["unknown"]
-    if delay_min >= 5:
-        return CONGESTION_COLORS["red"]
-    if delay_min >= 2:
-        return CONGESTION_COLORS["amber"]
-    return CONGESTION_COLORS["green"]
-
-
-def offset_polyline(points: list[tuple[float, float]], offset: float) -> list[tuple[float, float]]:
-    """Offset a screen-space path to the left of its travel direction."""
-    if len(points) < 2 or not offset:
-        return points
-    shifted: list[tuple[float, float]] = []
-    for index, point in enumerate(points):
-        before = points[max(0, index - 1)]
-        after = points[min(len(points) - 1, index + 1)]
-        dx, dy = after[0] - before[0], after[1] - before[1]
-        length = math.hypot(dx, dy)
-        shifted.append(
-            point
-            if not length
-            else (point[0] - dy / length * offset, point[1] + dx / length * offset)
-        )
-    return shifted
-
-
-def offset_where_overlapping(
-    points: list[tuple[float, float]],
-    other: list[tuple[float, float]],
-    offset: float = DIRECTION_OFFSET_PX,
-    threshold: float = 8.0,
-) -> list[tuple[float, float]]:
-    """Separate opposing lanes only where their road geometry overlaps."""
-    if len(points) < 2 or len(other) < 2:
-        return points
-
-    def distance_to_segment(point, start, end) -> float:
-        dx, dy = end[0] - start[0], end[1] - start[1]
-        denominator = dx * dx + dy * dy
-        ratio = (
-            0.0
-            if not denominator
-            else max(
-                0.0,
-                min(
-                    1.0,
-                    ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / denominator,
-                ),
-            )
-        )
-        return math.hypot(
-            point[0] - start[0] - ratio * dx,
-            point[1] - start[1] - ratio * dy,
-        )
-
-    shifted = offset_polyline(points, offset)
-    segments = list(zip(other, other[1:], strict=False))
-    return [
-        moved
-        if min(distance_to_segment(point, start, end) for start, end in segments) <= threshold
-        else point
-        for point, moved in zip(points, shifted, strict=True)
-    ]
-
-
-def predict_buses(
-    groups: list[RouteEtaGroup], route_lines: Iterable[object]
-) -> list[tuple[str, float, float, Operator, float]]:
-    """Estimate buses on their matching official HKeMobility route geometry.
-
-    The ETA is only evidence of time to the target stop, not GPS.  We use a
-    deliberately coarse two-minutes-per-stop pace, then interpolate by
-    arclength on the official HKeMobility spatial line and official stop order.
-    A line without validated road geometry produces no estimate.
-    """
-    buses: list[tuple[str, float, float, Operator, float]] = []
-    lines = list(route_lines)
-    operator_codes = {
-        Operator.KMB: "KMB",
-        Operator.CITYBUS: "CTB",
-        Operator.GMB: "GMB",
-    }
-    gate_coords = {"N": (22.338678, 114.261946), "S": (22.333360, 114.262881)}
-    for group in groups:
-        target_gate = gate_coords.get(group.gate.upper())
-        if target_gate is None:
-            continue
-        candidates: list[tuple[int, int, object]] = []
-        destination_tokens = {
-            token for token in group.destination.lower().split() if len(token) >= 3
-        }
-        for line in lines:
-            if (
-                str(getattr(line, "route", "")) != group.route
-                or str(getattr(line, "operator", "")) != operator_codes[group.operator]
-            ):
-                continue
-            stops = list(getattr(line, "stops", ()))
-            path = list(getattr(line, "path", ()))
-            stop_offsets = list(getattr(line, "stop_offsets", ()))
-            if len(stops) < 3 or len(path) < 2 or len(stop_offsets) != len(stops):
-                continue
-            gate_distances = [
-                math.hypot(
-                    float(stops[index].lat) - target_gate[0],
-                    float(stops[index].lon) - target_gate[1],
-                )
-                for index in range(len(stops))
-            ]
-            gate_distance = min(gate_distances)
-            circular = (
-                group.operator == Operator.GMB
-                and group.route == "104"
-                and str(stops[0].stop_id) == str(stops[-1].stop_id)
-            )
-            # The 104 ETA is for its next departure from the repeated HKUST
-            # stop.  Use the final loop occurrence so walking backwards follows
-            # the bus that is currently completing the circular trip.
-            if circular:
-                gate_index = max(
-                    index
-                    for index, distance in enumerate(gate_distances)
-                    if math.isclose(distance, gate_distance, abs_tol=1e-8)
-                )
-            else:
-                gate_index = gate_distances.index(gate_distance)
-            # A one-way target at either terminus has no defensible upstream
-            # placement.  The repeated final stop of circular 104 is the sole
-            # exception; the predicted marker itself still stays off endpoints.
-            if (
-                gate_distance > 0.004
-                or gate_index == 0
-                or (gate_index == len(stops) - 1 and not circular)
-            ):
-                continue
-            downstream_names = " ".join(stop.name.lower() for stop in stops[gate_index:])
-            destination_score = sum(token in downstream_names for token in destination_tokens)
-            candidates.append((destination_score, gate_index, line))
-        if not candidates:
-            continue
-        _score, gate_index, line = max(candidates, key=lambda item: (item[0], item[1]))
-        stops = list(line.stops)
-        path = list(line.path)
-        stop_offsets = list(line.stop_offsets)
-        for row in group.rows:
-            if row.minutes is None:
-                continue
-            # ETA is measured at the target stop.  Walk back through the
-            # matching official sequence at roughly two minutes per stop, and linearly
-            # interpolate only within that official geometry segment.
-            position = gate_index - max(0, row.minutes) / 2
-            if position <= 0 or position >= len(stops) - 1:
-                continue
-            index = math.floor(position)
-            fraction = position - index
-            target_offset = (
-                stop_offsets[index] + (stop_offsets[index + 1] - stop_offsets[index]) * fraction
-            )
-            located = _point_at_path_offset(path, target_offset)
-            if located is None:
-                continue
-            lat, lon, heading = located
-            # Identify the vehicle's service direction at a glance.  This is
-            # particularly important where the same route number has a loop.
-            # GMB 104 is a circular service.  Stop 13 (Ngau Tau Kok Road,
-            # outside Lotus Tower) is the approved turn point: before it the
-            # vehicle is heading for Kwun Tong; from it onward it is returning
-            # to HKUST.
-            if group.operator == Operator.GMB and group.route == "104":
-                terminus = "Kwun Tong" if position < 12 else "HKUST"
-            else:
-                # Keep marker wording consistent with the compact ETA embed.
-                terminus = group.destination
-            buses.append((f"{group.route} {terminus}", lat, lon, group.operator, heading))
-    return buses
 
 
 def _path_segment_length(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -323,62 +126,6 @@ def _background(
         except Exception:  # noqa: BLE001
             pass
     return Image.new("RGB", size, (240, 242, 245))
-
-
-def _arrow(
-    draw: ImageDraw.ImageDraw,
-    point: tuple[float, float],
-    angle: float,
-    color: tuple[int, int, int, int],
-) -> None:
-    """Draw the original small, thin roadside arrowhead style."""
-    tip = (point[0] + math.cos(angle) * 7, point[1] + math.sin(angle) * 7)
-    back = (point[0] - math.cos(angle) * 6, point[1] - math.sin(angle) * 6)
-    draw.line((back, tip), fill=color, width=2)
-    for delta in (-0.65, 0.65):
-        arm = (tip[0] - math.cos(angle + delta) * 6, tip[1] - math.sin(angle + delta) * 6)
-        draw.line((tip, arm), fill=color, width=2)
-
-
-def arrow_positions(
-    points: list[tuple[float, float]], spacing: float = 180.0, phase: float = 0.0
-) -> list[tuple[tuple[float, float], float]]:
-    """Distance-based arrow placement, independent of vertex density."""
-    lengths = [
-        math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points, points[1:], strict=False)
-    ]
-    total = sum(lengths)
-    if total < 18:
-        return []
-    distances: list[float] = []
-    position = 25 + phase
-    while position < total - 25:
-        distances.append(position)
-        position += spacing
-    if not distances:
-        distances = [total / 2]
-    out: list[tuple[tuple[float, float], float]] = []
-    for target in distances:
-        travelled = 0.0
-        pairs = zip(points, points[1:], strict=False)
-        for (a, b), length in zip(pairs, lengths, strict=True):
-            if length and travelled + length >= target:
-                ratio = (target - travelled) / length
-                point = (a[0] + (b[0] - a[0]) * ratio, a[1] + (b[1] - a[1]) * ratio)
-                out.append((point, math.atan2(b[1] - a[1], b[0] - a[0])))
-                break
-            travelled += length
-    return out
-
-
-def roadside_arrow_positions(
-    points: list[tuple[float, float]], phase: float = 0.0
-) -> list[tuple[tuple[float, float], float]]:
-    """Place arrowheads eight pixels beside, rather than on, the route."""
-    return [
-        ((point[0] - math.sin(angle) * 8, point[1] + math.cos(angle) * 8), angle)
-        for point, angle in arrow_positions(points, phase=phase)
-    ]
 
 
 def _draw_marker_on_left(
@@ -562,12 +309,15 @@ def _layout_bus_labels(
     draw: ImageDraw.ImageDraw,
     font: ImageFont.ImageFont,
     size: tuple[int, int],
+    placed_rects: Iterable[tuple[float, float, float, float]] = (),
 ) -> list[LabelPlacement]:
     """Lay out integrated route pills with their directional glyph on the road.
 
     The white triangle's centre is the interpolated road anchor.  The coloured
     pill is vertically centred on that point and grows from the triangle's
     leading compartment into the route text, making one compact marker.
+    Colliding pills stack vertically above the road point instead of being
+    dropped; ``placed_rects`` (e.g. legend bounds) are avoided too.
     """
     # Several ETA rows can describe vehicles that are visually indistinguishable
     # at this zoom.  A centred pill cannot be displaced without breaking the
@@ -577,84 +327,176 @@ def _layout_bus_labels(
     ordered_markers = sorted(
         markers, key=lambda marker: (marker.y, marker.x, marker.operator.value, marker.routes)
     )
-    marker_list: list[BusMarker] = []
+    # Same road point — or a neighbouring one within ~30 px, which reads as
+    # the same junction at this zoom — forms ONE stacked label group. Pills
+    # from different roads must never extend into each other.
+    anchor_groups: list[list[BusMarker]] = []
     for marker in ordered_markers:
-        nearby = next(
+        group = next(
             (
                 existing
-                for existing in reversed(marker_list)
-                if existing.operator == marker.operator
-                and _angular_distance(existing.heading, marker.heading) <= math.radians(12)
-                and math.hypot(existing.x - marker.x, existing.y - marker.y) <= 18
+                for existing in anchor_groups
+                if math.hypot(existing[0].x - marker.x, existing[0].y - marker.y) <= 30
             ),
             None,
         )
-        if nearby is None:
-            marker_list.append(marker)
-            continue
-        index = marker_list.index(nearby)
-        marker_list[index] = nearby._replace(
-            routes=tuple(sorted(set(nearby.routes) | set(marker.routes)))
-        )
+        if group is None:
+            anchor_groups.append([marker])
+        else:
+            group.append(marker)
+
     placed: list[LabelPlacement] = []
-    for marker in marker_list:
-        text = "/".join(marker.routes)
-        text_width = float(draw.textlength(text, font=font))
-        # Reserve a leading compartment for the 12 px triangle and a text
-        # gutter, so the triangle cannot be buried in the route number.
-        pill_width, pill_height = text_width + 20, 18.0
-        chosen = None
-        # Prefer normal reading order: triangle then route text.  Only flip at
-        # a map edge or an existing pill; either choice retains the triangle
-        # on the road and vertically centred in its box.
-        for text_side in (1, -1):
-            if text_side > 0:
-                left, right = marker.x - 7, marker.x + pill_width - 7
-            else:
-                left, right = marker.x - pill_width + 7, marker.x + 7
-            rect = (left, marker.y - pill_height / 2, right, marker.y + pill_height / 2)
-            if rect[0] < 2 or rect[1] < 2 or rect[2] > size[0] - 2 or rect[3] > size[1] - 2:
-                continue
-            covers_other_anchor = any(
-                math.hypot(marker.x - other.x, marker.y - other.y) > 10
-                and _rects_overlap(
-                    rect,
-                    (other.x - 5, other.y - 5, other.x + 5, other.y + 5),
+    occupied: list[tuple[float, float, float, float]] = list(placed_rects)
+    pill_height = 18.0
+    for group in anchor_groups:
+        # Deterministic order within a stack: operator then routes.
+        group = sorted(group, key=lambda m: (m.operator.value, m.routes))
+        for index, marker in enumerate(group):
+            text = "/".join(marker.routes)
+            pill_width = float(draw.textlength(text, font=font)) + 20
+            chosen = None
+            pointer = None
+            # Candidate rows: the road row first (pill vertically centred on
+            # the anchor, white triangle exactly at the road point), then a
+            # tidy upward stack. Every candidate keeps the FULL pill size —
+            # never squashed — so boxes stay readable at map edges.
+            candidate_offsets: list[float] = [0.0]
+            while len(candidate_offsets) < index + 1:
+                candidate_offsets.append(
+                    candidate_offsets[-1] - (pill_height + 4)
                 )
-                for other in marker_list
-                if other is not marker
-            )
-            conflicts = False
-            for existing in placed:
-                if not _rects_overlap(rect, existing.rect):
-                    continue
-                shares_anchor = (
-                    math.hypot(
-                        marker.x - existing.marker[0],
-                        marker.y - existing.marker[1],
+            # If the upward stack runs out of room, keep searching DOWNWARD
+            # below the road point before falling back to an overlap.
+            extra = 0
+            while len(candidate_offsets) < len(group) * 2:
+                extra += 1
+                candidate_offsets.append(extra * (pill_height + 4))
+            for offset_y in candidate_offsets:
+                top = marker.y + offset_y - pill_height / 2
+                bottom = top + pill_height
+                for text_side in (1, -1):
+                    if text_side > 0:
+                        left, right = marker.x - 7, marker.x + pill_width - 7
+                    else:
+                        left, right = marker.x - pill_width + 7, marker.x + 7
+                    rect = (left, top, right, bottom)
+                    if (
+                        rect[0] < 2
+                        or rect[1] < 2
+                        or rect[2] > size[0] - 2
+                        or rect[3] > size[1] - 2
+                    ):
+                        continue
+                    if any(_rects_overlap(rect, other) for other in occupied):
+                        continue
+                    chosen = rect
+                    # The white pointer rides INSIDE its pill: exactly on the
+                    # road point for the road row; centred in stacked pills so
+                    # direction stays interpretable above the road.
+                    pointer = (
+                        (marker.x, marker.y)
+                        if offset_y == 0.0 and abs((top + bottom) / 2 - marker.y) < 1
+                        else ((left + right) / 2 - text_side * (pill_width / 2 - 9), top + pill_height / 2)
                     )
-                    <= 10
-                )
-                candidate_side = math.copysign(1, (left + right) / 2 - marker.x)
-                existing_side = math.copysign(
-                    1,
-                    (existing.rect[0] + existing.rect[2]) / 2 - existing.marker[0],
-                )
-                # Two operators at the same road point use opposite sides of
-                # their shared arrow compartment. Suppressing both was the
-                # source of apparently missing bus/minibus markers.
-                if not shares_anchor or candidate_side == existing_side:
-                    conflicts = True
                     break
-            if covers_other_anchor or conflicts:
-                continue
-            chosen = rect
-            break
-        if chosen is not None:
+                if chosen is not None:
+                    break
+            if chosen is None:
+                # No clean slot in the stack columns: spiral outward over
+                # progressively larger offsets (up, down, left, right) until
+                # a free full-size slot exists. A pill NEVER ends up on top
+                # of another one.
+                chosen = None
+                for radius in range(1, 40):
+                    for dx, dy in (
+                        (-radius * 6, 0),
+                        (radius * 6, 0),
+                        (0, radius * (pill_height + 4)),
+                        (0, -radius * (pill_height + 4)),
+                        (-radius * 6, -radius * (pill_height + 4)),
+                        (radius * 6, -radius * (pill_height + 4)),
+                        (-radius * 6, radius * (pill_height + 4)),
+                        (radius * 6, radius * (pill_height + 4)),
+                    ):
+                        left = marker.x + dx - 7
+                        right = left + pill_width
+                        top = marker.y + dy - pill_height / 2
+                        bottom = top + pill_height
+                        rect = (left, top, right, bottom)
+                        if (
+                            rect[0] < 2
+                            or rect[1] < 2
+                            or rect[2] > size[0] - 2
+                            or rect[3] > size[1] - 2
+                        ):
+                            continue
+                        if any(_rects_overlap(rect, other) for other in occupied):
+                            continue
+                        chosen = rect
+                        pointer = ((left + right) / 2 - (pill_width / 2 - 9), top + pill_height / 2)
+                        break
+                    if chosen is not None:
+                        break
+            if chosen is None:
+                # Truly nowhere free (map wall-to-wall buses): keep the
+                # full-size pill on the road row, clipped into the canvas —
+                # never squashed.
+                left = min(max(2.0, marker.x - 7), size[0] - pill_width - 2)
+                top = min(
+                    max(2.0, marker.y - pill_height / 2), size[1] - pill_height - 2
+                )
+                chosen = (left, top, left + pill_width, top + pill_height)
+                pointer = (marker.x, marker.y)
+            occupied.append(chosen)
             placed.append(
-                LabelPlacement(text, chosen, (marker.x, marker.y), marker.operator, marker.heading)
+                LabelPlacement(
+                    text,
+                    chosen,
+                    pointer,
+                    marker.operator,
+                    marker.heading,
+                    marker.unreliable,
+                )
             )
     return placed
+
+
+def _dashed_rounded_rectangle(
+    draw: ImageDraw.ImageDraw,
+    rect: tuple[float, float, float, float],
+    radius: int,
+    fill: tuple[int, int, int, int],
+    outline: tuple[int, int, int, int],
+    dash: int = 4,
+    gap: int = 3,
+) -> None:
+    """Rounded rectangle with a dashed outline (PIL lacks dash support)."""
+    left, top, right, bottom = rect
+    draw.rounded_rectangle(rect, radius=radius, fill=fill)
+
+    def dashed_line(a, b):
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        if length <= 0:
+            return
+        ux, uy = (b[0] - a[0]) / length, (b[1] - a[1]) / length
+        travelled = 0.0
+        while travelled < length:
+            end = min(travelled + dash, length)
+            draw.line(
+                (
+                    (a[0] + ux * travelled, a[1] + uy * travelled),
+                    (a[0] + ux * end, a[1] + uy * end),
+                ),
+                fill=outline,
+                width=1,
+            )
+            travelled = end + gap
+
+    # Straight segments only (corner arcs stay undashed; visually equivalent).
+    dashed_line((left + radius, top), (right - radius, top))
+    dashed_line((left + radius, bottom), (right - radius, bottom))
+    dashed_line((left, top + radius), (left, bottom - radius))
+    dashed_line((right, top + radius), (right, bottom - radius))
 
 
 def _draw_bus_route_marker(
@@ -662,24 +504,41 @@ def _draw_bus_route_marker(
     placement: LabelPlacement,
     color: tuple[int, int, int],
     font: ImageFont.ImageFont,
+    unreliable: bool = False,
 ) -> None:
-    """Draw one coloured route pill with its white road-centred triangle."""
+    """Draw one coloured route pill with its white pointer inside it."""
     left, top, right, bottom = placement.rect
     anchor_x, anchor_y = placement.marker
-    # The anchor is the interpolated road position.  It is intentionally part
-    # of the pill, so the visible white direction triangle cannot drift away
-    # from the road when label rows are stacked.
-    draw.rounded_rectangle(
-        placement.rect, radius=4, fill=color + (245,), outline=(20, 20, 20, 255), width=1
-    )
+    if unreliable:
+        # Timetable-derived estimate: paler fill, dashed outline, dim text.
+        pale = tuple(int(c + (255 - c) * 0.55) for c in color)
+        draw.rounded_rectangle(placement.rect, radius=4, fill=pale + (200,))
+        _dashed_rounded_rectangle(
+            draw,
+            placement.rect,
+            radius=4,
+            fill=pale + (0,),
+            outline=(90, 90, 90, 235),
+        )
+        text_fill = (235, 235, 235, 255)
+    else:
+        draw.rounded_rectangle(
+            placement.rect, radius=4, fill=color + (245,), outline=(20, 20, 20, 255), width=1
+        )
+        text_fill = (255, 255, 255, 255)
+    # The white direction triangle lives INSIDE the pill (road point when the
+    # pill sits on the road row; pill-centred when stacked above it), so the
+    # box and its pointer are always one interpretable unit.
     draw.polygon(
         _bus_direction_arrow_triangle((anchor_x, anchor_y), placement.heading),
         fill=(255, 255, 255, 255),
     )
-    # Text starts after the reserved triangle compartment.  On the rare
-    # edge-flipped pill it grows cleanly to the triangle's left instead.
-    text_x = anchor_x + 9 if anchor_x <= (left + right) / 2 else left + 4
-    draw.text((text_x, top + 2), placement.text, fill=(255, 255, 255, 255), font=font)
+    text_x = (
+        anchor_x + 9
+        if anchor_x <= (left + right) / 2
+        else left + 4
+    )
+    draw.text((text_x, top + 2), placement.text, fill=text_fill, font=font)
 
 
 def _bus_direction_arrow_triangle(
@@ -707,32 +566,50 @@ def _bus_direction_arrow_triangle(
 
 
 def _merge_bus_markers(
-    predictions: Iterable[tuple[str, float, float, Operator, float]],
+    estimates: Iterable[object],
     center_lat: float,
     center_lon: float,
     zoom: float,
     size: tuple[int, int],
 ) -> list[BusMarker]:
-    grouped: dict[tuple[Operator, str, int, int, int], tuple[set[str], float, float, float]] = {}
+    grouped: dict[
+        tuple[Operator, str, int, int, int, bool],
+        tuple[set[str], float, float, float],
+    ] = {}
     projected = []
-    for route, lat, lon, operator, heading in predictions:
-        x, y = project(lat, lon, center_lat, center_lon, zoom, size)
+    for estimate in estimates:
+        x, y = project(estimate.lat, estimate.lon, center_lat, center_lon, zoom, size)
         if not (0 <= x < size[0] and 0 <= y < size[1]):
             continue
-        projected.append((operator.value, route, x, y, operator, heading))
-    for _operator_name, route, x, y, operator, heading in sorted(projected):
+        # Group by the full label so same-route opposite-destination markers
+        # (e.g. 91 Diamond Hill vs 91 Clear Water Bay) stay distinct.
+        projected.append(
+            (
+                estimate.operator.value,
+                estimate.label,
+                x,
+                y,
+                estimate.operator,
+                estimate.heading,
+                bool(getattr(estimate, "unreliable", False)),
+            )
+        )
+    for row in sorted(projected):
+        _operator_name, label, x, y, operator, heading, unreliable = row
         key = (
             operator,
-            route,
+            label,
             round(x / 4),
             round(y / 4),
             round(heading / math.radians(10)),
+            unreliable,
         )
         routes, *_rest = grouped.setdefault(key, (set(), x, y, heading))
-        routes.add(route)
+        routes.add(label)
     return [
-        BusMarker(tuple(sorted(routes)), x, y, operator, heading)
-        for (operator, _route, _x, _y, _heading), (routes, x, y, heading) in sorted(
+        BusMarker(tuple(sorted(routes)), x, y, operator, heading, unreliable)
+        for (operator, _route, _x, _y, _heading, unreliable), (routes, x, y, heading)
+        in sorted(
             grouped.items(),
             key=lambda item: (item[0][0].value, item[1][1], item[1][2], item[0][1:]),
         )
@@ -769,9 +646,9 @@ def _draw_gate_pins(
 def _draw_legend(draw: ImageDraw.ImageDraw, size: tuple[int, int]) -> None:
     """Explain only dashboard-authored estimates and stop glyphs."""
     font = _font(12)
-    x, y = 10, size[1] - 112
+    x, y = 10, size[1] - 132
     draw.rounded_rectangle(
-        (x - 6, y - 7, x + 455, y + 94),
+        (x - 6, y - 7, x + 455, y + 114),
         radius=7,
         fill=(255, 255, 255, 225),
         outline=(180, 180, 180, 235),
@@ -803,6 +680,22 @@ def _draw_legend(draw: ImageDraw.ImageDraw, size: tuple[int, int]) -> None:
         outline=(255, 255, 255, 255),
     )
     draw.text((public_x + 13, row_y - 3), "public bus stop", fill=(30, 30, 30, 255), font=font)
+    # Unreliable (timetable-derived) marker swatch: pale with dashed outline.
+    pale_kmb = tuple(int(c + (255 - c) * 0.55) for c in OPERATOR_COLORS[Operator.KMB])
+    unreliable_x = x + 240
+    _dashed_rounded_rectangle(
+        draw,
+        (unreliable_x, row_y, unreliable_x + 26, row_y + 13),
+        radius=3,
+        fill=pale_kmb + (200,),
+        outline=(90, 90, 90, 235),
+    )
+    draw.text(
+        (unreliable_x + 31, row_y - 3),
+        "timetable only",
+        fill=(30, 30, 30, 255),
+        font=font,
+    )
     draw.text(
         (x, y + 54),
         "Route geometry © Transport Department HKeMobility",
@@ -811,12 +704,48 @@ def _draw_legend(draw: ImageDraw.ImageDraw, size: tuple[int, int]) -> None:
     )
 
 
+ALERT_ROUTE_COLOR = (255, 140, 0, 200)  # amber casing for alerted routes
+
+
+def _draw_alerted_route_lines(
+    draw: ImageDraw.ImageDraw,
+    route_lines: list,
+    affected_routes: set[str],
+    center_lat: float,
+    center_lon: float,
+    zoom: float,
+    size: tuple[int, int],
+) -> int:
+    """Draw an amber casing under the paths of routes named in TD news.
+
+    Returns the number of distinct alerted directions drawn. Drawn beneath
+    markers so pills and stops stay readable.
+    """
+    if not affected_routes:
+        return 0
+    drawn = set()
+    for line in route_lines:
+        key = str(getattr(line, "route", ""))
+        if key not in affected_routes or key in drawn:
+            continue
+        path = list(getattr(line, "path", ()))
+        if len(path) < 2:
+            continue
+        drawn.add(key)
+        points = [project(lat, lon, center_lat, center_lon, zoom, size) for lat, lon in path]
+        # Wide soft casing first, then a crisp amber core.
+        draw.line(points, fill=(255, 140, 0, 90), width=11, joint="curve")
+        draw.line(points, fill=ALERT_ROUTE_COLOR, width=5, joint="curve")
+    return len(drawn)
+
+
 def render_map(
-    groups: list[RouteEtaGroup],
+    estimates: list,
     cache_dir: str,
     public_stops: Iterable[object] = (),
     route_lines: Iterable[object] = (),
     base_image: Image.Image | None = None,
+    affected_routes: Iterable[str] = (),
 ) -> bytes:
     route_lines = list(route_lines)
     public_stops = list(public_stops)
@@ -829,6 +758,17 @@ def render_map(
     size = canvas.size
 
     route_paths = [list(line.path) for line in route_lines if len(getattr(line, "path", ())) >= 2]
+
+    # Alerted-route casings go beneath everything dashboard-drawn.
+    _draw_alerted_route_lines(
+        draw,
+        route_lines,
+        {str(route) for route in affected_routes},
+        center_lat,
+        center_lon,
+        zoom,
+        size,
+    )
 
     # All stop glyphs use the exact same 8 px measure
     for _label, lat, lon in SHUTTLE_STOPS:
@@ -850,15 +790,15 @@ def render_map(
         _draw_marker_on_left(draw, x, y, heading, PUBLIC_STOP_COLOR, square=True)
 
     font = _font(13)
-    bus_markers = _merge_bus_markers(
-        predict_buses(groups, route_lines), center_lat, center_lon, zoom, size
-    )
-    for placement in _layout_bus_labels(bus_markers, draw, font, size):
+    legend_bounds = (4, size[1] - 120, 462, size[1] - 14)
+    bus_markers = _merge_bus_markers(estimates, center_lat, center_lon, zoom, size)
+    for placement in _layout_bus_labels(bus_markers, draw, font, size, [legend_bounds]):
         _draw_bus_route_marker(
             draw,
             placement,
             OPERATOR_COLORS.get(placement.operator, (100, 100, 100)),
             font,
+            unreliable=placement.unreliable,
         )
 
     _draw_legend(draw, size)

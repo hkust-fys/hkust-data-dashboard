@@ -1,10 +1,11 @@
-"""Traffic provider tests: parsing, corridor matching, and source caching."""
+"""Traffic provider tests: parsing, road matching, and source caching."""
 
 from datetime import UTC, datetime
 
 import pytest
 
 from dashboard.models import SpeedBand
+from dashboard.providers.tracked_roads import fallback_roads
 from dashboard.providers.traffic import (
     DETECTOR_META_SPEC,
     DETECTOR_META_URL,
@@ -18,7 +19,7 @@ from dashboard.providers.traffic import (
     build_corridor_statuses,
     fetch_traffic_data,
     filter_relevant_incidents,
-    match_corridors,
+    match_roads,
     parse_detector_metadata,
     parse_detector_observations,
     parse_roadworks,
@@ -71,13 +72,16 @@ def test_parse_detector_observations_bad_xml():
     assert parse_detector_observations("not xml at all") == {}
 
 
-def test_match_corridors_aliases():
-    assert match_corridors("Clear Water Bay Road accident") == ["Clear Water Bay Road"]
-    assert match_corridors("New Clear Water Bay Road works") == ["Clear Water Bay Road"]
-    assert match_corridors("Lung Cheung Road") == ["Lung Cheung Road"]
-    assert match_corridors("Hiram's Highway") == ["Hiram's Highway"]
-    assert match_corridors("Po Lam Road closure") == ["Po Lam Road"]
-    assert match_corridors("Nathan Road") == []
+def test_match_roads_aliases():
+    roads = fallback_roads()
+    assert match_roads("Clear Water Bay Road accident", roads) == ["clear water bay road"]
+    assert match_roads("New Clear Water Bay Road works", roads) == ["new clear water bay road"]
+    assert match_roads("Lung Cheung Road", roads) == ["lung cheung road"]
+    assert match_roads("Hiram's Highway", roads) == ["hiram's highway"]
+    assert match_roads("Po Lam Road closure", roads) == ["po lam road"]
+    assert match_roads("Nathan Road", roads) == []
+    # no table loaded: matches nothing rather than over-matching
+    assert match_roads("Clear Water Bay Road", None) == []
 
 
 def test_speed_bands():
@@ -90,15 +94,15 @@ def test_speed_bands():
 
 
 def test_build_corridor_statuses_groups_and_orders():
+    roads = fallback_roads()
     meta = parse_detector_metadata(s.DETECTOR_CSV)
     obs = parse_detector_observations(s.DETECTOR_XML)
-    statuses = build_corridor_statuses(obs, meta)
+    statuses = build_corridor_statuses(obs, meta, roads)
     names = [st.name for st in statuses]
-    assert "Clear Water Bay Road" in names
-    assert "Lung Cheung Road" in names
+    assert "clear water bay road" in names
     # unrelated road excluded
-    assert "Nathan Road" not in names
-    cwb = [st for st in statuses if st.name == "Clear Water Bay Road"][0]
+    assert "nathan road" not in names
+    cwb = [st for st in statuses if st.name == "clear water bay road"][0]
     assert cwb.observations[0].band == SpeedBand.RED
     assert cwb.direction != ""  # from the "Eastbound" description hint
 
@@ -108,9 +112,10 @@ def test_build_corridor_statuses_empty():
 
 
 def test_parse_special_news_and_filter_relevant():
+    roads = fallback_roads()
     incidents = parse_special_news(s.SPECIAL_NEWS_XML)
     assert len(incidents) == 3
-    relevant = filter_relevant_incidents(incidents)
+    relevant = filter_relevant_incidents(incidents, roads)
     assert [i.identifier for i in relevant] == ["TN-1", "TN-2"]
     assert len(relevant) <= 3
 
@@ -148,7 +153,8 @@ def test_sanitize_text():
 
 
 def test_parse_roadworks_matches_corridors():
-    rw = parse_roadworks(s.ROADWORKS_JSON)
+    roads = fallback_roads()
+    rw = parse_roadworks(s.ROADWORKS_JSON, roads)
     assert len(rw) == 1
     assert rw[0].identifier == "RW-1"
     assert "Hang Hau Road" in rw[0].description
@@ -201,8 +207,8 @@ def _traffic_client(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_traffic_data_honors_all_source_ttls(monkeypatch):
     client, calls, _ = _traffic_client(monkeypatch)
-    first = await fetch_traffic_data(client)
-    second = await fetch_traffic_data(client)
+    first = await fetch_traffic_data(client, fallback_roads())
+    second = await fetch_traffic_data(client, fallback_roads())
 
     assert sum(calls.values()) == 4
     assert all(count == 1 for count in calls.values())
@@ -226,12 +232,12 @@ async def test_fetch_traffic_data_honors_all_source_ttls(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_traffic_data_uses_expired_values_on_source_errors(monkeypatch):
     client, calls, state = _traffic_client(monkeypatch)
-    first = await fetch_traffic_data(client)
+    first = await fetch_traffic_data(client, fallback_roads())
 
     for entry in client.cache._store.values():  # noqa: SLF001
         entry.fetched_at = 0
     state["fail"] = True
-    stale = await fetch_traffic_data(client)
+    stale = await fetch_traffic_data(client, fallback_roads())
 
     assert sum(calls.values()) == 8
     assert all(count == 2 for count in calls.values())

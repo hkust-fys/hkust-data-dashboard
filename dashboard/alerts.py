@@ -2,14 +2,18 @@
 change.
 
 Every meaningful change (a warning hoisted/removed or a relevant TD traffic
-notice/roadwork appearing/clearing) is posted to the dashboard thread. Critical
-weather changes (black rainstorm hoist/removal and typhoon signal 8+) also ping
-the configured alert role.
+notice/roadwork appearing/clearing) is posted to the dashboard thread. Heavy
+congestion (a tracked road's detector speed entering the red band on two
+consecutive updates, with a per-road cooldown) also pings the configured alert
+role. Weather changes are posted without pinging: typhoon signal 8+ has the
+Pre-No. 8 announcement as lead time, and black rainstorm by definition arrives
+with none, so a ping adds noise rather than notice.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -17,15 +21,21 @@ from dashboard.models import Roadwork, TrafficCorridorStatus, TrafficIncident, W
 
 log = logging.getLogger(__name__)
 
-# Critical warning codes that warrant a role ping.
+# Warning codes that are posted to the thread prominently. They no longer ping:
+# weather signals are either pre-announced (Pre-No. 8) or instantaneous (black
+# rain), so the role ping is reserved for heavy congestion.
 CRITICAL_WARNING_CODES: frozenset[str] = frozenset(
     {
         "WRAINB",  # black rainstorm
         "TC8NE", "TC8NW", "TC8SE", "TC8SW",  # signal 8
         "TC9",  # increasing gale
         "TC10",  # hurricane
+        "TC8PRE",  # Pre-No. 8 Special Announcement (~2 h lead time)
     }
 )
+
+CONGESTION_RED_TICKS_REQUIRED = 2
+CONGESTION_COOLDOWN_SECONDS = 45 * 60.0
 
 # Friendly names so alerts read well even after a warning is removed
 # (mirrors the HKO code->name map in the weather provider).
@@ -38,6 +48,7 @@ WARNING_NAMES: dict[str, str] = {
     "TC8SW": "Gale Signal No. 8 SW",
     "TC9": "Gale Signal No. 9",
     "TC10": "Hurricane Signal No. 10",
+    "TC8PRE": "Pre-No. 8 Special Announcement",
     "WRAINA": "Amber Rainstorm",
     "WRAINR": "Red Rainstorm",
     "WRAINB": "Black Rainstorm",
@@ -77,14 +88,22 @@ class AlertState:
     traffic_incidents: frozenset[str] = frozenset()
     roadworks: frozenset[str] = frozenset()
     roadwork_labels: dict[str, str] = field(default_factory=dict)
+    red_streaks: dict[str, int] = field(default_factory=dict)
+    active_reds: set[str] = field(default_factory=set)
+    congestion_cooldown_until: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
 class AlertEvent:
-    """A single thread-worthy change."""
+    """A single thread-worthy change.
+
+    ``ping`` marks events that mention the alert role (heavy congestion only);
+    ``critical`` marks prominent weather events, which post without pinging.
+    """
 
     text: str
     critical: bool = False
+    ping: bool = False
 
 
 @dataclass
@@ -92,6 +111,7 @@ class AlertMonitor:
     """Tracks state and emits AlertEvents on change."""
 
     state: AlertState = field(default_factory=AlertState)
+    roads: object | None = None  # TrackedRoads table for names/affected routes
     _initialized: bool = False
 
     def _warning_events(
@@ -194,6 +214,69 @@ class AlertMonitor:
             )
         return events
 
+    def _congestion_events(self, statuses, now: datetime) -> list[AlertEvent]:
+        """Red-band detector congestion with hysteresis and a per-road cooldown.
+
+        A road must read RED on consecutive updates before alerting (one
+        detector glitch is not a jam), re-alerts at most every 45 minutes, and
+        posts one cleared note when it leaves the red band.
+        """
+        events: list[AlertEvent] = []
+        state = self.state
+        current_reds: dict[str, object] = {}
+        for status in statuses:
+            bands = [o.band for o in status.observations if o.band is not None]
+            if not bands or any(band.value != "red" for band in bands):
+                continue
+            current_reds[status.name] = status
+
+        for name, status in current_reds.items():
+            streak = state.red_streaks.get(name, 0) + 1
+            state.red_streaks[name] = streak
+            if name in state.active_reds:
+                continue
+            if streak < CONGESTION_RED_TICKS_REQUIRED:
+                continue
+            if time.monotonic() < state.congestion_cooldown_until.get(name, 0.0):
+                continue
+            state.active_reds.add(name)
+            state.congestion_cooldown_until[name] = (
+                time.monotonic() + CONGESTION_COOLDOWN_SECONDS
+            )
+            events.append(self._congestion_event(name, status, now, cleared=False))
+
+        for name in sorted(set(state.active_reds) - set(current_reds)):
+            state.active_reds.discard(name)
+            events.append(self._congestion_event(name, None, now, cleared=True))
+        # A red reading that does not persist must not bank progress toward
+        # the next alert: only consecutive red updates count.
+        for name in list(state.red_streaks):
+            if name not in current_reds:
+                state.red_streaks[name] = 0
+        return events
+
+    def _congestion_event(self, name: str, status, now: datetime, cleared: bool) -> AlertEvent:
+        roads = self.roads
+        display = roads.display_name(name) if roads is not None else name
+        routes: list[str] = []
+        if roads is not None:
+            routes = roads.routes_for_keys([name])
+        suffix = f" — affects: {', '.join(routes)}" if routes else ""
+        stamp = f" (<t:{int(now.timestamp())}:t>)"
+        if cleared:
+            return AlertEvent(text=f"✅ Congestion easing on **{display}**{stamp}")
+        speed_text = ""
+        observations = getattr(status, "observations", []) if status is not None else []
+        speeds = [
+            o.speed_kmh for o in observations if getattr(o, "speed_kmh", None) is not None
+        ]
+        if speeds:
+            speed_text = f" ({min(speeds):.0f} km/h)"
+        return AlertEvent(
+            text=f"🚗 Heavy congestion on **{display}**{speed_text}{suffix}{stamp}",
+            ping=True,
+        )
+
     def update(
         self,
         warnings: list[WeatherWarning],
@@ -213,6 +296,7 @@ class AlertMonitor:
             self._warning_events(warnings, now)
             + self._incident_events(current_incidents, now)
             + self._roadwork_events(current_roadworks, now)
+            + self._congestion_events(statuses, now)
         )
         self.state.warning_codes = frozenset(w.code for w in warnings)
         self.state.traffic_incidents = frozenset(
@@ -231,7 +315,7 @@ class AlertMonitor:
         return events
 
     def ping_for(self, event: AlertEvent, role_id: int | None) -> str:
-        """Render a thread message, appending the role ping when critical."""
-        if event.critical and role_id is not None:
+        """Render a thread message; only congestion events carry the role ping."""
+        if event.ping and role_id is not None:
             return f"{event.text}\n<@&{role_id}>"
         return event.text

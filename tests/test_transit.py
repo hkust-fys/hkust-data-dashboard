@@ -19,15 +19,36 @@ from dashboard.providers.transit import (
 from tests.fixtures import sample_data as s
 
 
+@pytest.mark.parametrize("operator", ["KMB", "CTB", "GMB"])
+def test_probe_cache_ages_cached_countdowns_between_rotated_probes(operator):
+    now = [100.0]
+    cache = transit.ProbeEtaCache(ttl_seconds=900, clock=lambda: now[0])
+    eta = transit.ProbeEta(operator, "11", "seq-1", "stop", 3, 4)
+    cache.set("probe", [eta])
+
+    now[0] += 65
+    assert cache.get("probe")[0].minutes == 3
+    assert cache._store["probe"][1] == [eta]  # noqa: SLF001
+
+
+def test_probe_cache_removes_departed_cached_rows():
+    now = [100.0]
+    cache = transit.ProbeEtaCache(ttl_seconds=900, clock=lambda: now[0])
+    cache.set("probe", [transit.ProbeEta("GMB", "11", "seq-1", "stop", 3, 1)])
+
+    now[0] += 120
+    assert cache.get("probe") == []
+
+
 def test_probe_cache_expires_only_after_multi_sweep_ceiling():
     """A long TTL keeps sweep rungs together but bounds outage staleness."""
     now = [100.0]
     cache = transit.ProbeEtaCache(ttl_seconds=420, clock=lambda: now[0])
-    eta = transit.ProbeEta("KMB", "91M", "inbound", "stop", 3, 4)
+    eta = transit.ProbeEta("KMB", "91M", "inbound", "stop", 3, 1000)
     cache.set("probe", [eta])
 
     now[0] += 419
-    assert cache.get("probe") == [eta]
+    assert cache.get("probe")[0].minutes == 994
     now[0] += 2
     assert cache.get("probe") is None
     assert "probe" not in cache._store  # noqa: SLF001

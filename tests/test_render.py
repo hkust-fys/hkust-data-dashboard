@@ -174,6 +174,7 @@ def test_traffic_map_embed_is_image_onlyish_and_timestamped():
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
     embed = _build_traffic_map_embed(png, s.utc())
     assert embed is not None
+    assert embed.title == "🗺️ Traffic map"
     desc = embed.description
     assert "min" not in desc
     assert "delay" not in desc

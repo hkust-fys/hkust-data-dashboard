@@ -109,7 +109,7 @@ async def test_button_defers_then_answers_with_countdown(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_press_while_showing_refreshes_instead_of_erroring(monkeypatch):
+async def test_press_while_showing_refreshes_silently(monkeypatch):
     updater = _updater(monkeypatch)
     updater.live_frames = _fresh_cache()
     running = asyncio.ensure_future(asyncio.sleep(5))
@@ -120,12 +120,12 @@ async def test_press_while_showing_refreshes_instead_of_erroring(monkeypatch):
 
     await view.children[0].callback(interaction)
 
-    running.cancel()
-    sent = interaction.sent_messages[-1]
-    assert sent.get("ephemeral")
-    assert "Refreshed the snapshot" in sent.get("content", "")
+    assert interaction.response.deferred is True
+    assert interaction.sent_messages == []
     assert updater.live_snapshot_task is not running
     updater.live_snapshot_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await updater.live_snapshot_task
 
 
 @pytest.mark.asyncio

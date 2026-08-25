@@ -417,11 +417,6 @@ class LiveViewSnapshotView(discord.ui.View):
             updater.live_snapshot_task = asyncio.create_task(
                 _refresh_ephemeral_snapshot(running, parts, updater, generation)
             )
-            with contextlib.suppress(Exception):
-                await interaction.followup.send(
-                    "Refreshed the snapshot and restarted the countdown.",
-                    ephemeral=True,
-                )
             return
 
         if now - updater.last_live_snapshot < LIVE_VIEW_COOLDOWN_SECONDS:

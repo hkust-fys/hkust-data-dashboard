@@ -242,7 +242,7 @@ def _build_traffic_map_embed(
         return None
     description = "[Open territory-wide view in HKeMobility](https://www.hkemobility.gov.hk/)"
     embed = discord.Embed(
-        title="🗺️ Traffic map — HKUST approaches",
+        title="🗺️ Traffic map",
         color=0x2563EB,
         description=description,
     )

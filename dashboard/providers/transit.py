@@ -11,7 +11,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -383,8 +383,9 @@ async def fetch_transit_etas(
 
 # Probe cache holds the last value per fetch group. The ceiling is deliberately
 # longer than a complete sweep so early and late groups coexist, while still
-# removing departed vehicles during a prolonged provider outage.
-PROBE_TTL_SECONDS = 420.0
+# removing departed vehicles during a prolonged provider outage. Ten GMB
+# groups per cycle means a 15-minute ceiling covers a slow ten-cycle sweep.
+PROBE_TTL_SECONDS = 900.0
 
 
 @dataclass(frozen=True)
@@ -436,10 +437,24 @@ class ProbeEtaCache:
         entry = self._store.get(key)
         if entry is None:
             return None
-        if self._ttl > 0 and self._clock() - entry[0] > self._ttl:
+        age_seconds = max(0.0, self._clock() - entry[0])
+        if self._ttl > 0 and age_seconds > self._ttl:
             self._store.pop(key, None)
             return None
-        return entry[1]
+        # Requests rotate across stops, so cached integer ETAs must count down
+        # between probes; otherwise a bus marker freezes and then jumps.
+        elapsed_minutes = int(age_seconds // 60.0)
+        if not elapsed_minutes:
+            return entry[1]
+        aged: list[ProbeEta] = []
+        for eta in entry[1]:
+            if eta.minutes is None:
+                aged.append(eta)
+                continue
+            remaining = eta.minutes - elapsed_minutes
+            if remaining >= 0:
+                aged.append(replace(eta, minutes=remaining))
+        return aged
 
     def set(self, key: str, value: list[ProbeEta]) -> None:
         self._store[key] = (self._clock(), value)

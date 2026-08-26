@@ -252,6 +252,8 @@ def test_traffic_summary_lists_affected_routes_for_news_and_roadworks():
     )
     assert "affects: 91M, 792M" in embed.description
     assert embed.description.count("affects:") == 2
+    assert "> Lane closure on Hang Hau Road" in embed.description
+    assert "> One lane closed" in embed.description
 
     # without a road table, no suffix renders
     plain = _build_traffic_summary_embed([], [incident], None)

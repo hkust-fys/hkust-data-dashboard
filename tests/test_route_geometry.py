@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import sys
+import types
 
 import pytest
 
@@ -130,9 +131,17 @@ class _SpatialClient:
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict[str, str] | None]] = []
 
-    async def fetch_json_cached(self, spec: Any, headers: dict[str, str] | None = None):
-        self.requests.append((spec.url, headers))
-        return False, {"e": "Destination", "sh": {"coordinates": []}}, 1.0
+    class _Response:
+        ok = True
+        status = 200
+
+        async def json(self):
+            return {"e": "Destination", "sh": {"coordinates": []}}
+
+    async def get(self, url: str, headers: dict[str, str] | None = None, timeout: int = 0):
+        self.requests.append((url, headers))
+        assert timeout == route_geometry.SPATIAL_REQUEST_TIMEOUT_MS
+        return self._Response()
 
 
 @pytest.mark.parametrize(
@@ -150,7 +159,51 @@ async def test_spatial_request_uses_route_sequence_and_operator_referer(spec, re
 
     url, headers = client.requests[0]
     assert url.endswith(f"/{spec.route_id}/sequence/{spec.sequence}/spatial")
-    assert headers == {"Referer": f"https://www.hkemobility.gov.hk/en/public-transport{referer}"}
+    assert headers == {
+        "Referer": f"https://www.hkemobility.gov.hk/en/public-transport{referer}",
+        "User-Agent": route_geometry.HKEMOBILITY_USER_AGENT,
+    }
+    assert headers["User-Agent"] == (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
+    )
+
+
+async def test_spatial_batch_uses_one_shared_playwright_context(monkeypatch):
+    contexts: list[_SpatialClient] = []
+
+    class Request:
+        async def new_context(self, *, user_agent):
+            assert user_agent == route_geometry.HKEMOBILITY_USER_AGENT
+            context = _SpatialClient()
+            context.disposed = False
+
+            async def dispose():
+                context.disposed = True
+
+            context.dispose = dispose
+            contexts.append(context)
+            return context
+
+    class Manager:
+        async def __aenter__(self):
+            return types.SimpleNamespace(request=Request())
+
+        async def __aexit__(self, *_args):
+            return None
+
+    fake_api = types.ModuleType("playwright.async_api")
+    fake_api.async_playwright = lambda: Manager()
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_api)
+    monkeypatch.setattr(route_geometry, "PACE_MAX_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(route_geometry, "PACE_WINDOW_SECONDS", 0)
+
+    results = await route_geometry._fetch_spatial_batch()
+
+    assert len(results) == len(route_geometry.ROUTE_SPECS)
+    assert len(contexts) == 1
+    assert len(contexts[0].requests) == len(route_geometry.ROUTE_SPECS)
+    assert contexts[0].disposed is True
 
 
 async def test_paced_gather_interleaves_hosts_but_spaces_one_host(monkeypatch):
@@ -201,10 +254,31 @@ async def test_invalid_refreshed_line_keeps_its_cached_line_while_other_route_up
         return [invalid, updated_line]
 
     monkeypatch.setattr(route_geometry, "_load_route_lines", load)
+    route_geometry._refresh_retry_after.pop(str(tmp_path), None)
     result = await route_geometry._refresh_route_geometry(object(), str(tmp_path), cached)
 
     assert result.routes == [cached_line, updated_line]
     assert result.fetched_at == 42.0
+    assert route_geometry._refresh_retry_after[str(tmp_path)] > asyncio.get_running_loop().time()
+
+
+async def test_incomplete_refresh_cooldown_suppresses_stale_cache_retry(monkeypatch, tmp_path):
+    cached_line = _valid_line(route_geometry.ROUTE_SPECS[0], "cached")
+    cached = RouteGeometry([cached_line], cached_line.stops, 1.0)
+    cache_dir = str(tmp_path)
+    route_geometry._refresh_retry_after[cache_dir] = (
+        asyncio.get_running_loop().time() + route_geometry.GEOMETRY_FAILURE_COOLDOWN_SECONDS
+    )
+    monkeypatch.setattr(route_geometry, "_load_disk_cache", lambda _cache_dir: cached)
+
+    async def should_not_refresh(_client, _cache_dir, _cached):
+        raise AssertionError("cooldown should suppress another direction sweep")
+
+    monkeypatch.setattr(route_geometry, "_refresh_route_geometry", should_not_refresh)
+    result = await route_geometry.fetch_route_geometry(object(), cache_dir)
+
+    assert result is cached
+    route_geometry._refresh_retry_after.pop(cache_dir, None)
 
 
 async def test_empty_or_failed_refresh_never_erases_last_good_cache(monkeypatch, tmp_path):
@@ -257,3 +331,18 @@ async def test_cancelled_background_refresh_is_normal_shutdown(monkeypatch):
 
     assert "cancel-test" not in route_geometry._refresh_tasks
     assert "cancel-test" not in route_geometry._refresh_retry_after
+
+
+@pytest.mark.asyncio
+async def test_shutdown_background_refreshes_drains_registry():
+    cache_key = "shutdown-test"
+    route_geometry._refresh_shutdown = False
+    route_geometry._refresh_retry_after[cache_key] = 123.0
+    task = asyncio.create_task(asyncio.sleep(60))
+    route_geometry._refresh_tasks[cache_key] = task
+
+    await route_geometry.shutdown_background_refreshes()
+
+    assert task.cancelled()
+    assert route_geometry._refresh_tasks == {}
+    assert route_geometry._refresh_retry_after == {}

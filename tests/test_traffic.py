@@ -137,6 +137,20 @@ def test_parse_special_news_live_uppercase_schema_and_hkt_announcement_time():
     )
 
 
+def test_parse_special_news_keeps_td_coordinate_and_landmarks():
+    xml = """<list><message>
+      <INCIDENT_NUMBER>I-1</INCIDENT_NUMBER><INCIDENT_HEADING_EN>Closure</INCIDENT_HEADING_EN>
+      <LATITUDE>22.3274</LATITUDE><LONGITUDE>114.2332</LONGITUDE>
+      <NEAR_LANDMARK_EN>HKUST</NEAR_LANDMARK_EN>
+      <BETWEEN_LANDMARK_EN>Gate A and Gate B</BETWEEN_LANDMARK_EN>
+    </message></list>"""
+    incident = parse_special_news(xml)[0]
+    assert incident.latitude == 22.3274
+    assert incident.longitude == 114.2332
+    assert incident.near_landmark == "HKUST"
+    assert incident.between_landmark == "Gate A and Gate B"
+
+
 def test_parse_special_news_dedupes():
     doubled = s.SPECIAL_NEWS_XML.replace("</trafficNews>", s.SPECIAL_NEWS_XML.split("<trafficNews>")[-1])
     incidents = parse_special_news(doubled)

@@ -709,34 +709,28 @@ ALERT_ROUTE_COLOR = (255, 140, 0, 200)  # amber casing for alerted routes
 
 def _draw_alerted_route_lines(
     draw: ImageDraw.ImageDraw,
-    route_lines: list,
-    affected_routes: set[str],
+    affected_road_paths: Iterable[Iterable[tuple[float, float]]],
     center_lat: float,
     center_lon: float,
     zoom: float,
     size: tuple[int, int],
 ) -> int:
-    """Draw an amber casing under the paths of routes named in TD news.
+    """Draw amber casings only on OSM road paths named in TD news.
 
-    Returns the number of distinct alerted directions drawn. Drawn beneath
-    markers so pills and stops stay readable.
+    Returns the number of road paths drawn. Drawn beneath markers so pills and
+    stops stay readable.
     """
-    if not affected_routes:
-        return 0
-    drawn = set()
-    for line in route_lines:
-        key = str(getattr(line, "route", ""))
-        if key not in affected_routes or key in drawn:
-            continue
-        path = list(getattr(line, "path", ()))
+    drawn = 0
+    for raw_path in affected_road_paths:
+        path = list(raw_path)
         if len(path) < 2:
             continue
-        drawn.add(key)
         points = [project(lat, lon, center_lat, center_lon, zoom, size) for lat, lon in path]
         # Wide soft casing first, then a crisp amber core.
         draw.line(points, fill=(255, 140, 0, 90), width=11, joint="curve")
         draw.line(points, fill=ALERT_ROUTE_COLOR, width=5, joint="curve")
-    return len(drawn)
+        drawn += 1
+    return drawn
 
 
 def render_map(
@@ -745,7 +739,7 @@ def render_map(
     public_stops: Iterable[object] = (),
     route_lines: Iterable[object] = (),
     base_image: Image.Image | None = None,
-    affected_routes: Iterable[str] = (),
+    affected_road_paths: Iterable[Iterable[tuple[float, float]]] = (),
 ) -> bytes:
     route_lines = list(route_lines)
     public_stops = list(public_stops)
@@ -762,8 +756,7 @@ def render_map(
     # Alerted-route casings go beneath everything dashboard-drawn.
     _draw_alerted_route_lines(
         draw,
-        route_lines,
-        {str(route) for route in affected_routes},
+        affected_road_paths,
         center_lat,
         center_lon,
         zoom,

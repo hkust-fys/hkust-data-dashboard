@@ -220,6 +220,32 @@ async def test_updater_edits_same_message_and_no_duplicate(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_updater_stops_provider_refreshes_before_session_close(monkeypatch):
+    import bot as bot_module
+
+    events: list[str] = []
+
+    async def stop_geometry():
+        events.append("geometry")
+
+    async def stop_roads():
+        events.append("roads")
+
+    class Session:
+        async def close(self):
+            events.append("session")
+
+    monkeypatch.setattr(bot_module.route_geometry_provider, "shutdown_background_refreshes", stop_geometry)
+    monkeypatch.setattr(bot_module.tracked_roads_provider, "shutdown_background_refreshes", stop_roads)
+    updater = DashboardUpdater(_fake_settings())
+    updater.session = Session()
+
+    await updater.stop()
+
+    assert events == ["geometry", "roads", "session"]
+
+
+@pytest.mark.asyncio
 async def test_updater_continues_after_provider_failure(monkeypatch):
     channel = _FakeChannel([])
 
@@ -390,6 +416,79 @@ async def test_collect_all_cancellation_awaits_provider_children(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await operation
     assert set(cancelled) == {"weather", "map"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("latitude", "longitude", "near_landmark", "between_landmark", "expected_anchor"),
+    [
+        (22.335, 114.26, "", "", (22.335, 114.26)),
+        (None, None, "HKUST North Gate", "", "skip"),
+        (None, None, "", "", (None, None)),
+        (22.335, None, "", "", "skip"),
+        (25.0, 114.26, "", "", "skip"),
+    ],
+)
+async def test_collect_all_passes_only_anchored_affected_road_segments(
+    monkeypatch,
+    latitude,
+    longitude,
+    near_landmark,
+    between_landmark,
+    expected_anchor,
+):
+    """Traffic overlays use coordinates, or the provider's guarded fallback."""
+    import bot as bot_module
+    from dashboard.models import TrafficIncident
+
+    incident = TrafficIncident(
+        "notice-1", "Road closure", "works", "Clear Water Bay Road", "HKUST",
+        "outbound", "active", latitude=latitude, longitude=longitude,
+        near_landmark=near_landmark, between_landmark=between_landmark,
+    )
+    calls: list[tuple[list[str], float | None, float | None]] = []
+    captured: dict[str, object] = {}
+
+    class Roads:
+        def match(self, _text):
+            return ["clear water bay road"]
+
+        def segments_near(self, keys, lat, lon):
+            calls.append((keys, lat, lon))
+            return [[(22.335, 114.26), (22.336, 114.261)]]
+
+    async def roads(*_args, **_kwargs):
+        return Roads()
+
+    async def transit(*_args, **_kwargs):
+        return ([], None, [])
+
+    async def weather(*_args, **_kwargs):
+        return (None, [], None)
+
+    async def traffic(*_args, **_kwargs):
+        return ([], [incident], [], None)
+
+    async def traffic_map(*_args, **kwargs):
+        captured.update(kwargs)
+        return (b"map", [])
+
+    from dashboard.providers import tracked_roads as tracked_roads_provider
+
+    monkeypatch.setattr(tracked_roads_provider, "fetch_tracked_roads", roads)
+    monkeypatch.setattr(bot_module.transit, "fetch_transit_etas", transit)
+    monkeypatch.setattr(bot_module.weather_provider, "fetch_weather_conditions", weather)
+    monkeypatch.setattr(bot_module.traffic_provider, "fetch_traffic_data", traffic)
+    monkeypatch.setattr(bot_module.maps, "fetch_traffic_map", traffic_map)
+
+    await bot_module.collect_all(object(), _fake_settings())
+
+    if expected_anchor == "skip":
+        assert calls == []
+        assert captured["affected_road_paths"] == []
+    else:
+        assert calls == [(["clear water bay road"], *expected_anchor)]
+        assert captured["affected_road_paths"] == [[(22.335, 114.26), (22.336, 114.261)]]
 
 
 @pytest.mark.asyncio

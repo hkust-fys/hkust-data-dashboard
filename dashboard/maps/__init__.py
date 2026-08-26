@@ -150,13 +150,12 @@ async def fetch_traffic_map(
     client,
     groups: list[RouteEtaGroup] | None = None,
     cache_dir: str = ".cache",
-    affected_routes: list[str] | None = None,
+    affected_road_paths: list[list[tuple[float, float]]] | None = None,
 ) -> tuple[bytes | None, list[object]]:
     """Capture the Google base map and render estimated bus/stop markers.
 
-    ``affected_routes`` are route numbers named in current TD news; their
-    official lines get an amber casing so the map shows where the notice
-    bites.
+    ``affected_road_paths`` contains only matched OSM road polylines from
+    current TD traffic news; it never represents a whole transit route.
     """
     base_image_task = asyncio.create_task(capture_gmaps_base(cache_dir=cache_dir))
     public_stops: list[Stop] = []
@@ -215,7 +214,7 @@ async def fetch_traffic_map(
             public_stops,
             route_lines,
             base_image,
-            affected_routes or [],
+            affected_road_paths or [],
         )
         return png, []
     except Exception as exc:  # noqa: BLE001

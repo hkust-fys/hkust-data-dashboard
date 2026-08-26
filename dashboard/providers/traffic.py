@@ -448,6 +448,10 @@ def parse_special_news(xml_text: str) -> list[TrafficIncident]:
                 start_time=as_datetime(fields.get("start_time") or fields.get("effective_time")),
                 end_time=as_datetime(fields.get("end_time") or fields.get("expiry_time")),
                 announcement_time=announcement_time,
+                latitude=_to_float(fields.get("latitude") or ""),
+                longitude=_to_float(fields.get("longitude") or ""),
+                near_landmark=fields.get("near_landmark_en", ""),
+                between_landmark=fields.get("between_landmark_en", ""),
             )
         )
     return _dedupe_incidents(incidents)

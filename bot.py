@@ -35,6 +35,8 @@ from dashboard.models import (
     WeatherConditions,
 )
 from dashboard.providers import cameras, transit
+from dashboard.providers import route_geometry as route_geometry_provider
+from dashboard.providers import tracked_roads as tracked_roads_provider
 from dashboard.providers import traffic as traffic_provider
 from dashboard.providers import weather as weather_provider
 from dashboard.render import (
@@ -93,8 +95,8 @@ async def collect_all(
             roads = tracked_roads_provider.fallback_roads()
         return await traffic_provider.fetch_traffic_data(client, roads)
 
-    async def _affected_routes() -> list[str]:
-        """Route numbers named in the current TD news/roadworks selection."""
+    async def _affected_road_paths() -> list[list[tuple[float, float]]]:
+        """Return anchored OSM segments for current TD traffic notices."""
         try:
             traffic_result = await tasks["traffic"]
         except Exception:  # noqa: BLE001
@@ -107,15 +109,42 @@ async def collect_all(
             )
         except Exception:  # noqa: BLE001
             roads = tracked_roads_provider.fallback_roads()
-        incidents = traffic_result[1] or []
-        roadworks = traffic_result[2] or []
-        texts = [
-            f"{i.title} {i.description} {i.location} {i.road}" for i in incidents
-        ] + [f"{w.description} {w.road}" for w in roadworks]
-        affected: set[str] = set()
-        for text in texts:
-            affected.update(roads.routes_for_text(text))
-        return sorted(affected)
+        segments_near = getattr(roads, "segments_near", None)
+        if segments_near is None:
+            return []
+        paths: list[list[tuple[float, float]]] = []
+        seen_paths: set[tuple[tuple[float, float], ...]] = set()
+        for incident in traffic_result[1] or []:
+            latitude = getattr(incident, "latitude", None)
+            longitude = getattr(incident, "longitude", None)
+            text = f"{incident.title} {incident.description} {incident.location} {incident.road}"
+            keys = roads.match(text)
+            has_coordinates = (
+                isinstance(latitude, (int, float))
+                and isinstance(longitude, (int, float))
+                and 22.0 <= latitude <= 23.0
+                and 113.5 <= longitude <= 114.7
+            )
+            if not has_coordinates:
+                # A malformed, partial, or out-of-range coordinate is an
+                # explicit source signal, not permission to guess a whole
+                # road. Only a completely coordinate-less notice may use the
+                # provider's conservative short-road fallback.
+                if latitude is not None or longitude is not None:
+                    continue
+                near_landmark = str(getattr(incident, "near_landmark", "") or "").strip()
+                between_landmark = str(
+                    getattr(incident, "between_landmark", "") or ""
+                ).strip()
+                if near_landmark or between_landmark:
+                    continue
+                latitude = longitude = None
+            for path in segments_near(keys, latitude, longitude) or ():
+                normalized = tuple((float(lat), float(lon)) for lat, lon in path)
+                if len(normalized) >= 2 and normalized not in seen_paths:
+                    seen_paths.add(normalized)
+                    paths.append(list(normalized))
+        return paths
 
     async def _traffic_map():
         # Transit ETA groups still drive retained estimated bus markers.
@@ -126,12 +155,12 @@ async def collect_all(
                 groups = transit_result[0]
         except Exception as exc:  # noqa: BLE001
             log.warning("traffic map: transit groups unavailable: %s", exc)
-        affected = await _affected_routes()
+        affected_paths = await _affected_road_paths()
         return await maps.fetch_traffic_map(
             client,
             groups=groups,
             cache_dir=settings.cache_dir,
-            affected_routes=affected,
+            affected_road_paths=affected_paths,
         )
 
     for name, coro in (
@@ -937,6 +966,8 @@ class DashboardUpdater:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await collection_task
         self._collection_task = None
+        await route_geometry_provider.shutdown_background_refreshes()
+        await tracked_roads_provider.shutdown_background_refreshes()
         if self.session is not None:
             await self.session.close()
             self.session = None

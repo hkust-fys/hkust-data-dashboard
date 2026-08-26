@@ -187,6 +187,10 @@ class TrafficIncident:
     start_time: datetime | None = None
     end_time: datetime | None = None
     announcement_time: datetime | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    near_landmark: str = ""
+    between_landmark: str = ""
 
 
 @dataclass

@@ -1,6 +1,7 @@
 """Tracked-roads provider tests: OSM parsing, table building, fallback."""
 
 import asyncio
+import json
 from collections import namedtuple
 
 import aiohttp
@@ -67,6 +68,44 @@ def test_build_tracked_roads_inverts_to_route_lists():
     assert list(roads.road_routes["clear water bay road"]) == sorted(
         roads.road_routes["clear water bay road"]
     )
+
+
+def test_build_tracked_roads_keeps_only_matched_way_paths_and_crops_near_anchor():
+    lines = [_line("91", ["Clear Water Bay Road"])]
+    roads = build_tracked_roads(
+        lines,
+        [["Clear Water Bay Road"]],
+        [
+            {"name": "Clear Water Bay Road", "points": [(22.3270, 114.2300), (22.3270, 114.2400)]},
+            {"name": "Untracked Road", "points": [(22.3270, 114.2300), (22.3270, 114.2400)]},
+        ],
+    )
+    assert set(roads.paths) == {"clear water bay road"}
+    assert len(roads.paths["clear water bay road"]) == 1
+    segments = roads.segments_near(["clear water bay road"], 22.3270, 114.2350)
+    assert len(segments) == 1
+    assert len(segments[0]) >= 2
+    assert roads.segments_near(["clear water bay road"], 22.3400, 114.2350) == []
+
+
+def test_coordinate_less_segments_allow_short_roads_and_warn(caplog):
+    roads = TrackedRoads(
+        display_names={"short road": "Short Road"}, aliases={"short road": "short road"},
+        paths={"short road": (((22.3, 114.2), (22.3, 114.205)),)},
+    )
+    with caplog.at_level("WARNING"):
+        segments = roads.segments_near(["short road"], None, None)
+    assert segments == [[(22.3, 114.2), (22.3, 114.205)]]
+    assert "Short Road" in caplog.text
+    assert "coordinate-less" in caplog.text
+
+
+def test_coordinate_less_segments_reject_long_roads():
+    roads = TrackedRoads(
+        display_names={"long road": "Long Road"}, aliases={"long road": "long road"},
+        paths={"long road": (((22.3, 114.2), (22.3, 114.22)),)},
+    )
+    assert roads.segments_near(["long road"], None, None) == []
 
 
 def test_match_is_case_insensitive_and_apostrophe_tolerant():
@@ -167,6 +206,77 @@ def test_replace_fetched_at_returns_stamped_copy():
     assert stamped.display_names == roads.display_names
 
 
+def test_replace_fetched_at_preserves_paths():
+    roads = TrackedRoads(
+        display_names={"road": "Road"}, aliases={"road": "road"},
+        paths={"road": (((22.3, 114.2), (22.31, 114.2)),)},
+    )
+    assert replace_fetched_at(roads, 1234.5).paths == roads.paths
+
+
+def test_disk_cache_roundtrip_and_legacy_missing_paths(tmp_path):
+    roads = TrackedRoads(
+        display_names={"road": "Road"}, aliases={"road": "road"},
+        road_routes={"road": ("91",)},
+        paths={"road": (((22.3, 114.2), (22.31, 114.2)),)},
+        source="osm", fetched_at=10.0,
+    )
+    tracked_roads._save_disk_cache(roads, str(tmp_path))
+    loaded = tracked_roads._load_disk_cache(str(tmp_path))
+    assert loaded is not None
+    assert loaded.paths == roads.paths
+
+    cache_path = tmp_path / "maps" / tracked_roads.ROADS_CACHE_NAME
+    raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    raw.pop("paths")
+    cache_path.write_text(json.dumps(raw), encoding="utf-8")
+    legacy = tracked_roads._load_disk_cache(str(tmp_path))
+    assert legacy is not None
+    assert legacy.display_names == roads.display_names
+    assert legacy.paths == {}
+
+
+def test_build_tracked_roads_retains_all_distinct_fragments_and_anchors_nearest():
+    lines = [_line("91", ["Clear Water Bay Road"])]
+    first = ((22.3270, 114.2300), (22.3270, 114.2310))
+    second = ((22.3270, 114.2400), (22.3270, 114.2410))
+    roads = build_tracked_roads(
+        lines, [["Clear Water Bay Road"]],
+        [
+            {"name": "Clear Water Bay Road", "points": list(first)},
+            {"name": "Clear Water Bay Road", "points": list(second)},
+            {"name": "Clear Water Bay Road", "points": list(first)},
+        ],
+    )
+    assert roads.paths["clear water bay road"] == (first, second)
+    segment = roads.segments_near(["clear water bay road"], 22.3270, 114.2405)
+    assert segment == [list(second)]
+
+
+def test_coordinate_less_segments_sum_all_fragments_before_short_fallback():
+    roads = TrackedRoads(
+        display_names={"road": "Road"}, aliases={"road": "road"},
+        paths={
+            "road": (
+                ((22.3, 114.2), (22.3, 114.205)),
+                ((22.3, 114.21), (22.3, 114.215)),
+                ((22.3, 114.22), (22.3, 114.225)),
+            )
+        },
+    )
+    # Each fragment is short, but together exceed the conservative threshold.
+    assert roads.segments_near(["road"]) == []
+
+
+def test_partial_coordinate_does_not_use_coordinate_less_fallback():
+    roads = TrackedRoads(
+        display_names={"road": "Road"}, aliases={"road": "road"},
+        paths={"road": (((22.3, 114.2), (22.3, 114.205)),)},
+    )
+    assert roads.segments_near(["road"], latitude=22.3) == []
+    assert roads.segments_near(["road"], longitude=114.2) == []
+
+
 _Key = namedtuple("_Key", "host port")
 
 
@@ -233,3 +343,18 @@ async def test_cancelled_background_refresh_is_normal_shutdown():
 
     assert cache_key not in tracked_roads._refresh_tasks
     assert cache_key not in tracked_roads._refresh_retry_after
+
+
+@pytest.mark.asyncio
+async def test_shutdown_background_refreshes_drains_registry():
+    cache_key = "shutdown-test"
+    tracked_roads._refresh_shutdown = False
+    tracked_roads._refresh_retry_after[cache_key] = 123.0
+    task = asyncio.create_task(asyncio.sleep(60))
+    tracked_roads._refresh_tasks[cache_key] = task
+
+    await tracked_roads.shutdown_background_refreshes()
+
+    assert task.cancelled()
+    assert tracked_roads._refresh_tasks == {}
+    assert tracked_roads._refresh_retry_after == {}

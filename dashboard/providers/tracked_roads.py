@@ -76,6 +76,15 @@ _EXCLUDED_HIGHWAY_TYPES = {
 
 SAMPLE_STEP_METRES = 150.0
 MATCH_RADIUS_METRES = 30.0
+# A TD news coordinate must be genuinely on the named OSM way.  This generous
+# bound covers GPS/map snapping error without turning an incident into a whole
+# route or whole-road highlight.  The returned line is capped at 500 m either
+# side of the nearest projected point.
+SEGMENT_MATCH_RADIUS_METRES = 120.0
+SEGMENT_HALF_LENGTH_METRES = 500.0
+# Coordinate-less TD notices may highlight only a genuinely short named way.
+# This avoids turning an ambiguous notice into a whole-corridor overlay.
+SHORT_ROAD_FALLBACK_MAX_METRES = 900.0
 
 
 @dataclass(frozen=True)
@@ -85,6 +94,9 @@ class TrackedRoads:
     display_names: dict[str, str] = field(default_factory=dict)  # key -> display
     aliases: dict[str, str] = field(default_factory=dict)  # key -> match phrase
     road_routes: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Canonical road key -> one or more OSM way polylines.  Only ways which
+    # intersected a tracked route are retained; fallback roads have no paths.
+    paths: dict[str, tuple[tuple[tuple[float, float], ...], ...]] = field(default_factory=dict)
     source: str = ""
     fetched_at: float = 0.0
 
@@ -138,6 +150,102 @@ class TrackedRoads:
 
     def display_name(self, key: str) -> str:
         return self.display_names.get(key, key.replace("-", " ").title())
+
+    def segments_near(
+        self,
+        keys: list[str],
+        latitude: float | None = None,
+        longitude: float | None = None,
+    ) -> list[list[tuple[float, float]]]:
+        """Crop matched OSM ways around a TD coordinate.
+
+        With an anchor, no cached path or path within 120 m yields no segment.
+        Each anchored result is limited to 500 m on either side of the nearest
+        projected point. Without an anchor, only roads no longer than 900 m
+        are returned and a warning is emitted, so ambiguous notices never
+        become whole-corridor guesses.
+        """
+        results: list[list[tuple[float, float]]] = []
+        if latitude is None and longitude is None:
+            for key in keys:
+                paths = self.paths.get(key, ())
+                if not paths:
+                    continue
+                length = sum(_path_length_metres(path) for path in paths)
+                if length <= SHORT_ROAD_FALLBACK_MAX_METRES:
+                    log.warning(
+                        "using coordinate-less short-road traffic segment for %s (%.0f m)",
+                        self.display_name(key),
+                        length,
+                    )
+                    results.extend(list(path) for path in paths)
+            return results
+        if latitude is None or longitude is None:
+            return []
+        anchor = (latitude, longitude)
+        for key in keys:
+            paths = self.paths.get(key, ())
+            candidates = [
+                (nearest[0], path, nearest)
+                for path in paths
+                if len(path) >= 2
+                for nearest in [_nearest_path_projection(anchor, path)]
+                if nearest is not None
+            ]
+            if not candidates:
+                continue
+            distance, path, nearest = min(candidates, key=lambda item: item[0])
+            if distance > SEGMENT_MATCH_RADIUS_METRES:
+                continue
+            _distance, _segment_index, _ratio, along = nearest
+            cumulative = [0.0]
+            for first, second in zip(path, path[1:], strict=False):
+                cumulative.append(cumulative[-1] + _metres_between(first, second))
+            start = max(0.0, along - SEGMENT_HALF_LENGTH_METRES)
+            end = min(cumulative[-1], along + SEGMENT_HALF_LENGTH_METRES)
+            cropped: list[tuple[float, float]] = [_point_at(path, cumulative, start)]
+            for index, point in enumerate(path[1:], 1):
+                if start < cumulative[index] < end:
+                    cropped.append(point)
+            cropped.append(_point_at(path, cumulative, end))
+            if cropped[-1] != cropped[-2]:
+                results.append(cropped)
+        return results
+
+
+def _nearest_path_projection(
+    point: tuple[float, float], path: tuple[tuple[float, float], ...]
+) -> tuple[float, int, float, float] | None:
+    best: tuple[float, int, float, float] | None = None
+    along = 0.0
+    for index, (start, end) in enumerate(zip(path, path[1:], strict=False)):
+        lat_scale = 111_320.0
+        lon_scale = lat_scale * math.cos(math.radians((start[0] + end[0]) / 2))
+        ex, ey = (end[0] - start[0]) * lat_scale, (end[1] - start[1]) * lon_scale
+        px, py = (point[0] - start[0]) * lat_scale, (point[1] - start[1]) * lon_scale
+        length_sq = ex * ex + ey * ey
+        ratio = 0.0 if length_sq == 0 else max(0.0, min(1.0, (px * ex + py * ey) / length_sq))
+        distance = math.hypot(px - ratio * ex, py - ratio * ey)
+        candidate = (distance, index, ratio, along + ratio * math.sqrt(length_sq))
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+        along += math.sqrt(length_sq)
+    return best
+
+
+def _point_at(
+    path: tuple[tuple[float, float], ...], cumulative: list[float], distance: float
+) -> tuple[float, float]:
+    for index, (start, end) in enumerate(zip(path, path[1:], strict=False), 1):
+        if distance <= cumulative[index]:
+            span = cumulative[index] - cumulative[index - 1]
+            ratio = 0.0 if span == 0 else (distance - cumulative[index - 1]) / span
+            return (start[0] + ratio * (end[0] - start[0]), start[1] + ratio * (end[1] - start[1]))
+    return path[-1]
+
+
+def _path_length_metres(path: tuple[tuple[float, float], ...]) -> float:
+    return sum(_metres_between(first, second) for first, second in zip(path, path[1:], strict=False))
 
 
 def _sorted_routes(routes: set[str]) -> list[str]:
@@ -289,6 +397,7 @@ def roads_for_line(line_points: list[tuple[float, float]], ways: list[dict]) -> 
 def build_tracked_roads(
     lines: list[RouteLine],
     roads_by_line: list[list[str]],
+    ways: list[dict] | None = None,
 ) -> TrackedRoads:
     """Combine per-direction OSM road lists into the shared road table."""
     display_by_key: dict[str, str] = {}
@@ -299,12 +408,20 @@ def build_tracked_roads(
             key = name.lower()
             display_by_key.setdefault(key, name)
             road_routes.setdefault(key, set()).add(label)
+    paths_by_key: dict[str, list[tuple[tuple[float, float], ...]]] = {}
+    for way in ways or []:
+        display = way.get("name_en") or way.get("name")
+        points = tuple(way.get("points") or ())
+        key = str(display or "").lower()
+        if key in display_by_key and len(points) >= 2 and points not in paths_by_key.setdefault(key, []):
+            paths_by_key[key].append(points)
     return TrackedRoads(
         display_names=dict(display_by_key),
         aliases={key: key for key in display_by_key},
         road_routes={
             key: tuple(_sorted_routes(routes)) for key, routes in road_routes.items()
         },
+        paths={key: tuple(value) for key, value in paths_by_key.items()},
         source="osm",
     )
 
@@ -327,6 +444,34 @@ def _cache_file(cache_dir: str) -> str:
     return os.path.join(cache_dir, "maps", ROADS_CACHE_NAME)
 
 
+def _parse_cached_paths(raw_paths: object) -> dict[str, tuple[tuple[tuple[float, float], ...], ...]]:
+    """Read the current multi-path shape and the brief singular-path shape."""
+    if not isinstance(raw_paths, dict):
+        return {}
+    parsed: dict[str, tuple[tuple[tuple[float, float], ...], ...]] = {}
+    for key, raw_value in raw_paths.items():
+        if not isinstance(key, str) or not isinstance(raw_value, list) or not raw_value:
+            continue
+        # Older development caches stored one path directly as [[lat, lon], ...].
+        if isinstance(raw_value[0], list) and len(raw_value[0]) >= 2 and isinstance(
+            raw_value[0][0], (int, float)
+        ):
+            raw_value = [raw_value]
+        paths: list[tuple[tuple[float, float], ...]] = []
+        for raw_path in raw_value:
+            if not isinstance(raw_path, list) or len(raw_path) < 2:
+                continue
+            try:
+                path = tuple((float(point[0]), float(point[1])) for point in raw_path)
+            except (IndexError, TypeError, ValueError):
+                continue
+            if path not in paths:
+                paths.append(path)
+        if paths:
+            parsed[key] = tuple(paths)
+    return parsed
+
+
 def _load_disk_cache(cache_dir: str) -> TrackedRoads | None:
     try:
         with open(_cache_file(cache_dir), encoding="utf-8") as file:
@@ -344,6 +489,7 @@ def _load_disk_cache(cache_dir: str) -> TrackedRoads | None:
             road_routes={
                 key: tuple(value) for key, value in (raw.get("road_routes") or {}).items()
             },
+            paths=_parse_cached_paths(raw.get("paths")),
             source=str(raw.get("source") or ""),
             fetched_at=float(raw.get("fetched_at") or 0),
         )
@@ -361,6 +507,10 @@ def _save_disk_cache(roads: TrackedRoads, cache_dir: str) -> None:
         "display_names": roads.display_names,
         "aliases": roads.aliases,
         "road_routes": {key: list(value) for key, value in roads.road_routes.items()},
+        "paths": {
+            key: [[list(point) for point in path] for path in paths]
+            for key, paths in roads.paths.items()
+        },
     }
     try:
         path = _cache_file(cache_dir)
@@ -421,6 +571,7 @@ async def _fetch_overpass(client: HttpClient, query: str) -> dict:
 
 _refresh_tasks: dict[str, asyncio.Task[TrackedRoads]] = {}
 _refresh_retry_after: dict[str, float] = {}
+_refresh_shutdown = False
 
 
 async def _refresh_roads(client: HttpClient, cache_dir: str) -> TrackedRoads:
@@ -450,7 +601,7 @@ async def _refresh_roads(client: HttpClient, cache_dir: str) -> TrackedRoads:
             failures,
             len(lines),
         )
-    roads = build_tracked_roads(lines, roads_by_line)
+    roads = build_tracked_roads(lines, roads_by_line, ways)
     roads = replace_fetched_at(roads, time.time())
     _save_disk_cache(roads, cache_dir)
     return roads
@@ -462,6 +613,7 @@ def replace_fetched_at(roads: TrackedRoads, fetched_at: float) -> TrackedRoads:
         display_names=roads.display_names,
         aliases=roads.aliases,
         road_routes=roads.road_routes,
+        paths=roads.paths,
         source=roads.source,
         fetched_at=fetched_at,
     )
@@ -469,6 +621,8 @@ def replace_fetched_at(roads: TrackedRoads, fetched_at: float) -> TrackedRoads:
 
 def _finish_refresh(task: asyncio.Task[TrackedRoads], cache_dir: str) -> None:
     _refresh_tasks.pop(cache_dir, None)
+    if _refresh_shutdown:
+        return
     if task.cancelled():
         # Normal shutdown must not create a failure cooldown or an exception
         # from this task's done callback.
@@ -490,9 +644,11 @@ async def fetch_tracked_roads(
     Order of preference: fresh disk cache, then a background refresh of the
     expired one, then a blocking refresh, then the curated fallback seed.
     """
+    global _refresh_shutdown
+    _refresh_shutdown = False
     cached = _load_disk_cache(cache_dir)
     if cached is not None and cached.display_names:
-        if time.time() - cached.fetched_at <= ROADS_TTL_SECONDS:
+        if time.time() - cached.fetched_at <= ROADS_TTL_SECONDS and cached.paths:
             return cached
         if cache_dir not in _refresh_tasks and time.monotonic() >= _refresh_retry_after.get(
             cache_dir, 0
@@ -513,3 +669,17 @@ async def fetch_tracked_roads(
         if cached is not None and cached.display_names:
             return cached
         return _fallback_roads()
+
+
+async def shutdown_background_refreshes() -> None:
+    """Cancel and drain refreshes before the shared HTTP session is closed."""
+    global _refresh_shutdown
+    _refresh_shutdown = True
+    tasks = list(_refresh_tasks.values())
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _refresh_tasks.clear()
+    _refresh_retry_after.clear()

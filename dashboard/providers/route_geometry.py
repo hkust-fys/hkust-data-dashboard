@@ -30,6 +30,7 @@ GEOMETRY_CACHE_VERSION = 11
 GEOMETRY_CACHE_NAME = "route-geometry.json"
 GEOMETRY_REFRESH_TIMEOUT_SECONDS = 45.0
 GEOMETRY_FAILURE_COOLDOWN_SECONDS = 5 * 60.0
+SPATIAL_REQUEST_TIMEOUT_MS = 10_000
 PACE_WINDOW_SECONDS = 12.0
 PACE_MAX_INTERVAL_SECONDS = 0.35
 MAX_STOP_DISTANCE_METRES = 110.0
@@ -43,6 +44,10 @@ GMB_STOP_URL = "https://data.etagmb.gov.hk/stop/{stop_id}"
 HKEMOBILITY_SPATIAL_URL = (
     "https://www.hkemobility.gov.hk/api/drss/public-transport-routes/"
     "{route_id}/sequence/{sequence}/spatial"
+)
+HKEMOBILITY_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
 )
 
 
@@ -156,6 +161,7 @@ def select_probe_stops(lines: Iterable[RouteLine]) -> list[ProbeStop]:
 
 _refresh_tasks: dict[str, asyncio.Task[RouteGeometry]] = {}
 _refresh_retry_after: dict[str, float] = {}
+_refresh_shutdown = False
 
 
 def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -384,7 +390,7 @@ async def _fetch_stop(client: HttpClient, operator: str, stop_id: str) -> Stop |
         return None
 
 
-async def _fetch_spatial(client: HttpClient, spec: RouteSpec) -> dict[str, Any] | None:
+async def _fetch_spatial(request_context: Any, spec: RouteSpec) -> dict[str, Any] | None:
     url = HKEMOBILITY_SPATIAL_URL.format(route_id=spec.route_id, sequence=spec.sequence)
     referer = (
         "https://www.hkemobility.gov.hk/en/public-transport/gmb"
@@ -392,12 +398,14 @@ async def _fetch_spatial(client: HttpClient, spec: RouteSpec) -> dict[str, Any] 
         else "https://www.hkemobility.gov.hk/en/public-transport/bus"
     )
     try:
-        _, raw, _ = await client.fetch_json_cached(
-            CachedFetch(
-                url, ROUTE_TTL_SECONDS, cache_key=f"hkemobility-{spec.route_id}-{spec.sequence}"
-            ),
-            headers={"Referer": referer},
+        response = await request_context.get(
+            url,
+            headers={"Referer": referer, "User-Agent": HKEMOBILITY_USER_AGENT},
+            timeout=SPATIAL_REQUEST_TIMEOUT_MS,
         )
+        if not response.ok:
+            raise RuntimeError(f"HTTP {response.status}")
+        raw = await response.json()
         return raw if isinstance(raw, dict) else None
     except Exception as exc:  # noqa: BLE001
         log.warning(
@@ -408,6 +416,27 @@ async def _fetch_spatial(client: HttpClient, spec: RouteSpec) -> dict[str, Any] 
             type(exc).__name__,
         )
         return None
+
+
+async def _fetch_spatial_batch() -> list[dict[str, Any] | None]:
+    """Fetch all spatial directions through one browser-shaped API context."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as playwright:
+        request_context = await playwright.request.new_context(user_agent=HKEMOBILITY_USER_AGENT)
+        try:
+            results: list[dict[str, Any] | None] = []
+            interval = min(
+                PACE_MAX_INTERVAL_SECONDS,
+                PACE_WINDOW_SECONDS / max(1, len(ROUTE_SPECS) - 1),
+            )
+            for index, spec in enumerate(ROUTE_SPECS):
+                if index:
+                    await asyncio.sleep(interval)
+                results.append(await _fetch_spatial(request_context, spec))
+            return results
+        finally:
+            await request_context.dispose()
 
 
 def _build_line(spec: RouteSpec, stops: list[Stop], raw: dict[str, Any] | None) -> RouteLine:
@@ -477,16 +506,16 @@ async def _load_route_lines(client: HttpClient) -> list[RouteLine]:
         )
         for operator, stop_id in unique_stops
     ]
-    spatial_jobs = [
-        (
-            HKEMOBILITY_SPATIAL_URL.format(route_id=spec.route_id, sequence=spec.sequence),
-            lambda spec=spec: _fetch_spatial(client, spec),
-        )
-        for spec in ROUTE_SPECS
-    ]
+    async def load_spatial_safely() -> list[Any]:
+        try:
+            return await _fetch_spatial_batch()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("HKeMobility spatial client failed: %s", type(exc).__name__)
+            return [None] * len(ROUTE_SPECS)
+
     stop_results, spatial_results = await asyncio.gather(
         _paced_gather(stop_jobs),
-        _paced_gather(spatial_jobs),
+        load_spatial_safely(),
     )
     stop_lookup = {
         key: value
@@ -643,12 +672,23 @@ async def _refresh_route_geometry(
         if complete and len(routes) == len(ROUTE_SPECS)
         else (cached.fetched_at if cached else 0),
     )
+    if not complete or len(routes) != len(ROUTE_SPECS):
+        _refresh_retry_after[cache_dir] = (
+            time.monotonic() + GEOMETRY_FAILURE_COOLDOWN_SECONDS
+        )
+        log.warning(
+            "route geometry refresh incomplete: retained %d/%d directions; retrying after cooldown",
+            len(routes),
+            len(ROUTE_SPECS),
+        )
     _save_disk_cache(geometry, cache_dir)
     return geometry
 
 
 def _finish_refresh(task: asyncio.Task[RouteGeometry], cache_dir: str) -> None:
     _refresh_tasks.pop(cache_dir, None)
+    if _refresh_shutdown:
+        return
     if task.cancelled():
         # Cancellation is normal during shutdown; it must not schedule a
         # failure cooldown or emit an unhandled done-callback exception.
@@ -662,6 +702,8 @@ def _finish_refresh(task: asyncio.Task[RouteGeometry], cache_dir: str) -> None:
 
 async def fetch_route_geometry(client: HttpClient, cache_dir: str = ".cache") -> RouteGeometry:
     """Return fresh/last-good geometry and refresh expired cache in background."""
+    global _refresh_shutdown
+    _refresh_shutdown = False
     cached = _load_disk_cache(cache_dir)
     if cached is not None:
         if time.time() - cached.fetched_at <= ROUTE_TTL_SECONDS:
@@ -676,3 +718,17 @@ async def fetch_route_geometry(client: HttpClient, cache_dir: str = ".cache") ->
     if time.monotonic() < _refresh_retry_after.get(cache_dir, 0):
         return RouteGeometry()
     return await _refresh_route_geometry(client, cache_dir, None)
+
+
+async def shutdown_background_refreshes() -> None:
+    """Cancel and drain refreshes before the shared HTTP session is closed."""
+    global _refresh_shutdown
+    _refresh_shutdown = True
+    tasks = list(_refresh_tasks.values())
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _refresh_tasks.clear()
+    _refresh_retry_after.clear()

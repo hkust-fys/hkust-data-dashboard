@@ -465,7 +465,7 @@ def test_gmb_stops_do_not_emit_public_glyphs_but_keep_geometry_for_eta():
     assert renderer._merged_public_stop_markers([gate], [line], [path]) == []
 
 
-def test_alerted_route_gets_amber_casing_on_map(tmp_path, monkeypatch):
+def test_alerted_road_path_gets_amber_casing_without_highlighting_route_remainder(tmp_path):
     from PIL import Image as PILImage
 
     stops = [
@@ -474,25 +474,14 @@ def test_alerted_route_gets_amber_casing_on_map(tmp_path, monkeypatch):
     ]
     path = [(stop.lat, stop.lon) for stop in stops]
     line = RouteLine("91", "KMB", "outbound", stops, path, list(range(5)))
-    other = RouteLine(
-        "11", "GMB", "seq-1", stops, [(lat + 0.001, lon) for lat, lon in path], list(range(5))
-    )
     base = PILImage.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white")
 
     plain = Image.open(
-        io.BytesIO(renderer.render_map([], str(tmp_path), [], [line, other], base))
+        io.BytesIO(renderer.render_map([], str(tmp_path), [], [line], base))
     )
     highlighted = Image.open(
-        io.BytesIO(
-            renderer.render_map([], str(tmp_path), [], [line, other], base, ["91"])
-        )
+        io.BytesIO(renderer.render_map([], str(tmp_path), [], [line], base, [path[:3]]))
     )
-
-    # The alerted corridor's midpoint must gain amber pixels vs the plain map.
-    x_mid, y_mid = renderer.project(path[2][0], path[2][1], 22.3274138, 114.2331738, 15.0,
-                                    (renderer.MAP_WIDTH, renderer.MAP_HEIGHT))
-    region_plain = plain.crop((int(x_mid) - 20, int(y_mid) - 20, int(x_mid) + 20, int(y_mid) + 20))
-    region_hl = highlighted.crop((int(x_mid) - 20, int(y_mid) - 20, int(x_mid) + 20, int(y_mid) + 20))
 
     def amber_count(image):
         return sum(
@@ -501,9 +490,14 @@ def test_alerted_route_gets_amber_casing_on_map(tmp_path, monkeypatch):
             if r > 200 and 90 < g < 190 and b < 120
         )
 
-    assert amber_count(region_hl) > amber_count(region_plain)
-    # the un-alerted route stays untouched
-    assert amber_count(region_plain) == 0
+    def amber_count_at(image, point):
+        x, y = renderer.project(*point, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
+                                 renderer.BASE_MAP_ZOOM, (renderer.MAP_WIDTH, renderer.MAP_HEIGHT))
+        region = image.crop((int(x) - 20, int(y) - 20, int(x) + 20, int(y) + 20))
+        return amber_count(region)
+
+    assert amber_count_at(highlighted, path[1]) > amber_count_at(plain, path[1])
+    assert amber_count_at(highlighted, path[4]) == amber_count_at(plain, path[4])
 
 
 def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_path, monkeypatch):

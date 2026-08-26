@@ -320,7 +320,17 @@ def _build_traffic_summary_embed(
         lines.append("\n**Active traffic notices**")
         for incident in notices:
             text = f"{incident.title} {incident.description} {incident.location} {incident.road}"
-            lines.append(f"• {_esc(incident.title)}")
+            # Preserve the notice wording itself as a quote and avoid
+            # repeating title/location fragments from TD's feed.
+            notice_parts: list[str] = []
+            for part in (incident.title, incident.description, incident.location, incident.road):
+                cleaned = part.strip()
+                if cleaned and cleaned.casefold() not in {
+                    existing.casefold() for existing in notice_parts
+                }:
+                    notice_parts.append(cleaned)
+            for part in notice_parts:
+                lines.append(f"> {_esc(part)}")
             road_names = _matched_road_names(text, roads)
             if road_names:
                 lines.append(f"  ↳ road: {', '.join(_esc(name) for name in road_names)}")

@@ -52,7 +52,7 @@ class Settings:
     announce_channel_id: int
     dashboard_message_id: int | None = None
     dev_webhook: str | None = None
-    update_interval_seconds: int = 15
+    update_interval_seconds: int = 10
     http_timeout_seconds: float = 10.0
     log_level: str = "INFO"
     cache_dir: str = field(default=".cache")
@@ -94,7 +94,7 @@ class Settings:
             dashboard_message_id=dashboard_message_id,
             dev_webhook=os.getenv("DEV_WEBHOOK", "").strip() or None,
             update_interval_seconds=_env_int(
-                "UPDATE_INTERVAL_SECONDS", 15, minimum=15
+                "UPDATE_INTERVAL_SECONDS", 10, minimum=10
             ),
             http_timeout_seconds=_env_float("HTTP_TIMEOUT_SECONDS", 10.0),
             log_level=log_level,

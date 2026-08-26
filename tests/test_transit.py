@@ -19,6 +19,14 @@ from dashboard.providers.transit import (
 from tests.fixtures import sample_data as s
 
 
+@pytest.fixture(autouse=True)
+def _reset_gmb_state(monkeypatch):
+    """Keep shared gate/probe cooldown and caches isolated between tests."""
+    monkeypatch.setattr(transit, "_gmb_cooldown_until", 0.0)
+    transit._gmb_gate_cache._stored = None  # noqa: SLF001
+    transit._probe_cache._store.clear()  # noqa: SLF001
+
+
 @pytest.mark.parametrize("operator", ["KMB", "CTB", "GMB"])
 def test_probe_cache_ages_cached_countdowns_between_rotated_probes(operator):
     now = [100.0]
@@ -73,7 +81,8 @@ async def test_gmb_probe_cap_rotates_across_all_groups(monkeypatch):
     monkeypatch.setattr(transit, "_gmb_cursor", 0)
     monkeypatch.setattr(transit, "_probe_cursor", 0)
     monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
-    for _ in range(4):
+    # Fourteen GMB groups per cycle require three cycles to cover all 35.
+    for _ in range(3):
         await transit.fetch_probe_etas(object(), probes)
 
     assert set(calls) == {f"stop-{index}" for index in range(35)}
@@ -232,6 +241,95 @@ async def test_one_failed_gmb_stop_does_not_hide_other_minibuses(caplog):
     rows = await _fetch_gmb(client, s.utc())
     assert rows
     assert "20013010" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_gmb_gate_403_sets_shared_cooldown_and_serves_aged_cache():
+    from dashboard.http import FetchError
+
+    transit._gmb_gate_cache.set([s.eta_row("11", "Choi Hung", "S", 5, operator=Operator.GMB)])
+    stamped, cached_rows = transit._gmb_gate_cache._stored  # noqa: SLF001
+    transit._gmb_gate_cache._stored = (stamped - 61, cached_rows)  # noqa: SLF001
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_json(self, _url):
+            self.calls += 1
+            raise FetchError("access denied", status_code=403)
+
+    client = Client()
+    await _fetch_gmb(client, s.utc())
+    assert client.calls == 1
+    assert transit._gmb_cooldown_until > transit.time.monotonic()  # noqa: SLF001
+
+    rows = await _fetch_gmb(client, s.utc())
+    assert client.calls == 1
+    assert rows and rows[0].minutes == 4
+
+
+@pytest.mark.asyncio
+async def test_gmb_gate_cooldown_expiry_resumes_polling():
+    transit._gmb_cooldown_until = transit.time.monotonic() + 60
+    client = _StubClient({"/eta/stop/": s.gmb_json()})
+    assert await _fetch_gmb(client, s.utc()) == []
+    assert client.calls == []
+
+    transit._gmb_cooldown_until = 0
+    rows = await _fetch_gmb(client, s.utc())
+    assert rows
+    assert client.calls
+
+
+def test_gmb_gate_cache_has_hard_ttl_for_live_and_unknown_etas():
+    transit._gmb_gate_cache.set([
+        s.eta_row("11", "Choi Hung", "S", 5, operator=Operator.GMB),
+        s.eta_row("11B", "Choi Hung", "S", None, operator=Operator.GMB),
+    ])
+    stamped, rows = transit._gmb_gate_cache._stored  # noqa: SLF001
+    transit._gmb_gate_cache._stored = (
+        stamped - transit._gmb_gate_cache.TTL_SECONDS - 1,
+        rows,
+    )  # noqa: SLF001
+
+    assert transit._gmb_gate_cache.get() == []
+    assert transit._gmb_gate_cache._stored is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_concurrent_gate_and_probe_403_stop_followup_calls():
+    import asyncio
+
+    from dashboard.http import FetchError
+
+    calls: list[str] = []
+    first_started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Client:
+        async def fetch_json(self, url):
+            calls.append(url)
+            if len(calls) == 1:
+                first_started.set()
+                await release.wait()
+            raise FetchError("access denied", status_code=403)
+
+    probe = SimpleNamespace(
+        operator="GMB", route="11", bound="seq-1", stop_id="20013010",
+        route_id=2004791, sequence=1, index=0,
+    )
+    client = Client()
+    gate_task = asyncio.create_task(_fetch_gmb(client, s.utc()))
+    await first_started.wait()
+    probe_task = asyncio.create_task(transit.fetch_probe_etas(client, [probe]))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(gate_task, probe_task)
+
+    # One request may already be in flight on the other path; neither path
+    # may start a second request after the shared cooldown is set.
+    assert len(calls) <= 2
 
 
 def test_gmb_config_has_both_gates_and_verified_stops():

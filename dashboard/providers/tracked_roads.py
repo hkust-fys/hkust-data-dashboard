@@ -162,7 +162,7 @@ class TrackedRoads:
         With an anchor, no cached path or path within 120 m yields no segment.
         Each anchored result is limited to 500 m on either side of the nearest
         projected point. Without an anchor, only roads no longer than 900 m
-        are returned and a warning is emitted, so ambiguous notices never
+        are returned and an informational message is emitted, so ambiguous notices never
         become whole-corridor guesses.
         """
         results: list[list[tuple[float, float]]] = []
@@ -173,7 +173,7 @@ class TrackedRoads:
                     continue
                 length = sum(_path_length_metres(path) for path in paths)
                 if length <= SHORT_ROAD_FALLBACK_MAX_METRES:
-                    log.warning(
+                    log.info(
                         "using coordinate-less short-road traffic segment for %s (%.0f m)",
                         self.display_name(key),
                         length,

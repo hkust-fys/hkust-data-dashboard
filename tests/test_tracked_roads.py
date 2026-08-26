@@ -88,16 +88,17 @@ def test_build_tracked_roads_keeps_only_matched_way_paths_and_crops_near_anchor(
     assert roads.segments_near(["clear water bay road"], 22.3400, 114.2350) == []
 
 
-def test_coordinate_less_segments_allow_short_roads_and_warn(caplog):
+def test_coordinate_less_segments_allow_short_roads_and_log_info(caplog):
     roads = TrackedRoads(
         display_names={"short road": "Short Road"}, aliases={"short road": "short road"},
         paths={"short road": (((22.3, 114.2), (22.3, 114.205)),)},
     )
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("INFO"):
         segments = roads.segments_near(["short road"], None, None)
     assert segments == [[(22.3, 114.2), (22.3, 114.205)]]
     assert "Short Road" in caplog.text
     assert "coordinate-less" in caplog.text
+    assert any(record.levelname == "INFO" for record in caplog.records)
 
 
 def test_coordinate_less_segments_reject_long_roads():

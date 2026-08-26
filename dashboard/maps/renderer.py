@@ -6,6 +6,7 @@ import io
 import math
 import os
 from collections.abc import Iterable
+from functools import lru_cache
 from typing import NamedTuple
 
 from PIL import Image, ImageDraw, ImageFont
@@ -15,6 +16,10 @@ from dashboard.models import Operator
 
 MAP_WIDTH = 960
 MAP_HEIGHT = 540
+LEGEND_WIDTH = 420
+LEGEND_HEIGHT = 110
+LEGEND_DISPLAY_WIDTH = 840
+LEGEND_BAND_HEIGHT = 240
 MIN_MAP_WIDTH = 720
 MIN_MAP_HEIGHT = 405
 BASE_MAP_LAT = 22.3274138
@@ -649,14 +654,7 @@ def _draw_gate_pins(
 def _draw_legend(draw: ImageDraw.ImageDraw, size: tuple[int, int]) -> None:
     """Explain only dashboard-authored estimates and stop glyphs."""
     font = _font(12)
-    x, y = 10, size[1] - 132
-    draw.rounded_rectangle(
-        (x - 6, y - 7, x + 400, y + 114),
-        radius=7,
-        fill=(255, 255, 255, 225),
-        outline=(180, 180, 180, 235),
-        width=1,
-    )
+    x, y = 10, max(8, size[1] - 102)
     draw.text((x, y), "Estimated buses (not GPS)", fill=(30, 30, 30, 255), font=font)
     cursor_x = x + 158
     for operator, color in OPERATOR_COLORS.items():
@@ -699,27 +697,61 @@ def _draw_legend(draw: ImageDraw.ImageDraw, size: tuple[int, int]) -> None:
         fill=(30, 30, 30, 255),
         font=font,
     )
-    draw.text(
-        (x, y + 54),
-        "Route geometry © Transport Department HKeMobility",
-        fill=(60, 60, 60, 255),
-        font=font,
+
+    # Match the map's high-contrast, no-fill rectangle indicator.
+    draw.rectangle(
+        (x, y + 54, x + 20, y + 64),
+        outline=ALERT_RECT_COLOR,
+        width=4,
     )
-    draw.line((x, y + 78, x + 20, y + 78), fill=ALERT_ROUTE_COLOR, width=2)
-    draw.line((x, y + 84, x + 20, y + 84), fill=ALERT_ROUTE_COLOR, width=2)
     draw.text(
-        (x + 27, y + 76),
+        (x + 27, y + 53),
         "traffic-news segment",
         fill=(30, 30, 30, 255),
         font=font,
     )
+    attribution = "Map data © Google · Route geometry © Transport Department HKeMobility"
+    draw.text(
+        (x, size[1] - 16),
+        attribution,
+        fill=(105, 105, 105, 255),
+        font=_font(8),
+    )
 
 
-ALERT_ROUTE_COLOR = (255, 179, 0, 235)
-ALERT_RAIL_WIDTH = 2
+@lru_cache(maxsize=1)
+def render_legend() -> bytes:
+    """Return the deterministic standalone legend PNG used beside the map."""
+    canvas = Image.new("RGB", (LEGEND_WIDTH, LEGEND_HEIGHT), (246, 247, 249))
+    _draw_legend(ImageDraw.Draw(canvas, "RGBA"), canvas.size)
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="PNG", optimize=False)
+    return buffer.getvalue()
 
 
-def _draw_alerted_route_lines(
+def _append_legend_band(canvas: Image.Image) -> Image.Image:
+    """Append a readable, opaque legend band below the untouched map image."""
+    map_image = canvas.convert("RGB")
+    legend = Image.open(io.BytesIO(render_legend())).convert("RGB")
+    legend_height = round(LEGEND_DISPLAY_WIDTH * legend.height / legend.width)
+    legend = legend.resize((LEGEND_DISPLAY_WIDTH, legend_height), Image.Resampling.LANCZOS)
+    composite = Image.new(
+        "RGB", (map_image.width, map_image.height + LEGEND_BAND_HEIGHT), (246, 247, 249)
+    )
+    composite.paste(map_image, (0, 0))
+    composite.paste(
+        legend,
+        ((map_image.width - LEGEND_DISPLAY_WIDTH) // 2, map_image.height + 20),
+    )
+    return composite
+
+
+ALERT_RECT_COLOR = (180, 0, 255, 255)
+ALERT_RECT_PADDING = 7
+ALERT_RECT_OUTLINE_WIDTH = 4
+
+
+def _draw_alerted_road_rectangles(
     canvas: Image.Image,
     affected_road_paths: Iterable[Iterable[tuple[float, float]]],
     center_lat: float,
@@ -727,16 +759,15 @@ def _draw_alerted_route_lines(
     zoom: float,
     size: tuple[int, int],
 ) -> int:
-    """Draw thin amber edge rails only on OSM road paths named in TD news.
+    """Draw merged, transparent rectangles around TD-affected road sections.
 
-    The rails deliberately leave the projected path centreline untouched, so
-    Google's traffic colour remains visible between them. Drawn beneath
-    markers so pills and stops stay readable.
+    Rectangles are padded in screen space, merged transitively when they touch,
+    and clipped to the map. The transparent centre preserves Google's traffic
+    layer. Drawn beneath markers so pills and stops stay readable.
     """
-    drawn = 0
     overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay, "RGBA")
-    projected_paths: list[list[tuple[float, float]]] = []
+    rectangles: list[tuple[float, float, float, float]] = []
     for raw_path in affected_road_paths:
         path = list(raw_path)
         if len(path) < 2:
@@ -744,16 +775,44 @@ def _draw_alerted_route_lines(
         points = [project(lat, lon, center_lat, center_lon, zoom, size) for lat, lon in path]
         if len(points) < 2:
             continue
-        projected_paths.append(points)
-        drawn += 1
-    # Draw every wide casing first, then erase every centerline. This ordering
-    # keeps center pixels untouched even where affected paths cross or hairpin.
-    for points in projected_paths:
-        overlay_draw.line(points, fill=ALERT_ROUTE_COLOR, width=ALERT_RAIL_WIDTH * 5, joint="curve")
-    for points in projected_paths:
-        overlay_draw.line(points, fill=(0, 0, 0, 0), width=ALERT_RAIL_WIDTH * 2, joint="curve")
+        left = max(0.0, min(point[0] for point in points) - ALERT_RECT_PADDING)
+        top = max(0.0, min(point[1] for point in points) - ALERT_RECT_PADDING)
+        right = min(float(size[0] - 1), max(point[0] for point in points) + ALERT_RECT_PADDING)
+        bottom = min(float(size[1] - 1), max(point[1] for point in points) + ALERT_RECT_PADDING)
+        if left <= right and top <= bottom:
+            rectangles.append((left, top, right, bottom))
+
+    # Merge transitively: expanding a merged rectangle can make it touch a
+    # later rectangle, so keep scanning until no merge remains.
+    merged: list[tuple[float, float, float, float]] = []
+    for rectangle in rectangles:
+        candidate = rectangle
+        changed = True
+        while changed:
+            changed = False
+            remaining: list[tuple[float, float, float, float]] = []
+            for other in merged:
+                if _rects_overlap(candidate, other, padding=2):
+                    candidate = (
+                        min(candidate[0], other[0]),
+                        min(candidate[1], other[1]),
+                        max(candidate[2], other[2]),
+                        max(candidate[3], other[3]),
+                    )
+                    changed = True
+                else:
+                    remaining.append(other)
+            merged = remaining
+        merged.append(candidate)
+
+    for left, top, right, bottom in merged:
+        overlay_draw.rectangle(
+            (left, top, right, bottom),
+            outline=ALERT_RECT_COLOR,
+            width=ALERT_RECT_OUTLINE_WIDTH,
+        )
     canvas.alpha_composite(overlay)
-    return drawn
+    return len(merged)
 
 
 def render_map(
@@ -776,8 +835,8 @@ def render_map(
 
     route_paths = [list(line.path) for line in route_lines if len(getattr(line, "path", ())) >= 2]
 
-    # Alerted-route edge rails go beneath everything dashboard-drawn.
-    _draw_alerted_route_lines(
+    # Traffic-news road indicators go beneath everything dashboard-drawn.
+    _draw_alerted_road_rectangles(
         canvas,
         affected_road_paths,
         center_lat,
@@ -806,9 +865,8 @@ def render_map(
         _draw_marker_on_left(draw, x, y, heading, PUBLIC_STOP_COLOR, square=True)
 
     font = _font(13)
-    legend_bounds = (4, size[1] - 120, 407, size[1] - 14)
     bus_markers = _merge_bus_markers(estimates, center_lat, center_lon, zoom, size)
-    for placement in _layout_bus_labels(bus_markers, draw, font, size, [legend_bounds]):
+    for placement in _layout_bus_labels(bus_markers, draw, font, size):
         _draw_bus_route_marker(
             draw,
             placement,
@@ -817,30 +875,23 @@ def render_map(
             unreliable=placement.unreliable,
         )
 
-    _draw_legend(draw, size)
-
-    draw.text(
-        (size[0] - 150, size[1] - 22),
-        "Map data © Google",
-        fill=(60, 60, 60, 255),
-        font=_font(12),
-    )
     buffer = io.BytesIO()
     # Discord/mobile payload target: retain full dimensions while adapting
     # quality. RGB WebP keeps traffic colours (no palette quantization).
-    image = canvas.convert("RGB")
+    image = _append_legend_band(canvas)
+    minimum_height = round(image.height * MIN_MAP_WIDTH / image.width)
     # Keep a readable mobile floor while reducing dimensions only as needed.
     while True:
-        for quality in (82, 78, 74, 70):
+        for quality in (82, 78, 74, 70, 65, 60):
             buffer.seek(0)
             buffer.truncate(0)
             image.save(buffer, format="WEBP", quality=quality, method=6)
             if buffer.tell() <= 100_000:
                 return buffer.getvalue()
-        if image.size == (MIN_MAP_WIDTH, MIN_MAP_HEIGHT):
+        if image.size == (MIN_MAP_WIDTH, minimum_height):
             raise ValueError("map WebP exceeds 100 KB at readable minimum dimensions")
         next_width = max(MIN_MAP_WIDTH, round(image.width * 0.9))
-        next_height = max(MIN_MAP_HEIGHT, round(image.height * 0.9))
+        next_height = round(next_width * image.height / image.width)
         if (next_width, next_height) == image.size:
-            next_width, next_height = MIN_MAP_WIDTH, MIN_MAP_HEIGHT
+            next_width, next_height = MIN_MAP_WIDTH, minimum_height
         image = image.resize((next_width, next_height), Image.Resampling.LANCZOS)

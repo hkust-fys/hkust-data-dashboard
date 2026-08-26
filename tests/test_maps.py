@@ -300,7 +300,7 @@ def test_public_stop_markers_are_offset_on_opposite_road_sides(tmp_path, monkeyp
     monkeypatch.setattr(renderer, "_draw_marker_on_left", tracking)
     png = renderer.render_map([], str(tmp_path), [center], lines)
     image = Image.open(io.BytesIO(png))
-    assert image.size == (renderer.MAP_WIDTH, renderer.MAP_HEIGHT)
+    assert image.size == (renderer.MAP_WIDTH, renderer.MAP_HEIGHT + renderer.LEGEND_BAND_HEIGHT)
     assert len(captured) == 2
     assert math.isclose(captured[0][0], captured[1][0], abs_tol=0.1)
     assert abs(captured[0][1] - captured[1][1]) >= 13.5
@@ -483,75 +483,56 @@ def test_gmb_stops_do_not_emit_public_glyphs_but_keep_geometry_for_eta():
     assert renderer._merged_public_stop_markers([gate], [line], [path]) == []
 
 
-def test_alerted_road_path_gets_amber_casing_without_highlighting_route_remainder(tmp_path):
-    from PIL import Image as PILImage
-
-    stops = [
-        Stop(f"{index}", f"Stop {index}", 22.333360, 114.26 + index * 0.002)
-        for index in range(5)
-    ]
-    path = [(stop.lat, stop.lon) for stop in stops]
-    line = RouteLine("91", "KMB", "outbound", stops, path, list(range(5)))
-    base = PILImage.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white")
-
-    plain = Image.open(
-        io.BytesIO(renderer.render_map([], str(tmp_path), [], [line], base))
-    )
-    highlighted = Image.open(
-        io.BytesIO(renderer.render_map([], str(tmp_path), [], [line], base, [path[:3]]))
-    )
-
-    def amber_count(image):
-        return sum(
-            count
-            for count, (r, g, b) in image.getcolors(maxcolors=1_000_000)
-            if r > 200 and 90 < g < 190 and b < 120
-        )
-
-    def amber_count_at(image, point):
-        x, y = renderer.project(*point, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
-                                 renderer.BASE_MAP_ZOOM, (renderer.MAP_WIDTH, renderer.MAP_HEIGHT))
-        region = image.crop((int(x) - 20, int(y) - 20, int(x) + 20, int(y) + 20))
-        return amber_count(region)
-
-    assert amber_count_at(highlighted, path[1]) > amber_count_at(plain, path[1])
-    assert amber_count_at(highlighted, path[4]) == amber_count_at(plain, path[4])
-
-
-def test_alerted_road_rails_leave_google_centerline_unchanged():
-    from PIL import Image as PILImage
-
-    base = PILImage.new("RGBA", (120, 80), (37, 92, 168, 255))
-    before = base.copy()
-    renderer._draw_alerted_route_lines(
+def test_alerted_parallel_carriageways_merge_into_one_transparent_rectangle(monkeypatch):
+    monkeypatch.setattr(renderer, "project", lambda lat, lon, *args: (lon, lat))
+    base = Image.new("RGBA", (100, 100), (37, 92, 168, 255))
+    count = renderer._draw_alerted_road_rectangles(
         base,
-        [[(22.3274138, 114.2331738), (22.3274138, 114.2431738)]],
-        renderer.BASE_MAP_LAT,
-        renderer.BASE_MAP_LON,
-        renderer.BASE_MAP_ZOOM,
-        base.size,
+        [[(10, 10), (10, 30)], [(14, 10), (14, 30)]],
+        renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON, renderer.BASE_MAP_ZOOM, base.size,
     )
-    center = renderer.project(
-        22.3274138, 114.2381738, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
-        renderer.BASE_MAP_ZOOM, base.size,
-    )
-    assert base.getpixel((round(center[0]), round(center[1]))) == before.getpixel(
-        (round(center[0]), round(center[1]))
-    )
+    assert count == 1
+    # The unfilled centre preserves Google's underlying traffic pixel.
+    assert base.getpixel((20, 10)) == (37, 92, 168, 255)
+    # The incident indicator is magenta-only; its transparent centre preserves
+    # the underlying traffic layer without a white halo.
+    assert base.getpixel((20, 4)) == renderer.ALERT_RECT_COLOR
+    assert base.getpixel((20, 7)) == (37, 92, 168, 255)
+    # An unaffected route remainder remains completely untouched.
+    assert base.getpixel((70, 10)) == (37, 92, 168, 255)
 
 
-def test_alerted_hairpin_rails_leave_each_centerline_unchanged():
-    base = Image.new("RGBA", (180, 140), (41, 96, 166, 255))
-    before = base.copy()
-    path = [(22.326, 114.232), (22.334, 114.232), (22.334, 114.240), (22.326, 114.240)]
-    renderer._draw_alerted_route_lines(
-        base, [path], renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
-        renderer.BASE_MAP_ZOOM, base.size,
+def test_alerted_distant_sections_remain_two_rectangles_and_clip_to_bounds(monkeypatch):
+    monkeypatch.setattr(renderer, "project", lambda lat, lon, *args: (lon, lat))
+    base = Image.new("RGBA", (100, 100), (41, 96, 166, 255))
+    count = renderer._draw_alerted_road_rectangles(
+        base,
+        [[(10, -20), (10, 10)], [(70, 70), (70, 120)]],
+        renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON, renderer.BASE_MAP_ZOOM, base.size,
     )
-    for point in path[1:-1]:
-        x, y = renderer.project(*point, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
-                                 renderer.BASE_MAP_ZOOM, base.size)
-        assert base.getpixel((round(x), round(y))) == before.getpixel((round(x), round(y)))
+    assert count == 2
+    assert base.getpixel((99, 70)) == renderer.ALERT_RECT_COLOR
+    assert base.getpixel((50, 50)) == (41, 96, 166, 255)
+
+
+def test_legend_uses_native_grey_band_without_inset_panel():
+    legend = Image.open(io.BytesIO(renderer.render_legend())).convert("RGB")
+    background = (246, 247, 249)
+    assert legend.getpixel((0, 0)) == background
+    assert legend.getpixel((legend.width - 1, legend.height - 1)) == background
+    # The rectangle indicator is represented in the legend as well.
+    assert renderer.ALERT_RECT_COLOR[:3] in {
+        pixel for _count, pixel in legend.getcolors(maxcolors=1_000_000)
+    }
+    swatch = legend.crop((10, 62, 31, 73))
+    assert (255, 255, 255) not in {
+        pixel for _count, pixel in swatch.getcolors(maxcolors=1_000_000)
+    }
+    # Attribution is consolidated and minimized at the bottom of the band.
+    source = renderer._draw_legend
+    import inspect
+    text = inspect.getsource(source)
+    assert "Map data © Google · Route geometry © Transport Department HKeMobility" in text
 
 
 def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_path, monkeypatch):
@@ -594,14 +575,46 @@ def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_pa
     }
 
 
-def test_render_map_returns_bounded_webp_at_capture_dimensions(tmp_path):
+def test_render_map_returns_bounded_webp_with_legend_band(tmp_path):
     encoded = renderer.render_map(
         [], str(tmp_path), base_image=Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), (238, 241, 245))
     )
     decoded = Image.open(io.BytesIO(encoded))
     assert decoded.format == "WEBP"
-    assert decoded.size == (renderer.MAP_WIDTH, renderer.MAP_HEIGHT)
+    assert decoded.size == (renderer.MAP_WIDTH, renderer.MAP_HEIGHT + renderer.LEGEND_BAND_HEIGHT)
     assert len(encoded) <= 100_000
+    assert all(
+        abs(channel - target) <= 3
+        for channel, target in zip(decoded.getpixel((500, 200)), (238, 241, 245), strict=True)
+    )
+    assert decoded.getpixel((10, renderer.MAP_HEIGHT)) != (238, 241, 245)
+
+
+def test_render_legend_is_standalone_opaque_png_with_all_key_labels():
+    encoded = renderer.render_legend()
+    image = Image.open(io.BytesIO(encoded))
+    image.load()
+    assert image.format == "PNG"
+    assert image.size == (renderer.LEGEND_WIDTH, renderer.LEGEND_HEIGHT)
+    assert image.mode == "RGB"
+    assert len(encoded) < 25_000
+    # The artwork contains the stable explanatory labels and more than one
+    # fill colour, rather than being a blank/transparent attachment.
+    assert len(image.getcolors(maxcolors=1_000_000)) > 10
+
+
+def test_render_map_does_not_paint_legend_over_lower_left(tmp_path):
+    base = Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), (211, 212, 213))
+    encoded = renderer.render_map([], str(tmp_path), base_image=base)
+    image = Image.open(io.BytesIO(encoded)).convert("RGB")
+    # This was previously inside the opaque legend exclusion panel. It should
+    # now retain the traffic base so labels can occupy the area.
+    rendered = image.getpixel((100, 500))
+    expected = base.getpixel((100, 500))
+    assert all(
+        abs(channel - target) <= 8
+        for channel, target in zip(rendered, expected, strict=True)
+    )
 
 
 def test_render_map_textured_traffic_base_stays_readable_and_bounded(tmp_path):
@@ -695,3 +708,4 @@ def test_legend_has_no_obsolete_google_traffic_or_direction_explanation():
     assert "Live traffic speed" not in source
     assert "traffic jam" not in source
     assert "Arrows show both travel directions" not in source
+    assert "Map data © Google" in source

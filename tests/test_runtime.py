@@ -3,12 +3,15 @@ no duplicate updater on reconnect, no arbitrary-message edits, continued
 operation after a failed provider."""
 
 
+import asyncio
+
 import pytest
 
 from bot import (
     DASHBOARD_MESSAGE_MARKER,
     DashboardUpdater,
     _find_dashboard_message,
+    _payload_fingerprint,
     _resolve_dashboard_message,
     _to_payload,
 )
@@ -203,9 +206,18 @@ async def test_updater_edits_same_message_and_no_duplicate(monkeypatch):
 
     monkeypatch.setattr(bot_module, "collect_all", fake_collect)
 
+    loop_release = asyncio.Event()
+
+    async def dormant_update_loop(_self, _channel=None):
+        await loop_release.wait()
+
+    # Keep the real loop task alive for the idempotent-start assertion, but
+    # prevent it from racing the two explicit presenter ticks below.
+    monkeypatch.setattr(bot_module.DashboardUpdater, "_update_loop", dormant_update_loop)
+
     settings = _fake_settings()
     updater = DashboardUpdater(settings)
-    # create the session/client without starting the background loop
+    # create the session/client and retain the background loop task
     await updater.start(channel)  # noqa: SLF001 - loop runs; stop() cancels it
     first_task = updater._loop_task  # noqa: SLF001
     await updater.start(channel)
@@ -215,8 +227,47 @@ async def test_updater_edits_same_message_and_no_duplicate(monkeypatch):
     await updater._tick(channel)  # noqa: SLF001
     assert updater._message.id == first_id
     assert len(channel.sent) == 1  # exactly one created
-    assert updater._message.edits >= 1
+    assert updater._message.edits == 1
+    loop_release.set()
     await updater.stop()
+
+
+@pytest.mark.asyncio
+async def test_updater_without_ffmpeg_does_not_start_live_frame_loop():
+    updater = DashboardUpdater(_fake_settings())
+    await updater.start()
+    assert updater.live_frames._task is None  # noqa: SLF001
+    await updater.stop()
+
+
+def test_payload_fingerprint_changes_when_map_bytes_change():
+    from dashboard.models import DashboardPayload, ImageAsset
+
+    first = DashboardPayload(files=[ImageAsset("map.png", b"first")])
+    changed = DashboardPayload(files=[ImageAsset("map.png", b"second")])
+    assert _payload_fingerprint(first) != _payload_fingerprint(changed)
+
+
+def test_payload_fingerprint_ignores_render_timestamp_but_keeps_content():
+    from datetime import UTC, datetime, timedelta
+
+    import discord
+
+    from dashboard.models import DashboardPayload
+
+    first_embed = discord.Embed(title="Traffic")
+    first_embed.timestamp = datetime.now(UTC)
+    later_embed = discord.Embed(title="Traffic")
+    later_embed.timestamp = first_embed.timestamp + timedelta(seconds=10)
+    changed_embed = discord.Embed(title="Traffic changed")
+    changed_embed.timestamp = later_embed.timestamp
+
+    assert _payload_fingerprint(DashboardPayload(embeds=[first_embed])) == _payload_fingerprint(
+        DashboardPayload(embeds=[later_embed])
+    )
+    assert _payload_fingerprint(DashboardPayload(embeds=[later_embed])) != _payload_fingerprint(
+        DashboardPayload(embeds=[changed_embed])
+    )
 
 
 @pytest.mark.asyncio
@@ -489,6 +540,63 @@ async def test_collect_all_passes_only_anchored_affected_road_segments(
     else:
         assert calls == [(["clear water bay road"], *expected_anchor)]
         assert captured["affected_road_paths"] == [[(22.335, 114.26), (22.336, 114.261)]]
+
+
+@pytest.mark.asyncio
+async def test_collect_all_allows_explicit_short_subroad_for_landmark_notice(monkeypatch):
+    """A landmark-only notice may select a named short sub-road, not its parent road."""
+    import bot as bot_module
+    from dashboard.models import TrafficIncident
+
+    incident = TrafficIncident(
+        "IN-26-06242",
+        "Traffic incident",
+        "Lung Cheung Road flyover is closed",
+        "Lung Cheung Road",
+        "Choi Hung Estate",
+        "Mong Kok-bound",
+        "active",
+        near_landmark="Choi Hung Estate",
+    )
+    calls: list[tuple[list[str], float | None, float | None]] = []
+    captured: dict[str, object] = {}
+
+    class Roads:
+        def match(self, _text):
+            return ["lung cheung road flyover", "lung cheung road"]
+
+        def segments_near(self, keys, lat, lon):
+            calls.append((keys, lat, lon))
+            return [[(22.34, 114.20), (22.341, 114.201)]]
+
+    async def roads(*_args, **_kwargs):
+        return Roads()
+
+    async def transit(*_args, **_kwargs):
+        return ([], None, [])
+
+    async def weather(*_args, **_kwargs):
+        return (None, [], None)
+
+    async def traffic(*_args, **_kwargs):
+        return ([], [incident], [], None)
+
+    async def traffic_map(*_args, **kwargs):
+        captured.update(kwargs)
+        return (b"map", [])
+
+    from dashboard.providers import tracked_roads as tracked_roads_provider
+
+    monkeypatch.setattr(tracked_roads_provider, "fetch_tracked_roads", roads)
+    monkeypatch.setattr(bot_module.transit, "fetch_transit_etas", transit)
+    monkeypatch.setattr(bot_module.weather_provider, "fetch_weather_conditions", weather)
+    monkeypatch.setattr(bot_module.traffic_provider, "fetch_traffic_data", traffic)
+    monkeypatch.setattr(bot_module.maps, "fetch_traffic_map", traffic_map)
+
+    await bot_module.collect_all(object(), _fake_settings())
+
+    assert calls == [(["lung cheung road flyover"], None, None)]
+    assert captured["affected_road_paths"] == [[(22.34, 114.20), (22.341, 114.201)]]
 
 
 @pytest.mark.asyncio

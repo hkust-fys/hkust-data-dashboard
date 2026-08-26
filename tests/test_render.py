@@ -1,9 +1,11 @@
 """Renderer tests: payload composition, Discord limit enforcement, and the
 explicit display states (Unavailable / Stale / No matching notice)."""
 
+import io
 from datetime import timedelta
 
 import discord
+from PIL import Image
 
 from dashboard.models import (
     EtaKind,
@@ -189,6 +191,34 @@ def test_traffic_map_embed_omitted_without_png():
     from dashboard.render import _build_traffic_map_embed
 
     assert _build_traffic_map_embed(None, s.utc()) is None
+
+
+def test_build_payload_omits_map_legend_without_map():
+    payload = build_payload(
+        weather=None,
+        groups=[],
+        statuses=[],
+        incidents=[],
+        capture_time=s.utc(),
+        traffic_map_webp=None,
+    )
+    assert all(embed.title != "🗺️ Map legend" for embed in payload.embeds)
+    assert all(file.filename != "traffic-map-legend.png" for file in payload.files)
+
+
+def test_payload_keeps_one_map_attachment_before_traffic_news():
+    source = io.BytesIO()
+    Image.new("RGB", (960, 540), (80, 120, 160)).save(source, format="WEBP")
+    payload = build_payload(
+        weather=None, groups=[], statuses=[], incidents=[], capture_time=s.utc(),
+        traffic_map_webp=source.getvalue(), map_source_time=s.utc(),
+    )
+    assert [embed.title for embed in payload.embeds[:2]] == [
+        "🗺️ Traffic map", "🚦 Traffic news"
+    ]
+    assert len(payload.files) == 1
+    map_image = Image.open(io.BytesIO(payload.files[0].data))
+    assert map_image.size == (960, 540)
 
 
 def test_traffic_map_and_summary_label_stale_or_unavailable_data():

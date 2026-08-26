@@ -66,6 +66,40 @@ GMB_STOPS: dict[int, tuple[tuple[str, str, str, int, int], ...]] = {
 KMB_BASE = "https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{stop}"
 CTB_BASE = "https://rt.data.gov.hk/v2/transport/citybus/eta/CTB/{stop}/{route}"
 GMB_BASE = "https://data.etagmb.gov.hk/eta/stop/{stop}"
+GMB_COOLDOWN_SECONDS = 60.0
+_gmb_cooldown_until = 0.0
+
+
+class _GmbGateCache:
+    """Last-good gate ETAs, aged while the shared GMB origin is cooling down."""
+
+    TTL_SECONDS = 900.0
+
+    def __init__(self) -> None:
+        self._stored: tuple[float, list[EtaRow]] | None = None
+
+    def set(self, rows: list[EtaRow]) -> None:
+        self._stored = (time.monotonic(), list(rows))
+
+    def get(self) -> list[EtaRow]:
+        if self._stored is None:
+            return []
+        stamped, rows = self._stored
+        age_seconds = max(0.0, time.monotonic() - stamped)
+        if age_seconds > self.TTL_SECONDS:
+            self._stored = None
+            return []
+        elapsed_minutes = int(age_seconds // 60.0)
+        aged: list[EtaRow] = []
+        for row in rows:
+            if row.minutes is None:
+                aged.append(row)
+            elif row.minutes - elapsed_minutes >= 0:
+                aged.append(replace(row, minutes=row.minutes - elapsed_minutes))
+        return aged
+
+
+_gmb_gate_cache = _GmbGateCache()
 
 # ETA TTL is the provider cache window; the bot renders at its own cadence.
 TRANSIT_TTL_SECONDS = 25.0
@@ -212,9 +246,42 @@ async def _fetch_citybus(client: HttpClient, now: datetime) -> list[EtaRow]:
 
 
 async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
+    global _gmb_cooldown_until
+    if time.monotonic() < _gmb_cooldown_until:
+        log.info("GMB gate polling paused during rate-limit cooldown")
+        return _gmb_gate_cache.get()
     rows: list[EtaRow] = []
     urls = [GMB_BASE.format(stop=stop_id) for stop_id in GMB_STOPS]
-    responses = await _fetch_many_json(client, urls, "GMB")
+    unique_urls = list(dict.fromkeys(urls))
+    responses: dict[str, dict[str, Any]] = {}
+    failures: list[Exception] = []
+    for url in unique_urls:
+        if time.monotonic() < _gmb_cooldown_until:
+            log.info("GMB gate polling paused during rate-limit cooldown")
+            return _gmb_gate_cache.get()
+        try:
+            result = await client.fetch_json(url)
+        except FetchError as exc:
+            if exc.status_code == 403:
+                _gmb_cooldown_until = time.monotonic() + GMB_COOLDOWN_SECONDS
+                log.warning(
+                    "GMB ETA rate-limited (403); pausing gate and probe polling for %.0fs",
+                    GMB_COOLDOWN_SECONDS,
+                )
+                return _gmb_gate_cache.get()
+            failures.append(exc)
+            log.warning("GMB ETA request failed for %s: %s", url, exc)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            failures.append(exc)
+            log.warning("GMB ETA request failed for %s: %s", url, exc)
+            continue
+        if isinstance(result, dict):
+            responses[url] = result
+        else:
+            failures.append(TypeError("GMB ETA response was not an object"))
+    if not responses and failures:
+        raise failures[0]
     for stop_id, routes in GMB_STOPS.items():
         data = responses.get(GMB_BASE.format(stop=stop_id), {})
         entries = (data or {}).get("data", []) or []
@@ -273,6 +340,8 @@ async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
                             bound=f"seq-{seq}",
                         )
                     )
+    if not failures:
+        _gmb_gate_cache.set(rows)
     return rows
 
 
@@ -383,8 +452,9 @@ async def fetch_transit_etas(
 
 # Probe cache holds the last value per fetch group. The ceiling is deliberately
 # longer than a complete sweep so early and late groups coexist, while still
-# removing departed vehicles during a prolonged provider outage. Ten GMB
-# groups per cycle means a 15-minute ceiling covers a slow ten-cycle sweep.
+# removing departed vehicles during a prolonged provider outage. Fourteen GMB
+# groups per 10-second cycle cover the current 91-group set in about 70 seconds.
+# The 15-minute ceiling therefore still bounds prolonged outage staleness.
 PROBE_TTL_SECONDS = 900.0
 
 
@@ -469,9 +539,7 @@ _gmb_cursor = 0
 # data.etagmb.gov.hk rate-limits bursts with 403s. GMB groups are capped per
 # cycle and the whole GMB sweep backs off for a cooldown when a 403 appears;
 # the probe cache keeps last-good values meanwhile.
-GMB_GROUPS_PER_CYCLE = 10
-GMB_COOLDOWN_SECONDS = 180.0
-_gmb_cooldown_until = 0.0
+GMB_GROUPS_PER_CYCLE = 14
 
 
 async def _fetch_raw_stop_eta(client: HttpClient, probe) -> Any:
@@ -575,7 +643,7 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
 async def fetch_probe_etas(
     client: HttpClient,
     probes: Sequence[Any],
-    max_per_cycle: int = 60,
+    max_per_cycle: int = 36,
 ) -> list[ProbeEta]:
     """Poll up to ``max_per_cycle`` fetch groups round-robin; cache results.
 
@@ -644,15 +712,19 @@ async def fetch_probe_etas(
         _probe_cursor += 1
     async def refresh_group(group_key: str) -> bool:
         global _gmb_cooldown_until
+        if group_key.startswith("GMB:") and time.monotonic() < _gmb_cooldown_until:
+            return True
         probes_in_group = groups[group_key]
         now = datetime.now(UTC)
+        if group_key.startswith("GMB:") and time.monotonic() < _gmb_cooldown_until:
+            return True
         try:
             raw = await _fetch_raw_stop_eta(client, probes_in_group[0])
         except FetchError as exc:
-            if "HTTP 403" in str(exc) and group_key.startswith("GMB:"):
+            if exc.status_code == 403 and group_key.startswith("GMB:"):
                 _gmb_cooldown_until = time.monotonic() + GMB_COOLDOWN_SECONDS
                 log.warning(
-                    "GMB ETA rate-limited (403); pausing GMB probes for %.0fs",
+                    "GMB ETA rate-limited (403); pausing gate and probe polling for %.0fs",
                     GMB_COOLDOWN_SECONDS,
                 )
                 return True

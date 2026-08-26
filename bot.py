@@ -13,10 +13,13 @@ import argparse
 import asyncio
 import contextlib
 import copy
+import hashlib
 import inspect
 import io
+import json
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -137,7 +140,25 @@ async def collect_all(
                     getattr(incident, "between_landmark", "") or ""
                 ).strip()
                 if near_landmark or between_landmark:
-                    continue
+                    # A landmark-only notice may still name a specific short
+                    # sub-road (for example, "Lung Cheung Road flyover").
+                    # Permit the conservative whole-way fallback only for
+                    # that explicit refinement, never for the generic road.
+                    def _words(value: object) -> str:
+                        return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+                    road_words = _words(getattr(incident, "road", ""))
+                    text_words = _words(text)
+                    keys = [
+                        key
+                        for key in keys
+                        if (key_words := _words(key))
+                        and road_words
+                        and key_words.startswith(f"{road_words} ")
+                        and key_words in text_words
+                    ]
+                    if not keys:
+                        continue
                 latitude = longitude = None
             for path in segments_near(keys, latitude, longitude) or ():
                 normalized = tuple((float(lat), float(lon)) for lat, lon in path)
@@ -681,6 +702,34 @@ def discord_file(asset: ImageAsset) -> discord.File:
     return discord.File(io.BytesIO(asset.data), filename=asset.filename)
 
 
+def _payload_fingerprint(payload: DashboardPayload) -> str:
+    """Hash sent content, excluding render-time embed timestamps."""
+    embeds = []
+    for embed in payload.embeds:
+        if embed is None:
+            continue
+        as_dict = embed.to_dict() if hasattr(embed, "to_dict") else embed
+        if isinstance(as_dict, dict):
+            # ``build_payload`` stamps each render with ``checked_at``.  The
+            # timestamp is useful to display, but should not defeat dedup when
+            # all source content and attachments are unchanged.
+            as_dict = dict(as_dict)
+            as_dict.pop("timestamp", None)
+        embeds.append(as_dict)
+    files = [
+        {"filename": asset.filename, "content_type": asset.content_type,
+         "data_sha256": hashlib.sha256(asset.data).hexdigest()}
+        for asset in payload.files
+    ]
+    serialized = json.dumps(
+        {"embeds": embeds, "files": files},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
 async def _apply_payload(message, payload: DashboardPayload, view=None) -> None:
     """Edit embeds + attachments atomically; replace images to avoid CDN cache."""
     embeds = [e for e in payload.embeds if e is not None]
@@ -721,6 +770,7 @@ class DashboardUpdater:
         self.session = None
         self.client: HttpClient | None = None
         self._last_good_payload: DashboardPayload | None = None
+        self._last_payload_fingerprint: str | None = None
         self._snapshot: CollectionSnapshot | None = None
         self._collection_task: asyncio.Task | None = None
         self._collection_generation = 0
@@ -752,7 +802,11 @@ class DashboardUpdater:
             self.client = HttpClient(
                 self.session, timeout_seconds=self.settings.http_timeout_seconds
             )
-            self.live_frames.start(self)
+            # Camera decoding is unavailable in dry-run/test configurations
+            # without the preflight-resolved ffmpeg executable.  Do not start
+            # a retry loop that can only emit repeated assertion warnings.
+            if self.settings.ffmpeg_executable:
+                self.live_frames.start(self)
             self._running = True
             self._loop_task = asyncio.create_task(self._update_loop(channel))
 
@@ -934,8 +988,11 @@ class DashboardUpdater:
             self._message = await _ensure_dashboard_message(
                 channel, payload, view=self.live_view
             )
+        fingerprint = _payload_fingerprint(payload)
         try:
-            await _apply_payload(self._message, payload, view=self.live_view)
+            if fingerprint != self._last_payload_fingerprint:
+                await _apply_payload(self._message, payload, view=self.live_view)
+                self._last_payload_fingerprint = fingerprint
             self._last_good_payload = payload
         except Exception as exc:  # noqa: BLE001
             log.warning("edit failed (keeping last good): %s", exc)

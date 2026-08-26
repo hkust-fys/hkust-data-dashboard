@@ -18,7 +18,7 @@ def test_settings_from_env_valid(monkeypatch):
     assert settings.discord_token == "abc"
     assert settings.announce_channel_id == 12345
     assert settings.dashboard_message_id is None
-    assert settings.update_interval_seconds == 15
+    assert settings.update_interval_seconds == 10
 
 
 def test_settings_missing_required_keys(monkeypatch):
@@ -62,6 +62,6 @@ def test_settings_invalid_channel_id(monkeypatch):
 def test_settings_invalid_interval(monkeypatch):
     monkeypatch.setenv("DISCORD_TOKEN", "t")
     monkeypatch.setenv("ANNOUNCE_CHANNEL_ID", "1")
-    monkeypatch.setenv("UPDATE_INTERVAL_SECONDS", "14")  # below minimum 15
+    monkeypatch.setenv("UPDATE_INTERVAL_SECONDS", "9")  # below minimum 10
     with pytest.raises(ConfigError):
         Settings.from_env()

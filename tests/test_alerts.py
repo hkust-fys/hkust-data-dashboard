@@ -4,7 +4,6 @@ from dashboard.alerts import (
     CRITICAL_WARNING_CODES,
     AlertMonitor,
     _family_of,
-    _warning_name,
 )
 from dashboard.models import (
     Roadwork,
@@ -18,7 +17,13 @@ from tests.fixtures import sample_data as s
 
 
 def _warning(code: str) -> WeatherWarning:
-    return WeatherWarning(code=code, name=_warning_name(code))
+    names = {
+        "TC1": "Standby Signal No. 1", "TC8NE": "Gale Signal No. 8 NE",
+        "WRAINA": "Amber Rainstorm", "WRAINR": "Red Rainstorm",
+        "WRAINB": "Black Rainstorm", "TC8PRE": "Pre-No. 8 Special Announcement",
+        "WHOT": "Very Hot Weather",
+    }
+    return WeatherWarning(code=code, name=names.get(code, code))
 
 
 def _status(name: str, band: SpeedBand, speed: float | None = None) -> TrafficCorridorStatus:
@@ -93,6 +98,13 @@ def test_cancel_posts_event():
     assert "cancelled" in events[0].text
     assert events[0].critical  # black rainstorm removal is prominent (no ping)
     assert mon.ping_for(events[0], role_id=123456789) == events[0].text
+
+
+def test_cancel_uses_last_source_name():
+    mon = AlertMonitor()
+    mon.update([WeatherWarning(code="WRAINA", name="Amber Rainstorm Warning Signal")], [])
+    events = mon.update([], [])
+    assert events and "Amber Rainstorm Warning Signal" in events[0].text
 
 
 def test_pre_no8_announcement_is_critical_code():

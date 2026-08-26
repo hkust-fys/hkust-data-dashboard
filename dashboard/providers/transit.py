@@ -68,6 +68,12 @@ CTB_BASE = "https://rt.data.gov.hk/v2/transport/citybus/eta/CTB/{stop}/{route}"
 GMB_BASE = "https://data.etagmb.gov.hk/eta/stop/{stop}"
 GMB_COOLDOWN_SECONDS = 60.0
 _gmb_cooldown_until = 0.0
+# The provider tolerates twenty sequential GMB requests in a normal cycle in
+# current observations.  Keep the live limit process-local: a 403 lowers it
+# for the remainder of this process, while a restart restores the initial
+# value.  The cooldown timestamp also acts as the 403 episode marker, so two
+# requests already in flight cannot double-decrement the limit.
+GMB_GROUPS_PER_CYCLE = 20
 
 
 class _GmbGateCache:
@@ -246,7 +252,6 @@ async def _fetch_citybus(client: HttpClient, now: datetime) -> list[EtaRow]:
 
 
 async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
-    global _gmb_cooldown_until
     if time.monotonic() < _gmb_cooldown_until:
         log.info("GMB gate polling paused during rate-limit cooldown")
         return _gmb_gate_cache.get()
@@ -263,11 +268,7 @@ async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
             result = await client.fetch_json(url)
         except FetchError as exc:
             if exc.status_code == 403:
-                _gmb_cooldown_until = time.monotonic() + GMB_COOLDOWN_SECONDS
-                log.warning(
-                    "GMB ETA rate-limited (403); pausing gate and probe polling for %.0fs",
-                    GMB_COOLDOWN_SECONDS,
-                )
+                _record_gmb_403()
                 return _gmb_gate_cache.get()
             failures.append(exc)
             log.warning("GMB ETA request failed for %s: %s", url, exc)
@@ -452,8 +453,9 @@ async def fetch_transit_etas(
 
 # Probe cache holds the last value per fetch group. The ceiling is deliberately
 # longer than a complete sweep so early and late groups coexist, while still
-# removing departed vehicles during a prolonged provider outage. Fourteen GMB
-# groups per 10-second cycle cover the current 91-group set in about 70 seconds.
+# removing departed vehicles during a prolonged provider outage. Twenty GMB
+# groups per 10-second cycle cover the current 91-group set in about 50 seconds
+# until any 403 response steps the live limit down.
 # The 15-minute ceiling therefore still bounds prolonged outage staleness.
 PROBE_TTL_SECONDS = 900.0
 
@@ -538,8 +540,34 @@ _gmb_cursor = 0
 
 # data.etagmb.gov.hk rate-limits bursts with 403s. GMB groups are capped per
 # cycle and the whole GMB sweep backs off for a cooldown when a 403 appears;
-# the probe cache keeps last-good values meanwhile.
-GMB_GROUPS_PER_CYCLE = 14
+# the probe cache keeps last-good values meanwhile. A 403 also steps the
+# process-local batch limit down, with no automatic recovery until restart.
+_GMB_BATCH_STEP = 3
+_GMB_BATCH_FLOOR = 5
+
+
+def _record_gmb_403() -> None:
+    """Enter the shared cooldown and reduce the next probe batch once.
+
+    This is deliberately synchronous: the gate and probe fetchers run on the
+    same event loop, so the first 403 sets the episode marker before another
+    in-flight request can handle its own 403.
+    """
+    global GMB_GROUPS_PER_CYCLE, _gmb_cooldown_until
+    now = time.monotonic()
+    if now < _gmb_cooldown_until:
+        return
+    old_limit = GMB_GROUPS_PER_CYCLE
+    new_limit = max(_GMB_BATCH_FLOOR, old_limit - _GMB_BATCH_STEP)
+    GMB_GROUPS_PER_CYCLE = new_limit
+    _gmb_cooldown_until = now + GMB_COOLDOWN_SECONDS
+    log.warning(
+        "GMB ETA rate-limited (403); reducing probe batch limit %d -> %d "
+        "and pausing gate and probe polling for %.0fs",
+        old_limit,
+        new_limit,
+        GMB_COOLDOWN_SECONDS,
+    )
 
 
 async def _fetch_raw_stop_eta(client: HttpClient, probe) -> Any:
@@ -654,7 +682,7 @@ async def fetch_probe_etas(
     per cycle and the GMB sweep backs off for a cooldown when the host
     rate-limits (HTTP 403), serving last-good cache meanwhile.
     """
-    global _probe_cursor, _gmb_cursor, _gmb_cooldown_until
+    global _probe_cursor, _gmb_cursor
     if not probes:
         return []
     unique: dict[str, Any] = {}
@@ -692,9 +720,12 @@ async def fetch_probe_etas(
     gmb_window = min(GMB_GROUPS_PER_CYCLE, cycle_budget, len(gmb))
     selected_gmb: list[str] = []
     if gmb_window:
-        gmb_start = (_gmb_cursor * gmb_window) % len(gmb)
+        # Store an absolute offset rather than a cycle number.  Otherwise a
+        # 403-driven window change (for example 20 -> 17) would move the next
+        # start backwards and immediately repeat three just-polled groups.
+        gmb_start = _gmb_cursor % len(gmb)
         selected_gmb = [gmb[(gmb_start + i) % len(gmb)] for i in range(gmb_window)]
-        _gmb_cursor += 1
+        _gmb_cursor = (gmb_start + gmb_window) % len(gmb)
     if not other and not selected_gmb:
         return [
             eta
@@ -722,11 +753,7 @@ async def fetch_probe_etas(
             raw = await _fetch_raw_stop_eta(client, probes_in_group[0])
         except FetchError as exc:
             if exc.status_code == 403 and group_key.startswith("GMB:"):
-                _gmb_cooldown_until = time.monotonic() + GMB_COOLDOWN_SECONDS
-                log.warning(
-                    "GMB ETA rate-limited (403); pausing gate and probe polling for %.0fs",
-                    GMB_COOLDOWN_SECONDS,
-                )
+                _record_gmb_403()
                 return True
             else:
                 log.warning(

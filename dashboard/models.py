@@ -119,6 +119,7 @@ class WeatherWarning:
     summary: str = ""
     action: str = ""
     icon_url: str = ""
+    icon_data: bytes = b""
     issued_at: datetime | None = None
 
 

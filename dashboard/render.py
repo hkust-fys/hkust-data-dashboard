@@ -7,9 +7,11 @@ fields/embed, 6000 aggregate chars/embed, 10 embeds/files per message.
 
 from __future__ import annotations
 
+import io
 from datetime import UTC, datetime
 
 import discord
+from PIL import Image, UnidentifiedImageError
 
 from dashboard.models import (
     DashboardPayload,
@@ -21,6 +23,7 @@ from dashboard.models import (
     TrafficCorridorStatus,
     TrafficIncident,
     WeatherConditions,
+    WeatherWarning,
 )
 
 # Discord limits (from the discord.py docs).
@@ -149,26 +152,56 @@ def _has_departures(group: RouteEtaGroup) -> bool:
 # Embed builders (each returns a list of embed "parts" to respect limits)
 # --------------------------------------------------------------------------
 
+def _display_weather_warnings(
+    weather: WeatherConditions | None,
+) -> list[WeatherWarning]:
+    """Return active warnings in the provider's importance order."""
+    if weather is None:
+        return []
+    return list(weather.warnings or [])
+
+
+def _build_warning_icon_strip(weather: WeatherConditions | None) -> bytes | None:
+    """Combine all available official warning icons into one compact thumbnail."""
+    tiles: list[Image.Image] = []
+    for warning in _display_weather_warnings(weather):
+        if not warning.icon_data:
+            continue
+        try:
+            with Image.open(io.BytesIO(warning.icon_data)) as source:
+                icon = source.convert("RGBA")
+        except (OSError, UnidentifiedImageError):
+            continue
+        icon.thumbnail((64, 64), Image.Resampling.LANCZOS)
+        tile = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        tile.alpha_composite(icon, ((64 - icon.width) // 2, (64 - icon.height) // 2))
+        tiles.append(tile)
+    if not tiles:
+        return None
+
+    strip = Image.new("RGBA", (64 * len(tiles), 64), (0, 0, 0, 0))
+    for index, tile in enumerate(tiles):
+        strip.alpha_composite(tile, (index * 64, 0))
+    output = io.BytesIO()
+    strip.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
 def _build_weather_embed(weather: WeatherConditions | None) -> discord.Embed | None:
     if weather is None:
         return None
-    warnings = weather.warnings or []
+    warnings = _display_weather_warnings(weather)
     snap = weather.snapshot
 
     lines: list[str] = []
     thumbnail: str | None = None
     if warnings:
-        # show every active warning icon inline (an embed has only one
-        # thumbnail slot, so icons are embedded in the text)
+        # Discord has one thumbnail slot; keep the first official icon visible
+        # and leave all warning names inline in the description.
         icons = [w.icon_url for w in warnings if w.icon_url]
-        if len(icons) == 1:
+        if icons:
             thumbnail = icons[0]
-        elif icons:
-            lines.append(" ".join(f"[!]({u})" for u in icons))
         for w in warnings:
             line = _esc(w.name)
-            if w.summary:
-                line += f" — {_esc(w.summary)}"
             if w.issued_at:
                 # Relative timestamps keep the warning line readable across
                 # midnight (Discord renders nearby dates as “today”/
@@ -454,6 +487,18 @@ def build_payload(
     # 4. Weather
     weather_embed = _build_weather_embed(weather)
     if weather_embed is not None:
+        warning_icon_strip = _build_warning_icon_strip(weather)
+        if warning_icon_strip:
+            weather_embed.set_thumbnail(url="attachment://hko-warnings.png")
+            payload.files.append(
+                ImageAsset(
+                    filename="hko-warnings.png",
+                    data=warning_icon_strip,
+                    content_type="image/png",
+                    label="HKO warning icons",
+                    source_time=weather.warning_time if weather else None,
+                )
+            )
         payload.embeds.append(weather_embed)
 
     # 5. Source errors — visible so an unavailable provider is never silent.

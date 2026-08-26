@@ -37,37 +37,6 @@ CRITICAL_WARNING_CODES: frozenset[str] = frozenset(
 CONGESTION_RED_TICKS_REQUIRED = 2
 CONGESTION_COOLDOWN_SECONDS = 45 * 60.0
 
-# Friendly names so alerts read well even after a warning is removed
-# (mirrors the HKO code->name map in the weather provider).
-WARNING_NAMES: dict[str, str] = {
-    "TC1": "Standby Signal No. 1",
-    "TC3": "Strong Wind Signal No. 3",
-    "TC8NE": "Gale Signal No. 8 NE",
-    "TC8NW": "Gale Signal No. 8 NW",
-    "TC8SE": "Gale Signal No. 8 SE",
-    "TC8SW": "Gale Signal No. 8 SW",
-    "TC9": "Gale Signal No. 9",
-    "TC10": "Hurricane Signal No. 10",
-    "TC8PRE": "Pre-No. 8 Special Announcement",
-    "WRAINA": "Amber Rainstorm",
-    "WRAINR": "Red Rainstorm",
-    "WRAINB": "Black Rainstorm",
-    "WTS": "Thunderstorm Warning",
-    "WL": "Landslip Warning",
-    "WFIRER": "Red Fire Danger",
-    "WFIREY": "Yellow Fire Danger",
-    "WHOT": "Very Hot Weather",
-    "WCOLD": "Cold Weather Warning",
-    "WMSGNL": "Strong Monsoon Signal",
-    "WFROST": "Frost Warning",
-    "WTM": "Tsunami Warning",
-}
-
-
-def _warning_name(code: str) -> str:
-    return WARNING_NAMES.get(code, code)
-
-
 def _family_of(code: str) -> str:
     """Group related warning codes so escalations read as upgrades:
     TC1/TC3/TC8*/TC9/TC10 -> "TC", WRAINA/WRAINR/WRAINB -> "WRAIN"."""
@@ -85,6 +54,7 @@ class AlertState:
     """Last-known signal state, used to detect transitions."""
 
     warning_codes: frozenset[str] = frozenset()
+    warning_names: dict[str, str] = field(default_factory=dict)
     traffic_incidents: frozenset[str] = frozenset()
     roadworks: frozenset[str] = frozenset()
     roadwork_labels: dict[str, str] = field(default_factory=dict)
@@ -125,7 +95,7 @@ class AlertMonitor:
         removed = old_codes - new_codes
         for code in sorted(hoisted):
             w = next((x for x in warnings if x.code == code), None)
-            name = _warning_name(w.name if w else code)
+            name = w.name if w else code
             critical = code in CRITICAL_WARNING_CODES
             # if the same family had a lower level before, this is an upgrade
             family = _family_of(code)
@@ -139,7 +109,7 @@ class AlertMonitor:
                 )
             )
         for code in sorted(removed):
-            name = _warning_name(code)
+            name = self.state.warning_names.get(code, code)
             critical = code in CRITICAL_WARNING_CODES
             family = _family_of(code)
             downgraded = any(_family_of(c) == family for c in hoisted)
@@ -299,6 +269,7 @@ class AlertMonitor:
             + self._congestion_events(statuses, now)
         )
         self.state.warning_codes = frozenset(w.code for w in warnings)
+        self.state.warning_names = {w.code: w.name for w in warnings}
         self.state.traffic_incidents = frozenset(
             incident.identifier or incident.title for incident in current_incidents
         )

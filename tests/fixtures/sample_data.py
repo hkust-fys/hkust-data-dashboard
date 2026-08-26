@@ -179,10 +179,15 @@ def hko_rhrread() -> dict:
     }
 
 
-def hko_warnsum(active: tuple[str, ...] = ("TC", "RAIN")) -> dict:
+def hko_warnsum(active: tuple[str, ...] = ("TC3", "WRAINA")) -> dict:
     result: dict = {"updateTime": utc().isoformat()}
     for code in active:
-        result[code] = {"code": code, "issueDateTime": utc().isoformat()}
+        result["TC" if code.startswith("TC") else "WRAIN"] = {
+            "code": code,
+            "type": "Strong Wind Signal No. 3" if code == "TC3" else "Amber",
+            "name": "Tropical Cyclone Warning Signal" if code == "TC3" else "Rainstorm Warning Signal",
+            "issueTime": utc().isoformat(), "updateTime": utc().isoformat(),
+        }
     return result
 
 
@@ -190,8 +195,42 @@ def hko_warning_info() -> dict:
     return {
         "details": {
             "TC": {"summary": "Tropical Cyclone Warning", "action": "Stay indoors"},
-            "RAIN": {"summary": "Amber Rainstorm", "action": ""},
+            "WRAIN": {"summary": "Amber Rainstorm Warning Signal", "action": ""},
         }
+    }
+
+
+def hko_warnsum_wrain_live() -> dict:
+    """Sanitized live-shaped warnsum: family key differs from canonical code."""
+    return {"WRAIN": {
+        "code": "WRAINA", "name": "Rainstorm Warning Signal", "type": "Amber",
+        "issueTime": utc().isoformat(), "updateTime": utc().isoformat(),
+    }}
+
+
+def hko_warning_info_list() -> dict:
+    return {
+        "details": [
+            {
+                "warningStatementCode": "WRAIN",
+                "subtype": "WRAINA",
+                "contents": ["Amber Rainstorm Warning Signal"],
+                "updateTime": utc().isoformat(),
+            }
+        ]
+    }
+
+
+def hko_warntoday_wrain() -> dict:
+    return {
+        "WARNING_DATABASE": [
+            {
+                "WarningCode": "WRAINA",
+                "WarningName": "Rainstorm Warning Signal",
+                "Type": "Amber",
+                "Icon": "/images_e/raina.gif",
+            }
+        ]
     }
 
 

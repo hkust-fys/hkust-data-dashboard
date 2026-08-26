@@ -26,6 +26,12 @@ from dashboard.render import (
 from tests.fixtures import sample_data as s
 
 
+def _icon_png(color: tuple[int, int, int, int]) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGBA", (32, 32), color).save(output, format="PNG")
+    return output.getvalue()
+
+
 def test_eta_cell_highlight_and_markers():
     # cells are plain text for code blocks, number LEFT-padded to 2 chars
     # (right-aligned) + symbol in the 3rd char: * = scheduled, no bold/◀.
@@ -389,9 +395,7 @@ def test_traffic_summary_ignores_detector_statuses_and_color():
 
 
 def test_weather_embed_multiple_warning_icons():
-    """With several active warnings, each icon renders inline in the text
-    (an embed has only one thumbnail slot, so the first icon is used only
-    when there is a single warning)."""
+    """The first available official warning icon is the thumbnail."""
     from dashboard.models import WeatherConditions, WeatherWarning
     from dashboard.render import _build_weather_embed
 
@@ -404,14 +408,100 @@ def test_weather_embed_multiple_warning_icons():
     embed = _build_weather_embed(WeatherConditions(warnings=warnings))
     assert embed is not None
     value = embed.description
-    assert "tc8ne.issuing.gif" in value
-    assert "rainb.issuing.gif" in value
+    assert "tc8ne.issuing.gif" not in value
+    assert "rainb.issuing.gif" not in value
     assert "Gale Signal No. 8 NE" in value  # warning name is inline text, not a title
-    assert not embed.thumbnail.url  # multiple icons -> no single thumbnail
+    assert embed.thumbnail.url.endswith("tc8ne.issuing.gif")
 
     single = _build_weather_embed(WeatherConditions(warnings=warnings[:1]))
     assert single.thumbnail is not None
     assert single.thumbnail.url.endswith("tc8ne.issuing.gif")
+
+
+def test_weather_embed_omits_long_warning_statement():
+    from dashboard.models import WeatherConditions, WeatherWarning
+    from dashboard.render import _build_weather_embed
+
+    embed = _build_weather_embed(WeatherConditions(warnings=[WeatherWarning(
+        code="WRAINA",
+        name="Amber Rainstorm Warning Signal",
+        summary="A deliberately long HKO warning statement that belongs on the source page.",
+    )]))
+
+    assert embed is not None
+    assert "Amber Rainstorm Warning Signal" in embed.description
+    assert "deliberately long" not in embed.description
+
+
+def test_weather_embed_shows_all_warnings_once_in_one_icon_strip():
+    from dashboard.models import WeatherConditions, WeatherWarning
+    from dashboard.render import build_payload
+
+    weather = WeatherConditions(warnings=[
+        WeatherWarning("WRAINA", "Amber Rainstorm Warning Signal",
+                       icon_url="https://www.hko.gov.hk/images_e/raina.gif",
+                       icon_data=_icon_png((255, 191, 0, 255))),
+        WeatherWarning("WTS", "Thunderstorm Warning",
+                       icon_url="https://www.hko.gov.hk/images_e/ts.gif",
+                       icon_data=_icon_png((0, 0, 255, 255))),
+        WeatherWarning("TC3", "Strong Wind Signal No. 3",
+                       icon_url="https://www.hko.gov.hk/images_e/tc3.gif",
+                       icon_data=_icon_png((255, 0, 0, 255))),
+    ])
+
+    payload = build_payload(weather, [], [], [], None, None)
+    descriptions = "\n".join(embed.description or "" for embed in payload.embeds)
+
+    assert descriptions.count("Strong Wind Signal No. 3") == 1
+    assert descriptions.count("Amber Rainstorm Warning Signal") == 1
+    assert descriptions.count("Thunderstorm Warning") == 1
+    assert [embed.thumbnail.url for embed in payload.embeds if embed.thumbnail] == [
+        "attachment://hko-warnings.png",
+    ]
+    assert [asset.filename for asset in payload.files] == ["hko-warnings.png"]
+    strip = Image.open(io.BytesIO(payload.files[0].data))
+    assert strip.size == (192, 64)
+
+
+def test_build_payload_combines_warning_icons_in_one_thumbnail():
+    from dashboard.models import WeatherConditions, WeatherWarning
+    from dashboard.render import build_payload
+
+    weather = WeatherConditions(warnings=[
+        WeatherWarning("TC8NE", "Gale Signal No. 8 NE",
+                       icon_url="https://hko.example/tc8.gif",
+                       icon_data=_icon_png((255, 0, 0, 255))),
+        WeatherWarning("WRAINA", "Amber Rainstorm Warning Signal",
+                       icon_url="https://hko.example/rain.gif",
+                       icon_data=_icon_png((255, 191, 0, 255))),
+    ])
+    payload = build_payload(weather, [], [], [], None, None)
+    weather_embeds = [e for e in payload.embeds if e.thumbnail]
+    assert [e.thumbnail.url for e in weather_embeds] == [
+        "attachment://hko-warnings.png"
+    ]
+    assert len(payload.files) == 1
+    strip = Image.open(io.BytesIO(payload.files[0].data))
+    assert strip.size == (128, 64)
+    assert "[!]" not in "\n".join(e.description or "" for e in payload.embeds)
+
+
+def test_warning_icons_use_one_meaningful_embed_without_displacing_transit():
+    from dashboard.models import WeatherConditions, WeatherWarning
+    from dashboard.render import build_payload
+
+    weather = WeatherConditions(warnings=[
+        WeatherWarning(
+            f"TC{i}", f"Warning {i}", icon_url=f"https://hko.example/{i}.gif",
+            icon_data=_icon_png((i * 20, 0, 0, 255)),
+        )
+        for i in range(8)
+    ])
+    payload = build_payload(weather, s.route_groups(), [], [], None, None)
+    thumbnails = [e.thumbnail.url for e in payload.embeds if e.thumbnail]
+    assert thumbnails == ["attachment://hko-warnings.png"]
+    assert sum("Warning " in (e.description or "") for e in payload.embeds) == 1
+    assert any(e.title == "🚌 Bus stops" for e in payload.embeds)
 
 
 def test_weather_embed_title_reading_and_issued_timestamps():

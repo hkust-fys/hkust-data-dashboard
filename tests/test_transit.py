@@ -23,6 +23,7 @@ from tests.fixtures import sample_data as s
 def _reset_gmb_state(monkeypatch):
     """Keep shared gate/probe cooldown and caches isolated between tests."""
     monkeypatch.setattr(transit, "_gmb_cooldown_until", 0.0)
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 20)
     transit._gmb_gate_cache._stored = None  # noqa: SLF001
     transit._probe_cache._store.clear()  # noqa: SLF001
 
@@ -81,11 +82,62 @@ async def test_gmb_probe_cap_rotates_across_all_groups(monkeypatch):
     monkeypatch.setattr(transit, "_gmb_cursor", 0)
     monkeypatch.setattr(transit, "_probe_cursor", 0)
     monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
-    # Fourteen GMB groups per cycle require three cycles to cover all 35.
+    # Twenty GMB groups per cycle require three cycles to cover all 35.
     for _ in range(3):
         await transit.fetch_probe_etas(object(), probes)
 
     assert set(calls) == {f"stop-{index}" for index in range(35)}
+
+
+@pytest.mark.asyncio
+async def test_gmb_probe_default_batch_limit_is_twenty(monkeypatch):
+    probes = [
+        SimpleNamespace(
+            operator="GMB", route=f"R{index}", bound="seq-1", stop_id=f"stop-{index}",
+            route_id=1, sequence=1, index=0,
+        )
+        for index in range(25)
+    ]
+    calls: list[str] = []
+
+    async def fetch(_client, probe):
+        calls.append(probe.stop_id)
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit.fetch_probe_etas(object(), probes)
+
+    assert len(calls) == 20
+
+
+@pytest.mark.asyncio
+async def test_gmb_probe_rotation_continues_after_batch_reduction(monkeypatch):
+    probes = [
+        SimpleNamespace(
+            operator="GMB", route=f"R{index}", bound="seq-1", stop_id=f"stop-{index}",
+            route_id=1, sequence=1, index=0,
+        )
+        for index in range(40)
+    ]
+    calls: list[str] = []
+
+    async def fetch(_client, probe):
+        calls.append(probe.stop_id)
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
+    monkeypatch.setattr(transit, "_gmb_cursor", 0)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+
+    await transit.fetch_probe_etas(object(), probes)
+    first_batch = set(calls)
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 17)
+    await transit.fetch_probe_etas(object(), probes)
+    second_batch = set(calls[20:])
+
+    assert len(first_batch) == 20
+    assert len(second_batch) == 17
+    assert first_batch.isdisjoint(second_batch)
 
 
 @pytest.mark.asyncio
@@ -138,6 +190,22 @@ async def test_gmb_probe_sweep_stops_after_first_403(monkeypatch):
 
     assert len(calls) == 1
     assert transit._gmb_cooldown_until > transit.time.monotonic()  # noqa: SLF001
+    assert transit.GMB_GROUPS_PER_CYCLE == 17
+
+
+def test_gmb_403_decrements_once_per_cooldown_episode(monkeypatch):
+    transit._record_gmb_403()
+    assert transit.GMB_GROUPS_PER_CYCLE == 17
+    transit._record_gmb_403()
+    assert transit.GMB_GROUPS_PER_CYCLE == 17
+
+
+def test_gmb_403_reduces_after_each_cooldown_and_stops_at_floor(monkeypatch):
+    expected = [17, 14, 11, 8, 5, 5]
+    for limit in expected:
+        transit._record_gmb_403()
+        assert limit == transit.GMB_GROUPS_PER_CYCLE
+        monkeypatch.setattr(transit, "_gmb_cooldown_until", 0.0)
 
 
 class _StubClient:
@@ -330,6 +398,7 @@ async def test_concurrent_gate_and_probe_403_stop_followup_calls():
     # One request may already be in flight on the other path; neither path
     # may start a second request after the shared cooldown is set.
     assert len(calls) <= 2
+    assert transit.GMB_GROUPS_PER_CYCLE == 17
 
 
 def test_gmb_config_has_both_gates_and_verified_stops():

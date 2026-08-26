@@ -2,6 +2,7 @@
 
 from dashboard.alerts import (
     CRITICAL_WARNING_CODES,
+    ROAD_ALERT_COOLDOWN_SECONDS,
     AlertMonitor,
     _family_of,
 )
@@ -150,12 +151,78 @@ def test_congestion_cooldown_suppresses_repeat_ping():
     assert len(first) == 1
     # stays red: active, no repeat
     assert mon.update([], [slow]) == []
-    # clears, then jams again within the cooldown: no new ping
+    # clears, then jams again within the cooldown: thread update is retained,
+    # but the repeated role ping is suppressed.
     clear = _status("Clear Water Bay Road", SpeedBand.GREEN, speed=60)
     cleared = mon.update([], [clear])
     assert len(cleared) == 1 and "easing" in cleared[0].text
     assert mon.update([], [slow]) == []
-    assert mon.update([], [slow]) == []
+    repeated = mon.update([], [slow])
+    assert len(repeated) == 1 and not repeated[0].ping
+
+
+def test_one_hour_road_alert_cooldown_is_shared_across_sources(monkeypatch):
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    clock = [1000.0]
+    monkeypatch.setattr("dashboard.alerts.time.monotonic", lambda: clock[0])
+    mon = AlertMonitor(roads=fallback_roads())
+    incident = TrafficIncident(
+        "td-cwb", "Incident on Clear Water Bay Road", "", "Clear Water Bay Road",
+        "", "", "active",
+    )
+    slow = _status("Clear Water Bay Road", SpeedBand.RED, speed=10)
+    clear = _status("Clear Water Bay Road", SpeedBand.GREEN, speed=60)
+    mon.update([], [])
+
+    news = mon.update([], [], [incident])
+    assert len(news) == 1 and news[0].ping
+    mon.update([], [slow], [incident])
+    congestion = mon.update([], [slow], [incident])
+    assert len(congestion) == 1 and "Heavy congestion" in congestion[0].text
+    assert not congestion[0].ping  # traffic news shadows detector ping on same road
+
+    mon.update([], [clear], [])
+    clock[0] += ROAD_ALERT_COOLDOWN_SECONDS + 1
+    mon.update([], [slow], [])
+    later = mon.update([], [slow], [])
+    assert len(later) == 1 and later[0].ping
+
+    reverse = AlertMonitor(roads=fallback_roads())
+    new_cwb_slow = _status("New Clear Water Bay Road", SpeedBand.RED, speed=9)
+    new_cwb_news = TrafficIncident(
+        "td-new-cwb", "Incident on New Clear Water Bay Road", "",
+        "New Clear Water Bay Road", "", "", "active",
+    )
+    reverse.update([], [])
+    reverse.update([], [new_cwb_slow])
+    detector = reverse.update([], [new_cwb_slow])
+    assert len(detector) == 1 and detector[0].ping
+    news_after_detector = reverse.update([], [new_cwb_slow], [new_cwb_news])
+    assert len(news_after_detector) == 1 and not news_after_detector[0].ping
+
+
+def test_roadwork_does_not_consume_road_alert_cooldown():
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    mon = AlertMonitor(roads=fallback_roads())
+    roadwork = Roadwork("rw-1", "Works", "Clear Water Bay Road")
+    incident = TrafficIncident(
+        "td-cwb", "Incident on Clear Water Bay Road", "", "Clear Water Bay Road",
+        "", "", "active",
+    )
+    mon.update([], [], [], [])
+    assert mon.update([], [], [], [roadwork])
+    news = mon.update([], [], [incident], [roadwork])
+    assert len(news) == 1 and news[0].ping
+
+
+def test_congestion_alerts_watch_only_two_clear_water_bay_roads():
+    mon = AlertMonitor()
+    other = _status("Lung Cheung Road", SpeedBand.RED, speed=10)
+    mon.update([], [])
+    mon.update([], [other])
+    assert mon.update([], [other]) == []
 
 
 def test_congestion_alert_names_affected_routes():
@@ -206,6 +273,53 @@ def test_relevant_td_traffic_notice_posts_and_clears():
     events = mon.update([], [], [])
     assert len(events) == 1
     assert "TD traffic notice cleared" in events[0].text
+
+
+def test_priority_road_traffic_news_pings_only_when_new():
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    for road in ("Clear Water Bay Road", "New Clear Water Bay Road"):
+        mon = AlertMonitor(roads=fallback_roads())
+        incident = TrafficIncident(
+            identifier=f"td-{road}",
+            title=f"Lane closure on {road}",
+            description="One lane closed",
+            road=road,
+            location="",
+            direction="eastbound",
+            status="active",
+        )
+        mon.update([], [], [])
+
+        posted = mon.update([], [], [incident])
+        assert len(posted) == 1 and posted[0].ping
+        assert "<@&123456789>" in mon.ping_for(posted[0], role_id=123456789)
+
+        cleared = mon.update([], [], [])
+        assert len(cleared) == 1 and not cleared[0].ping
+        assert "<@&123456789>" not in mon.ping_for(cleared[0], role_id=123456789)
+
+
+def test_other_traffic_news_and_roadworks_do_not_ping():
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    mon = AlertMonitor(roads=fallback_roads())
+    mon.update([], [], [], [])
+    incident = TrafficIncident(
+        identifier="td-lung-cheung",
+        title="Lane closure on Lung Cheung Road",
+        description="One lane closed",
+        road="Lung Cheung Road",
+        location="",
+        direction="eastbound",
+        status="active",
+    )
+    roadwork = Roadwork("rw-cwb", "Works on Clear Water Bay Road", "Clear Water Bay Road")
+
+    events = mon.update([], [], [incident], [roadwork])
+
+    assert len(events) == 2
+    assert all(not event.ping for event in events)
 
 
 def test_relevant_roadwork_posts_once_and_clears_with_description():

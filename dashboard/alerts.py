@@ -2,12 +2,10 @@
 change.
 
 Every meaningful change (a warning hoisted/removed or a relevant TD traffic
-notice/roadwork appearing/clearing) is posted to the dashboard thread. Heavy
-congestion (a tracked road's detector speed entering the red band on two
-consecutive updates, with a per-road cooldown) also pings the configured alert
-role. Weather changes are posted without pinging: typhoon signal 8+ has the
-Pre-No. 8 announcement as lead time, and black rainstorm by definition arrives
-with none, so a ping adds noise rather than notice.
+notice/roadwork appearing/clearing) is posted to the dashboard thread. New TD
+traffic notices on Clear Water Bay Road or New Clear Water Bay Road, and heavy
+detector-confirmed congestion, ping the configured alert role. Weather changes
+and roadworks do not ping.
 """
 
 from __future__ import annotations
@@ -35,7 +33,10 @@ CRITICAL_WARNING_CODES: frozenset[str] = frozenset(
 )
 
 CONGESTION_RED_TICKS_REQUIRED = 2
-CONGESTION_COOLDOWN_SECONDS = 45 * 60.0
+ROAD_ALERT_COOLDOWN_SECONDS = 60 * 60.0
+WATCHED_ALERT_ROADS: frozenset[str] = frozenset(
+    {"clear water bay road", "new clear water bay road"}
+)
 
 def _family_of(code: str) -> str:
     """Group related warning codes so escalations read as upgrades:
@@ -60,14 +61,14 @@ class AlertState:
     roadwork_labels: dict[str, str] = field(default_factory=dict)
     red_streaks: dict[str, int] = field(default_factory=dict)
     active_reds: set[str] = field(default_factory=set)
-    congestion_cooldown_until: dict[str, float] = field(default_factory=dict)
+    road_alert_cooldown_until: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
 class AlertEvent:
     """A single thread-worthy change.
 
-    ``ping`` marks events that mention the alert role (heavy congestion only);
+    ``ping`` marks events that mention the alert role;
     ``critical`` marks prominent weather events, which post without pinging.
     """
 
@@ -83,6 +84,21 @@ class AlertMonitor:
     state: AlertState = field(default_factory=AlertState)
     roads: object | None = None  # TrackedRoads table for names/affected routes
     _initialized: bool = False
+
+    def _claim_road_alert(self, road_keys: set[str]) -> bool:
+        """Claim one shared one-hour role-alert window for the matched roads."""
+        watched = WATCHED_ALERT_ROADS.intersection(road_keys)
+        if not watched:
+            return False
+        if not self._initialized:
+            return True  # startup events are discarded and must not consume cooldown
+        now = time.monotonic()
+        if all(now < self.state.road_alert_cooldown_until.get(key, 0.0) for key in watched):
+            return False
+        until = now + ROAD_ALERT_COOLDOWN_SECONDS
+        for key in watched:
+            self.state.road_alert_cooldown_until[key] = until
+        return True
 
     def _warning_events(
         self, warnings: list[WeatherWarning], now: datetime
@@ -136,7 +152,8 @@ class AlertMonitor:
                 events.append(
                     AlertEvent(
                         text=f"📢 **{incident.title}**{suffix} "
-                        f"(<t:{int(now.timestamp())}:t>)"
+                        f"(<t:{int(now.timestamp())}:t>)",
+                        ping=self._claim_road_alert(self._incident_road_keys(incident)),
                     )
                 )
         for key in sorted(self.state.traffic_incidents - current):
@@ -147,6 +164,26 @@ class AlertMonitor:
                 )
             )
         return events
+
+    def _incident_road_keys(self, incident: TrafficIncident) -> set[str]:
+        """Resolve a TD notice to the watched canonical road keys."""
+        text = " ".join(
+            (
+                incident.title,
+                incident.description,
+                incident.road,
+                incident.location,
+                incident.near_landmark,
+                incident.between_landmark,
+            )
+        )
+        if self.roads is not None:
+            return WATCHED_ALERT_ROADS.intersection(self.roads.match(text))
+        # Production normally has the tracked-road table. Retain a strict
+        # exact-field fallback so a temporary table failure does not suppress
+        # an explicitly named priority road or confuse New CWB with CWB.
+        named_fields = {incident.road.casefold().strip(), incident.location.casefold().strip()}
+        return WATCHED_ALERT_ROADS.intersection(named_fields)
 
     @staticmethod
     def _roadwork_key(roadwork: Roadwork) -> str:
@@ -185,10 +222,10 @@ class AlertMonitor:
         return events
 
     def _congestion_events(self, statuses, now: datetime) -> list[AlertEvent]:
-        """Red-band detector congestion with hysteresis and a per-road cooldown.
+        """Red-band detector congestion with hysteresis and shared cooldown.
 
         A road must read RED on consecutive updates before alerting (one
-        detector glitch is not a jam), re-alerts at most every 45 minutes, and
+        detector glitch is not a jam), re-alerts at most hourly, and
         posts one cleared note when it leaves the red band.
         """
         events: list[AlertEvent] = []
@@ -201,19 +238,25 @@ class AlertMonitor:
             current_reds[status.name] = status
 
         for name, status in current_reds.items():
+            road_key = name.casefold().strip()
+            if road_key not in WATCHED_ALERT_ROADS:
+                continue
             streak = state.red_streaks.get(name, 0) + 1
             state.red_streaks[name] = streak
             if name in state.active_reds:
                 continue
             if streak < CONGESTION_RED_TICKS_REQUIRED:
                 continue
-            if time.monotonic() < state.congestion_cooldown_until.get(name, 0.0):
-                continue
             state.active_reds.add(name)
-            state.congestion_cooldown_until[name] = (
-                time.monotonic() + CONGESTION_COOLDOWN_SECONDS
+            events.append(
+                self._congestion_event(
+                    name,
+                    status,
+                    now,
+                    cleared=False,
+                    ping=self._claim_road_alert({road_key}),
+                )
             )
-            events.append(self._congestion_event(name, status, now, cleared=False))
 
         for name in sorted(set(state.active_reds) - set(current_reds)):
             state.active_reds.discard(name)
@@ -225,7 +268,9 @@ class AlertMonitor:
                 state.red_streaks[name] = 0
         return events
 
-    def _congestion_event(self, name: str, status, now: datetime, cleared: bool) -> AlertEvent:
+    def _congestion_event(
+        self, name: str, status, now: datetime, cleared: bool, ping: bool = False
+    ) -> AlertEvent:
         roads = self.roads
         display = roads.display_name(name) if roads is not None else name
         routes: list[str] = []
@@ -244,7 +289,7 @@ class AlertMonitor:
             speed_text = f" ({min(speeds):.0f} km/h)"
         return AlertEvent(
             text=f"🚗 Heavy congestion on **{display}**{speed_text}{suffix}{stamp}",
-            ping=True,
+            ping=ping,
         )
 
     def update(
@@ -260,6 +305,12 @@ class AlertMonitor:
         The first call only seeds the state (no flood of events on startup).
         """
         now = now or datetime.now(UTC)
+        monotonic_now = time.monotonic()
+        self.state.road_alert_cooldown_until = {
+            key: until
+            for key, until in self.state.road_alert_cooldown_until.items()
+            if until > monotonic_now
+        }
         current_incidents = incidents or []
         current_roadworks = roadworks or []
         events = (
@@ -286,7 +337,7 @@ class AlertMonitor:
         return events
 
     def ping_for(self, event: AlertEvent, role_id: int | None) -> str:
-        """Render a thread message; only congestion events carry the role ping."""
+        """Render a thread message, adding the configured role when requested."""
         if event.ping and role_id is not None:
             return f"{event.text}\n<@&{role_id}>"
         return event.text

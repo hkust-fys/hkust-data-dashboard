@@ -79,10 +79,12 @@ async def test_live_hko_warnsum_parses():
         client = HttpClient(session)
         raw = await client.fetch_json(WARNSUM_URL)
         assert isinstance(raw, dict)
-        # warnsum has no top-level updateTime; codes carry their own issueTime
-        for code, payload in raw.items():
+        # Outer keys are warning families (for example WRAIN); the payload's
+        # code is the canonical active variant (for example WRAINR).
+        for _family, payload in raw.items():
             assert isinstance(payload, dict)
-            assert payload.get("code") == code
+            assert isinstance(payload.get("code"), str)
+            assert payload["code"]
 
 
 @pytest.mark.asyncio

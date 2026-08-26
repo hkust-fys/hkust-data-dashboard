@@ -234,11 +234,11 @@ def _build_transit_embed(
 
 
 def _build_traffic_map_embed(
-    png: bytes,
+    webp: bytes,
     source_time: datetime | None = None,
 ) -> discord.Embed | None:
     """Render the Google Maps base screenshot as an image pane."""
-    if not png:
+    if not webp:
         return None
     description = "[Open territory-wide view in HKeMobility](https://www.hkemobility.gov.hk/)"
     embed = discord.Embed(
@@ -246,7 +246,7 @@ def _build_traffic_map_embed(
         color=0x2563EB,
         description=description,
     )
-    embed.set_image(url="attachment://traffic-map.png")
+    embed.set_image(url="attachment://traffic-map.webp")
     return _set_source_timestamp(embed, "Google traffic", source_time)
 
 
@@ -399,7 +399,7 @@ def build_payload(
     statuses: list[TrafficCorridorStatus],
     incidents: list[TrafficIncident],
     capture_time: datetime | None,
-    traffic_map_png: bytes | None,
+    traffic_map_webp: bytes | None,
     transit_source_time: datetime | None = None,
     map_source_time: datetime | None = None,
     roadworks: list[Roadwork] | None = None,
@@ -420,18 +420,18 @@ def build_payload(
     checked_at = now or datetime.now(UTC)
 
     # 1. Image-first traffic map.
-    if traffic_map_png:
+    if traffic_map_webp:
         map_embed = _build_traffic_map_embed(
-            traffic_map_png,
+            traffic_map_webp,
             map_source_time or checked_at,
         )
         if map_embed is not None:
             payload.embeds.append(map_embed)
             payload.files.append(
                 ImageAsset(
-                    filename="traffic-map.png",
-                    data=traffic_map_png,
-                    content_type="image/png",
+                    filename="traffic-map.webp",
+                    data=traffic_map_webp,
+                    content_type="image/webp",
                     label="Traffic map",
                     source_time=map_source_time,
                 )

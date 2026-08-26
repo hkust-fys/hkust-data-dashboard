@@ -83,11 +83,13 @@ python bot.py --dry-run --no-keys
 python bot.py --dev-webhook
 ```
 
-The Google Maps screenshot uses the configured 1920×1080 viewport and exact
-traffic-layer base URL from `dashboard/maps/tiles.py`. Official TD route-stop
-geometry is refreshed independently for marker placement. Other public sources
-retain their own cadences, and their source timestamps—not the dashboard edit
-time—are displayed.
+The Google Maps screenshot uses a compact 960×540 viewport at zoom 14 and the
+exact traffic-layer base URL from `dashboard/maps/tiles.py`; the traffic layer
+is kept intact while dashboard markers and thin amber traffic-news rails are
+added. The resulting WebP map attachment targets at most 100 KB for mobile
+payloads. Official TD route-stop geometry is refreshed independently for marker
+placement. Other public sources retain their own cadences, and their source
+timestamps—not the dashboard edit time—are displayed.
 
 ## Test
 

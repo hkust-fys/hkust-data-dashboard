@@ -171,8 +171,8 @@ def test_error_embed_shows_provider_failures():
 def test_traffic_map_embed_is_image_onlyish_and_timestamped():
     from dashboard.render import _build_traffic_map_embed
 
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
-    embed = _build_traffic_map_embed(png, s.utc())
+    webp = b"RIFF" + b"\x00" * 64
+    embed = _build_traffic_map_embed(webp, s.utc())
     assert embed is not None
     assert embed.title == "🗺️ Traffic map"
     desc = embed.description
@@ -180,7 +180,7 @@ def test_traffic_map_embed_is_image_onlyish_and_timestamped():
     assert "delay" not in desc
     assert "HKeMobility" in desc
     assert not embed.fields
-    assert embed.image.url == "attachment://traffic-map.png"
+    assert embed.image.url == "attachment://traffic-map.webp"
     assert embed.timestamp == s.utc()
     assert embed.footer.text == "Google traffic"
 
@@ -438,7 +438,7 @@ def test_build_payload_respects_embed_caps():
         statuses=s.traffic_statuses(),
         incidents=s.traffic_incidents(),
         capture_time=s.utc(),
-        traffic_map_png=b"\x89PNG\r\n" + b"\x00" * 100,
+        traffic_map_webp=b"RIFF" + b"\x00" * 100,
         transit_source_time=s.utc(),
         map_source_time=s.utc(),
     )

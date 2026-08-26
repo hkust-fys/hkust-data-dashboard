@@ -207,7 +207,7 @@ async def fetch_traffic_map(
             len(estimates),
         )
     try:
-        png = await asyncio.to_thread(
+        webp = await asyncio.to_thread(
             render_map,
             estimates,
             cache_dir,
@@ -216,7 +216,7 @@ async def fetch_traffic_map(
             base_image,
             affected_road_paths or [],
         )
-        return png, []
+        return webp, []
     except Exception as exc:  # noqa: BLE001
         import traceback
 

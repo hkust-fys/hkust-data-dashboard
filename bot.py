@@ -260,12 +260,12 @@ def _to_payload(results: dict[str, object]) -> DashboardPayload:
     # The map provider returns the Google base image and retained markers.
     smap_result = results.get("traffic_map")
     if isinstance(smap_result, Exception):
-        map_png: bytes | None = None
+        map_webp: bytes | None = None
     elif isinstance(smap_result, tuple) and len(smap_result) >= 2:
-        map_png = smap_result[0]
+        map_webp = smap_result[0]
     else:
-        map_png = None
-    if map_png is None:
+        map_webp = None
+    if map_webp is None:
         errors.append("traffic map unavailable")
     map_source_time = None
 
@@ -282,7 +282,7 @@ def _to_payload(results: dict[str, object]) -> DashboardPayload:
         statuses=statuses,
         incidents=incidents,
         capture_time=capture_time,
-        traffic_map_png=map_png,
+        traffic_map_webp=map_webp,
         transit_source_time=transit_source_time,
         map_source_time=map_source_time,
         roadworks=roadworks,
@@ -1086,8 +1086,8 @@ async def run_dry_run(settings: Settings) -> None:
         with open(preview_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         for asset in payload.files:
-            if asset.filename == "traffic-map.png":
-                with open(os.path.join(".private", "traffic-map-preview.png"), "wb") as f:
+            if asset.filename == "traffic-map.webp":
+                with open(os.path.join(".private", "traffic-map-preview.webp"), "wb") as f:
                     f.write(asset.data)
         log.info("dry-run preview written to %s", preview_path)
 

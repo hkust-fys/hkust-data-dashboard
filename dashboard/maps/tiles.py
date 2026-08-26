@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import io
 import logging
 import os
@@ -15,11 +16,20 @@ from PIL import Image, ImageStat
 log = logging.getLogger(__name__)
 
 GMAPS_BASE_URL = (
-    "https://www.google.com/maps/@22.3274138,114.2331738,15z/data=!5m1!1e1?entry=ttu"
+    "https://www.google.com/maps/@22.3274138,114.2331738,14z/data=!5m1!1e1?entry=ttu"
 )
-VIEWPORT_WIDTH = 1920
-VIEWPORT_HEIGHT = 1080
+VIEWPORT_WIDTH = 960
+VIEWPORT_HEIGHT = 540
 TILE_SIZE = 256
+BASE_CACHE_FILENAME = "gmaps_base_z14_960x540.png"
+
+
+def cache_filename(url: str, viewport: tuple[int, int]) -> str:
+    """Return a collision-safe base cache name for a URL/viewport pair."""
+    if url == GMAPS_BASE_URL and viewport == (VIEWPORT_WIDTH, VIEWPORT_HEIGHT):
+        return BASE_CACHE_FILENAME
+    digest = hashlib.sha256(f"{url}\0{viewport[0]}x{viewport[1]}".encode()).hexdigest()[:12]
+    return f"gmaps_base_custom_{viewport[0]}x{viewport[1]}_{digest}.png"
 
 # Repeated launch failures (dead system proxy/PAC) would otherwise warn on
 # every presenter tick. Back off before trying again; the cached base map
@@ -195,7 +205,9 @@ async def capture_gmaps_base(
 ) -> Image.Image:
     """Export Google Maps' visible map canvas with its traffic layer."""
     global _capture_retry_after
-    cache_path = os.path.join(cache_dir, "gmaps_base.png")
+    # Version the cache so a previously captured 1920x1080/zoom-15 map can
+    # never be reused as the new zoom-14 base.
+    cache_path = os.path.join(cache_dir, cache_filename(url, viewport))
     os.makedirs(cache_dir, exist_ok=True)
     if time.monotonic() < _capture_retry_after:
         return _cached_or_placeholder(cache_path, viewport)

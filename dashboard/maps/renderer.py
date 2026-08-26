@@ -10,14 +10,16 @@ from typing import NamedTuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-from dashboard.maps.tiles import TILE_SIZE
+from dashboard.maps.tiles import BASE_CACHE_FILENAME, TILE_SIZE
 from dashboard.models import Operator
 
-MAP_WIDTH = 1920
-MAP_HEIGHT = 1080
+MAP_WIDTH = 960
+MAP_HEIGHT = 540
+MIN_MAP_WIDTH = 720
+MIN_MAP_HEIGHT = 405
 BASE_MAP_LAT = 22.3274138
 BASE_MAP_LON = 114.2331738
-BASE_MAP_ZOOM = 15.0
+BASE_MAP_ZOOM = 14.0
 STOP_MARKER_SIZE = 8
 
 OPERATOR_COLORS = {
@@ -119,10 +121,11 @@ def _background(
     zoom: float = BASE_MAP_ZOOM,
     size: tuple[int, int] = (MAP_WIDTH, MAP_HEIGHT),
 ) -> Image.Image:
-    cache_path = os.path.join(cache_dir, "gmaps_base.png")
+    cache_path = os.path.join(cache_dir, BASE_CACHE_FILENAME)
     if os.path.exists(cache_path):
         try:
-            return Image.open(cache_path).convert("RGB")
+            image = Image.open(cache_path).convert("RGB")
+            return image.resize(size, Image.Resampling.LANCZOS) if image.size != size else image
         except Exception:  # noqa: BLE001
             pass
     return Image.new("RGB", size, (240, 242, 245))
@@ -648,7 +651,7 @@ def _draw_legend(draw: ImageDraw.ImageDraw, size: tuple[int, int]) -> None:
     font = _font(12)
     x, y = 10, size[1] - 132
     draw.rounded_rectangle(
-        (x - 6, y - 7, x + 455, y + 114),
+        (x - 6, y - 7, x + 400, y + 114),
         radius=7,
         fill=(255, 255, 255, 225),
         outline=(180, 180, 180, 235),
@@ -702,34 +705,54 @@ def _draw_legend(draw: ImageDraw.ImageDraw, size: tuple[int, int]) -> None:
         fill=(60, 60, 60, 255),
         font=font,
     )
+    draw.line((x, y + 78, x + 20, y + 78), fill=ALERT_ROUTE_COLOR, width=2)
+    draw.line((x, y + 84, x + 20, y + 84), fill=ALERT_ROUTE_COLOR, width=2)
+    draw.text(
+        (x + 27, y + 76),
+        "traffic-news segment",
+        fill=(30, 30, 30, 255),
+        font=font,
+    )
 
 
-ALERT_ROUTE_COLOR = (255, 140, 0, 200)  # amber casing for alerted routes
+ALERT_ROUTE_COLOR = (255, 179, 0, 235)
+ALERT_RAIL_WIDTH = 2
 
 
 def _draw_alerted_route_lines(
-    draw: ImageDraw.ImageDraw,
+    canvas: Image.Image,
     affected_road_paths: Iterable[Iterable[tuple[float, float]]],
     center_lat: float,
     center_lon: float,
     zoom: float,
     size: tuple[int, int],
 ) -> int:
-    """Draw amber casings only on OSM road paths named in TD news.
+    """Draw thin amber edge rails only on OSM road paths named in TD news.
 
-    Returns the number of road paths drawn. Drawn beneath markers so pills and
-    stops stay readable.
+    The rails deliberately leave the projected path centreline untouched, so
+    Google's traffic colour remains visible between them. Drawn beneath
+    markers so pills and stops stay readable.
     """
     drawn = 0
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay, "RGBA")
+    projected_paths: list[list[tuple[float, float]]] = []
     for raw_path in affected_road_paths:
         path = list(raw_path)
         if len(path) < 2:
             continue
         points = [project(lat, lon, center_lat, center_lon, zoom, size) for lat, lon in path]
-        # Wide soft casing first, then a crisp amber core.
-        draw.line(points, fill=(255, 140, 0, 90), width=11, joint="curve")
-        draw.line(points, fill=ALERT_ROUTE_COLOR, width=5, joint="curve")
+        if len(points) < 2:
+            continue
+        projected_paths.append(points)
         drawn += 1
+    # Draw every wide casing first, then erase every centerline. This ordering
+    # keeps center pixels untouched even where affected paths cross or hairpin.
+    for points in projected_paths:
+        overlay_draw.line(points, fill=ALERT_ROUTE_COLOR, width=ALERT_RAIL_WIDTH * 5, joint="curve")
+    for points in projected_paths:
+        overlay_draw.line(points, fill=(0, 0, 0, 0), width=ALERT_RAIL_WIDTH * 2, joint="curve")
+    canvas.alpha_composite(overlay)
     return drawn
 
 
@@ -753,9 +776,9 @@ def render_map(
 
     route_paths = [list(line.path) for line in route_lines if len(getattr(line, "path", ())) >= 2]
 
-    # Alerted-route casings go beneath everything dashboard-drawn.
+    # Alerted-route edge rails go beneath everything dashboard-drawn.
     _draw_alerted_route_lines(
-        draw,
+        canvas,
         affected_road_paths,
         center_lat,
         center_lon,
@@ -783,7 +806,7 @@ def render_map(
         _draw_marker_on_left(draw, x, y, heading, PUBLIC_STOP_COLOR, square=True)
 
     font = _font(13)
-    legend_bounds = (4, size[1] - 120, 462, size[1] - 14)
+    legend_bounds = (4, size[1] - 120, 407, size[1] - 14)
     bus_markers = _merge_bus_markers(estimates, center_lat, center_lon, zoom, size)
     for placement in _layout_bus_labels(bus_markers, draw, font, size, [legend_bounds]):
         _draw_bus_route_marker(
@@ -803,5 +826,21 @@ def render_map(
         font=_font(12),
     )
     buffer = io.BytesIO()
-    canvas.convert("RGB").save(buffer, format="PNG")
-    return buffer.getvalue()
+    # Discord/mobile payload target: retain full dimensions while adapting
+    # quality. RGB WebP keeps traffic colours (no palette quantization).
+    image = canvas.convert("RGB")
+    # Keep a readable mobile floor while reducing dimensions only as needed.
+    while True:
+        for quality in (82, 78, 74, 70):
+            buffer.seek(0)
+            buffer.truncate(0)
+            image.save(buffer, format="WEBP", quality=quality, method=6)
+            if buffer.tell() <= 100_000:
+                return buffer.getvalue()
+        if image.size == (MIN_MAP_WIDTH, MIN_MAP_HEIGHT):
+            raise ValueError("map WebP exceeds 100 KB at readable minimum dimensions")
+        next_width = max(MIN_MAP_WIDTH, round(image.width * 0.9))
+        next_height = max(MIN_MAP_HEIGHT, round(image.height * 0.9))
+        if (next_width, next_height) == image.size:
+            next_width, next_height = MIN_MAP_WIDTH, MIN_MAP_HEIGHT
+        image = image.resize((next_width, next_height), Image.Resampling.LANCZOS)

@@ -16,6 +16,24 @@ from dashboard.models import EtaRow, Operator, RouteEtaGroup
 from dashboard.providers.route_geometry import RouteLine, Stop
 
 
+def test_map_capture_and_projection_contract_stays_synchronized():
+    assert tiles.VIEWPORT_WIDTH == renderer.MAP_WIDTH == 960
+    assert tiles.VIEWPORT_HEIGHT == renderer.MAP_HEIGHT == 540
+    assert renderer.BASE_MAP_ZOOM == 14.0
+    assert ",14z/" in tiles.GMAPS_BASE_URL
+    assert "!5m1!1e1" in tiles.GMAPS_BASE_URL
+
+
+def test_custom_capture_cache_identity_includes_url_and_viewport():
+    default = tiles.cache_filename(tiles.GMAPS_BASE_URL, (tiles.VIEWPORT_WIDTH, tiles.VIEWPORT_HEIGHT))
+    custom_url = tiles.cache_filename("https://example.test/maps", (960, 540))
+    custom_size = tiles.cache_filename(tiles.GMAPS_BASE_URL, (640, 360))
+    assert default == tiles.BASE_CACHE_FILENAME
+    assert custom_url != default and custom_size != default
+    assert custom_url != custom_size
+    assert custom_url.endswith(".png") and "960x540" in custom_url
+
+
 def test_authoritative_gate_mapping_uses_verified_direction_variants():
     import dashboard.maps as maps
 
@@ -215,7 +233,7 @@ def test_canvas_export_rejects_opaque_tile_loading_grid():
 
 
 async def test_invalid_black_cache_is_not_reused(tmp_path, monkeypatch):
-    cache_path = tmp_path / "gmaps_base.png"
+    cache_path = tmp_path / "gmaps_base_z14_960x540.png"
     Image.new("RGB", (40, 20), (0, 0, 0)).save(cache_path)
 
     fake_api = types.ModuleType("playwright.async_api")
@@ -500,6 +518,42 @@ def test_alerted_road_path_gets_amber_casing_without_highlighting_route_remainde
     assert amber_count_at(highlighted, path[4]) == amber_count_at(plain, path[4])
 
 
+def test_alerted_road_rails_leave_google_centerline_unchanged():
+    from PIL import Image as PILImage
+
+    base = PILImage.new("RGBA", (120, 80), (37, 92, 168, 255))
+    before = base.copy()
+    renderer._draw_alerted_route_lines(
+        base,
+        [[(22.3274138, 114.2331738), (22.3274138, 114.2431738)]],
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM,
+        base.size,
+    )
+    center = renderer.project(
+        22.3274138, 114.2381738, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM, base.size,
+    )
+    assert base.getpixel((round(center[0]), round(center[1]))) == before.getpixel(
+        (round(center[0]), round(center[1]))
+    )
+
+
+def test_alerted_hairpin_rails_leave_each_centerline_unchanged():
+    base = Image.new("RGBA", (180, 140), (41, 96, 166, 255))
+    before = base.copy()
+    path = [(22.326, 114.232), (22.334, 114.232), (22.334, 114.240), (22.326, 114.240)]
+    renderer._draw_alerted_route_lines(
+        base, [path], renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM, base.size,
+    )
+    for point in path[1:-1]:
+        x, y = renderer.project(*point, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
+                                 renderer.BASE_MAP_ZOOM, base.size)
+        assert base.getpixel((round(x), round(y))) == before.getpixel((round(x), round(y)))
+
+
 def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_path, monkeypatch):
     from dashboard.maps.positions import BusEstimate
 
@@ -538,6 +592,67 @@ def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_pa
         "91 Diamond Hill",
         "11 Choi Hung",
     }
+
+
+def test_render_map_returns_bounded_webp_at_capture_dimensions(tmp_path):
+    encoded = renderer.render_map(
+        [], str(tmp_path), base_image=Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), (238, 241, 245))
+    )
+    decoded = Image.open(io.BytesIO(encoded))
+    assert decoded.format == "WEBP"
+    assert decoded.size == (renderer.MAP_WIDTH, renderer.MAP_HEIGHT)
+    assert len(encoded) <= 100_000
+
+
+def test_render_map_textured_traffic_base_stays_readable_and_bounded(tmp_path):
+    # Deterministic map-like texture plus thin traffic strokes exercises the
+    # dimension fallback without permitting an unreadably tiny image.
+    width, height = renderer.MAP_WIDTH, renderer.MAP_HEIGHT
+    textured = Image.new("RGB", (width, height), (232, 235, 238))
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(textured)
+    for index in range(120):
+        y = 8 + index * 4
+        draw.line((0, y, width, y + (index % 7) * 3), fill=(150 + index % 40,) * 3, width=1)
+    traffic = ((100, (20, 190, 50)), (180, (235, 210, 20)), (260, (245, 130, 10)), (340, (220, 30, 40)))
+    for y, color in traffic:
+        draw.line((180, y, 780, y + 30), fill=color, width=3)
+    encoded = renderer.render_map([], str(tmp_path), base_image=textured)
+    decoded = Image.open(io.BytesIO(encoded))
+    decoded.load()
+    assert decoded.format == "WEBP"
+    assert len(encoded) <= 100_000
+    assert decoded.width >= renderer.MIN_MAP_WIDTH and decoded.height >= renderer.MIN_MAP_HEIGHT
+    for index, (y, _) in enumerate(traffic):
+        red, green, blue = decoded.getpixel((480, y + 15))
+        assert max(red, green, blue) > 100
+        if index == 0:
+            assert green > red and green > blue
+        elif index == 1:
+            assert red > 150 and green > 150 and blue < 150
+        elif index == 2:
+            assert red > green > blue
+        else:
+            assert red > green + 50 and red > blue + 40
+
+
+def test_render_map_webp_preserves_traffic_color_relationships(tmp_path):
+    base = Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white")
+    bands = ((120, (20, 190, 50)), (180, (235, 210, 20)),
+             (240, (245, 130, 10)), (300, (220, 30, 40)))
+    for y, color in bands:
+        for row in range(y, y + 24):
+            for x in range(220, 740):
+                base.putpixel((x, row), color)
+    encoded = renderer.render_map([], str(tmp_path), base_image=base)
+    decoded = Image.open(io.BytesIO(encoded))
+    decoded.load()
+    assert len(encoded) <= 100_000
+    green, yellow, orange, red = [decoded.getpixel((480, y + 12)) for y, _ in bands]
+    assert green[1] > green[0] and green[1] > green[2]
+    assert yellow[0] > 150 and yellow[1] > 150 and yellow[2] < yellow[1] - 60
+    assert orange[0] > orange[1] > orange[2]
+    assert red[0] > red[1] + 80 and red[0] > red[2] + 60
 
 
 def test_bus_markers_merge_matching_route_operator_at_same_position():

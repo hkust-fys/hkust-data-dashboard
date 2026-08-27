@@ -49,6 +49,28 @@ HKEMOBILITY_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
 )
+HKEMOBILITY_BUS_REFERER = "https://www.hkemobility.gov.hk/en/public-transport/bus"
+HKEMOBILITY_GMB_REFERER = "https://www.hkemobility.gov.hk/en/public-transport/gmb"
+
+
+def _append_system_ca_node_option() -> str | None:
+    """Add Playwright's system-CA flag on Windows without losing options."""
+    if os.name != "nt":
+        return None
+    previous = os.environ.get("NODE_OPTIONS")
+    options = previous or ""
+    if "--use-system-ca" not in options.split():
+        os.environ["NODE_OPTIONS"] = f"{options} --use-system-ca".strip()
+    return previous
+
+
+def _restore_node_options(previous: str | None) -> None:
+    if os.name != "nt":
+        return
+    if previous is None:
+        os.environ.pop("NODE_OPTIONS", None)
+    else:
+        os.environ["NODE_OPTIONS"] = previous
 
 
 @dataclass(frozen=True)
@@ -393,9 +415,9 @@ async def _fetch_stop(client: HttpClient, operator: str, stop_id: str) -> Stop |
 async def _fetch_spatial(request_context: Any, spec: RouteSpec) -> dict[str, Any] | None:
     url = HKEMOBILITY_SPATIAL_URL.format(route_id=spec.route_id, sequence=spec.sequence)
     referer = (
-        "https://www.hkemobility.gov.hk/en/public-transport/gmb"
+        HKEMOBILITY_GMB_REFERER
         if spec.operator == "GMB"
-        else "https://www.hkemobility.gov.hk/en/public-transport/bus"
+        else HKEMOBILITY_BUS_REFERER
     )
     try:
         response = await request_context.get(
@@ -408,12 +430,16 @@ async def _fetch_spatial(request_context: Any, spec: RouteSpec) -> dict[str, Any
         raw = await response.json()
         return raw if isinstance(raw, dict) else None
     except Exception as exc:  # noqa: BLE001
+        status = getattr(response, "status", None) if "response" in locals() else None
+        detail = str(exc).replace("\n", " ")[:300]
         log.warning(
-            "HKeMobility line failed for %s/%s/%s: %s",
+            "HKeMobility line failed for %s/%s/%s url=%s status=%s detail=%s",
             spec.operator,
             spec.route,
             spec.bound,
-            type(exc).__name__,
+            url,
+            status,
+            detail,
         )
         return None
 
@@ -422,21 +448,28 @@ async def _fetch_spatial_batch() -> list[dict[str, Any] | None]:
     """Fetch all spatial directions through one browser-shaped API context."""
     from playwright.async_api import async_playwright
 
-    async with async_playwright() as playwright:
-        request_context = await playwright.request.new_context(user_agent=HKEMOBILITY_USER_AGENT)
-        try:
-            results: list[dict[str, Any] | None] = []
-            interval = min(
-                PACE_MAX_INTERVAL_SECONDS,
-                PACE_WINDOW_SECONDS / max(1, len(ROUTE_SPECS) - 1),
-            )
-            for index, spec in enumerate(ROUTE_SPECS):
-                if index:
-                    await asyncio.sleep(interval)
-                results.append(await _fetch_spatial(request_context, spec))
-            return results
-        finally:
-            await request_context.dispose()
+    previous_options = _append_system_ca_node_option()
+    try:
+        async with async_playwright() as playwright:
+            # The Node driver has inherited NODE_OPTIONS by this point; restore
+            # the host process environment before making requests.
+            _restore_node_options(previous_options)
+            request_context = await playwright.request.new_context(user_agent=HKEMOBILITY_USER_AGENT)
+            try:
+                results: list[dict[str, Any] | None] = []
+                interval = min(
+                    PACE_MAX_INTERVAL_SECONDS,
+                    PACE_WINDOW_SECONDS / max(1, len(ROUTE_SPECS) - 1),
+                )
+                for index, spec in enumerate(ROUTE_SPECS):
+                    if index:
+                        await asyncio.sleep(interval)
+                    results.append(await _fetch_spatial(request_context, spec))
+                return results
+            finally:
+                await request_context.dispose()
+    finally:
+        _restore_node_options(previous_options)
 
 
 def _build_line(spec: RouteSpec, stops: list[Stop], raw: dict[str, Any] | None) -> RouteLine:

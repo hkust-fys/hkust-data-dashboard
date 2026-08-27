@@ -1023,6 +1023,7 @@ class DashboardUpdater:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await collection_task
         self._collection_task = None
+        await maps.shutdown_gmaps_browser()
         await route_geometry_provider.shutdown_background_refreshes()
         await tracked_roads_provider.shutdown_background_refreshes()
         if self.session is not None:
@@ -1096,21 +1097,26 @@ async def run_dev_webhook(settings: Settings) -> None:
     import aiohttp
 
     async with aiohttp.ClientSession() as session:
-        client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
-        results = await collect_all(client, settings)
-        payload = _to_payload(results)
-        webhook = discord.Webhook.from_url(settings.dev_webhook, session=session)
-        files = [discord_file(a) for a in payload.files]
-        await webhook.send(
-            content="",
-            embeds=[e for e in payload.embeds if e is not None],
-            files=files or None,
-        )
-        log.info(
-            "dev webhook sent %d embeds, %d files",
-            len(payload.embeds),
-            len(payload.files),
-        )
+        try:
+            client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
+            results = await collect_all(client, settings)
+            payload = _to_payload(results)
+            webhook = discord.Webhook.from_url(settings.dev_webhook, session=session)
+            files = [discord_file(a) for a in payload.files]
+            await webhook.send(
+                content="",
+                embeds=[e for e in payload.embeds if e is not None],
+                files=files or None,
+            )
+            log.info(
+                "dev webhook sent %d embeds, %d files",
+                len(payload.embeds),
+                len(payload.files),
+            )
+        finally:
+            await maps.shutdown_gmaps_browser()
+            await route_geometry_provider.shutdown_background_refreshes()
+            await tracked_roads_provider.shutdown_background_refreshes()
 
 
 async def run_dry_run(settings: Settings) -> None:
@@ -1119,34 +1125,39 @@ async def run_dry_run(settings: Settings) -> None:
 
     os.makedirs(".private", exist_ok=True)
     async with aiohttp.ClientSession() as session:
-        client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
-        results = await collect_all(client, settings)
-        payload = _to_payload(results)
+        try:
+            client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
+            results = await collect_all(client, settings)
+            payload = _to_payload(results)
 
-        lines: list[str] = []
-        for i, embed in enumerate(payload.embeds):
-            if embed is None:
-                continue
-            title = embed.title or "(no title)"
-            lines.append(f"=== Embed {i + 1}: {title} ===")
-            if embed.description:
-                lines.append(f"description: {embed.description}")
-            for field in embed.fields:
-                lines.append(f"[{field.name}]")
-                lines.append(field.value)
-            if embed.image and embed.image.url:
-                lines.append(f"image: {embed.image.url}")
-        lines.append("")
-        lines.append(f"files: {[a.filename for a in payload.files]}")
+            lines: list[str] = []
+            for i, embed in enumerate(payload.embeds):
+                if embed is None:
+                    continue
+                title = embed.title or "(no title)"
+                lines.append(f"=== Embed {i + 1}: {title} ===")
+                if embed.description:
+                    lines.append(f"description: {embed.description}")
+                for field in embed.fields:
+                    lines.append(f"[{field.name}]")
+                    lines.append(field.value)
+                if embed.image and embed.image.url:
+                    lines.append(f"image: {embed.image.url}")
+            lines.append("")
+            lines.append(f"files: {[a.filename for a in payload.files]}")
 
-        preview_path = os.path.join(".private", "dashboard-preview.txt")
-        with open(preview_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        for asset in payload.files:
-            if asset.filename == "traffic-map.webp":
-                with open(os.path.join(".private", "traffic-map-preview.webp"), "wb") as f:
-                    f.write(asset.data)
-        log.info("dry-run preview written to %s", preview_path)
+            preview_path = os.path.join(".private", "dashboard-preview.txt")
+            with open(preview_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            for asset in payload.files:
+                if asset.filename == "traffic-map.webp":
+                    with open(os.path.join(".private", "traffic-map-preview.webp"), "wb") as f:
+                        f.write(asset.data)
+            log.info("dry-run preview written to %s", preview_path)
+        finally:
+            await maps.shutdown_gmaps_browser()
+            await route_geometry_provider.shutdown_background_refreshes()
+            await tracked_roads_provider.shutdown_background_refreshes()
 
 
 # --------------------------------------------------------------------------

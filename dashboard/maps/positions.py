@@ -146,7 +146,7 @@ def estimate_bus_positions(
         stops_count = len(list(lines_by_key[key].stops))
         if not 0 <= idx <= stops_count - 1:
             continue
-        minutes = max(0, int(eta.minutes))
+        minutes = max(0.0, float(eta.minutes))
         raw_position = idx - minutes / MINUTES_PER_STOP
         # The estimate must lie on the route. Undeparted buses never render:
         # an ETA > 0 AT the terminus (implied position < 0) means the bus has

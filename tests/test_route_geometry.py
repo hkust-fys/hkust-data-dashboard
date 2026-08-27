@@ -169,6 +169,17 @@ async def test_spatial_request_uses_route_sequence_and_operator_referer(spec, re
     )
 
 
+def test_system_ca_option_preserves_existing_node_options(monkeypatch):
+    monkeypatch.setattr(route_geometry.os, "name", "nt")
+    monkeypatch.setenv("NODE_OPTIONS", "--trace-warnings")
+    previous = route_geometry._append_system_ca_node_option()
+    assert previous == "--trace-warnings"
+    assert "--trace-warnings" in route_geometry.os.environ["NODE_OPTIONS"]
+    assert "--use-system-ca" in route_geometry.os.environ["NODE_OPTIONS"]
+    route_geometry._restore_node_options(previous)
+    assert route_geometry.os.environ["NODE_OPTIONS"] == "--trace-warnings"
+
+
 async def test_spatial_batch_uses_one_shared_playwright_context(monkeypatch):
     contexts: list[_SpatialClient] = []
 

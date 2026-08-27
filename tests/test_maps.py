@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import io
 import math
 import sys
@@ -250,6 +251,79 @@ async def test_invalid_black_cache_is_not_reused(tmp_path, monkeypatch):
     result = await tiles.capture_gmaps_base(str(tmp_path), viewport=(40, 20))
     assert result.size == (40, 20)
     assert result.getpixel((20, 10)) == (240, 242, 245)
+
+
+@pytest.mark.asyncio
+async def test_shared_browser_is_reused_and_shutdown_allows_reinit(monkeypatch):
+    launches = []
+
+    class Browser:
+        def __init__(self):
+            self.closed = False
+        def is_connected(self):
+            return not self.closed
+        async def close(self):
+            self.closed = True
+
+    class Chromium:
+        async def launch(self, **_kwargs):
+            browser = Browser()
+            launches.append(browser)
+            return browser
+
+    class Manager:
+        chromium = Chromium()
+        async def start(self):
+            return self
+        async def stop(self):
+            pass
+
+    fake_api = types.ModuleType("playwright.async_api")
+    fake_api.async_playwright = lambda: Manager()
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_api)
+    tiles._shared_browser = None
+    tiles._playwright_manager = None
+
+    assert await tiles._get_shared_browser() is await tiles._get_shared_browser()
+    assert len(launches) == 1
+    await tiles.shutdown_gmaps_browser()
+    await tiles.shutdown_gmaps_browser()
+    assert await tiles._get_shared_browser() is launches[1]
+    assert len(launches) == 2
+    await tiles.shutdown_gmaps_browser()
+
+
+@pytest.mark.asyncio
+async def test_disconnected_capture_failure_closes_shared_browser_without_deadlock(tmp_path):
+    class Browser:
+        def __init__(self):
+            self.closed = False
+        def is_connected(self):
+            return not self.closed
+        async def new_context(self, **_kwargs):
+            self.closed = True
+            raise RuntimeError("browser disconnected")
+        async def close(self):
+            self.closed = True
+
+    class Manager:
+        async def stop(self):
+            pass
+
+    browser = Browser()
+    tiles._shared_browser = browser
+    tiles._playwright_manager = Manager()
+    tiles._browser_loop = asyncio.get_running_loop()
+    tiles._capture_lock_loop = asyncio.get_running_loop()
+    tiles._capture_retry_after = 0.0
+
+    result = await asyncio.wait_for(
+        tiles.capture_gmaps_base(str(tmp_path), viewport=(40, 20)), timeout=2.0
+    )
+    assert result.size == (40, 20)
+    assert tiles._shared_browser is None
+    assert tiles._playwright_manager is None
+    await tiles.shutdown_gmaps_browser()
 
 
 def test_interpolated_bus_arrow_uses_the_local_curved_road_tangent():

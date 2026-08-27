@@ -116,7 +116,7 @@ TRANSIT_TTL_SECONDS = 25.0
 # --------------------------------------------------------------------------
 
 
-def _minutes_until(iso: str | None, now: datetime) -> int | None:
+def _precise_minutes_until(iso: str | None, now: datetime) -> float | None:
     if not iso:
         return None
     try:
@@ -126,7 +126,12 @@ def _minutes_until(iso: str | None, now: datetime) -> int | None:
     if eta.tzinfo is None:
         eta = eta.replace(tzinfo=UTC)
     diff = (eta - now).total_seconds() / 60
-    return max(0, round(diff))
+    return max(0.0, diff)
+
+
+def _minutes_until(iso: str | None, now: datetime) -> int | None:
+    precise = _precise_minutes_until(iso, now)
+    return round(precise) if precise is not None else None
 
 
 def _kmb_kind(rmk: str) -> EtaKind:
@@ -469,7 +474,7 @@ class ProbeEta:
     bound: str
     stop_id: str
     index: int  # official stop-sequence index of the probe stop
-    minutes: int | None
+    minutes: float | None
     kind: EtaKind = EtaKind.REALTIME
 
 
@@ -513,10 +518,11 @@ class ProbeEtaCache:
         if self._ttl > 0 and age_seconds > self._ttl:
             self._store.pop(key, None)
             return None
-        # Requests rotate across stops, so cached integer ETAs must count down
-        # between probes; otherwise a bus marker freezes and then jumps.
-        elapsed_minutes = int(age_seconds // 60.0)
-        if not elapsed_minutes:
+        # Requests rotate across stops, so cached ETAs must count down
+        # continuously between probes; otherwise a bus marker freezes and
+        # then jumps a full minute.
+        elapsed_minutes = age_seconds / 60.0
+        if elapsed_minutes <= 0:
             return entry[1]
         aged: list[ProbeEta] = []
         for eta in entry[1]:
@@ -597,7 +603,7 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
             entry_dir = str(entry.get("dir") or "")[:1].lower()
             if entry_dir and entry_dir != probe.bound[:1].lower():
                 continue
-            minutes = _minutes_until(entry.get("eta"), now)
+            minutes = _precise_minutes_until(entry.get("eta"), now)
             if minutes is None:
                 continue
             out.append(
@@ -622,7 +628,7 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
             eta_iso = entry.get("eta")
             if not eta_iso:
                 continue
-            minutes = _minutes_until(eta_iso, now)
+            minutes = _precise_minutes_until(eta_iso, now)
             if minutes is None:
                 continue
             out.append(
@@ -648,7 +654,7 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
         for eta in entry.get("eta") or []:
             diff = eta.get("diff")
             try:
-                minutes = int(diff) if diff is not None else None
+                minutes = float(diff) if diff is not None else None
             except (TypeError, ValueError):
                 minutes = None
             if minutes is None or minutes < last:

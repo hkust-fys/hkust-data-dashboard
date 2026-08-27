@@ -4,6 +4,7 @@ operation after a failed provider."""
 
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 
@@ -276,6 +277,9 @@ async def test_updater_stops_provider_refreshes_before_session_close(monkeypatch
 
     events: list[str] = []
 
+    async def stop_browser():
+        events.append("browser")
+
     async def stop_geometry():
         events.append("geometry")
 
@@ -288,12 +292,13 @@ async def test_updater_stops_provider_refreshes_before_session_close(monkeypatch
 
     monkeypatch.setattr(bot_module.route_geometry_provider, "shutdown_background_refreshes", stop_geometry)
     monkeypatch.setattr(bot_module.tracked_roads_provider, "shutdown_background_refreshes", stop_roads)
+    monkeypatch.setattr(bot_module.maps, "shutdown_gmaps_browser", stop_browser)
     updater = DashboardUpdater(_fake_settings())
     updater.session = Session()
 
     await updater.stop()
 
-    assert events == ["geometry", "roads", "session"]
+    assert events == ["browser", "geometry", "roads", "session"]
 
 
 @pytest.mark.asyncio
@@ -319,6 +324,39 @@ async def test_updater_continues_after_provider_failure(monkeypatch):
     # still created one message
     assert updater._message is not None
     await updater.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner", ["run_dry_run", "run_dev_webhook"])
+async def test_one_shot_runners_cleanup_background_resources_on_failure(monkeypatch, runner):
+    import bot as bot_module
+
+    events: list[str] = []
+
+    async def fail_collect(*_args, **_kwargs):
+        raise RuntimeError("collection failed")
+
+    async def stop_browser():
+        events.append("browser")
+
+    async def stop_geometry():
+        events.append("geometry")
+
+    async def stop_roads():
+        events.append("roads")
+
+    monkeypatch.setattr(bot_module, "collect_all", fail_collect)
+    monkeypatch.setattr(bot_module.maps, "shutdown_gmaps_browser", stop_browser)
+    monkeypatch.setattr(bot_module.route_geometry_provider, "shutdown_background_refreshes", stop_geometry)
+    monkeypatch.setattr(bot_module.tracked_roads_provider, "shutdown_background_refreshes", stop_roads)
+    settings = replace(
+        _fake_settings(),
+        dev_webhook="https://discord.com/api/webhooks/placeholder/token",
+    )
+
+    with pytest.raises(RuntimeError, match="collection failed"):
+        await getattr(bot_module, runner)(settings)
+    assert events == ["browser", "geometry", "roads"]
 
 
 @pytest.mark.asyncio

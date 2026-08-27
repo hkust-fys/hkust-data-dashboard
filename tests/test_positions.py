@@ -214,6 +214,15 @@ def test_lone_realtime_row_renders_at_its_implied_position():
     assert line.stops[1].lon < estimates[0].lon < line.stops[3].lon
 
 
+def test_fractional_probe_minute_produces_fractional_marker_position():
+    line = _line()
+    estimates = estimate_bus_positions(
+        [Probe("KMB", "X", "outbound", 3, 2.5)], [line]
+    )
+    assert len(estimates) == 1
+    assert estimates[0].position == 1.75
+
+
 def test_estimate_without_geometry_is_dropped():
     line = RouteLine("X", "KMB", "outbound", _line().stops)
     assert (

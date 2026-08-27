@@ -336,6 +336,31 @@ def test_traffic_summary_names_affected_road_per_item():
     )
 
 
+def test_traffic_summary_omits_bare_road_from_quote_but_keeps_annotation():
+    from dashboard.models import TrafficIncident
+    from dashboard.providers.route_geometry import RouteLine
+    from dashboard.providers.tracked_roads import build_tracked_roads
+    from dashboard.render import _build_traffic_summary_embed
+
+    roads = build_tracked_roads(
+        [RouteLine("91", "KMB", "outbound")], [["Waterloo Road"]]
+    )
+    incident = TrafficIncident(
+        identifier="waterloo",
+        title="Traffic congestion",
+        description="Waterloo Road is slow near the junction",
+        road="Waterloo Road",
+        location="Waterloo Road",
+        direction="",
+        status="active",
+    )
+    embed = _build_traffic_summary_embed([], [incident], None, roads=roads)
+    assert "\n> Waterloo Road\n" not in embed.description
+    assert "> Traffic congestion" in embed.description
+    assert "> Waterloo Road is slow near the junction" in embed.description
+    assert "↳ road: Waterloo Road" in embed.description
+
+
 def test_traffic_summary_links_to_official_td_traffic_news():
     from dashboard.render import TD_TRAFFIC_NEWS_URL, _build_traffic_summary_embed
 

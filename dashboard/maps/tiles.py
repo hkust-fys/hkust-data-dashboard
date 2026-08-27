@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
 import io
 import logging
@@ -36,6 +37,87 @@ def cache_filename(url: str, viewport: tuple[int, int]) -> str:
 # keeps rendering meanwhile.
 CAPTURE_FAILURE_BACKOFF_SECONDS = 10 * 60.0
 _capture_retry_after = 0.0
+_playwright_manager = None
+_shared_browser = None
+_capture_lock: asyncio.Lock | None = None
+_capture_lock_loop = None
+_browser_loop = None
+
+
+async def _close_shared_browser() -> None:
+    """Close shared resources, retaining globals until both closes finish."""
+    global _playwright_manager, _shared_browser, _browser_loop
+    browser, manager = _shared_browser, _playwright_manager
+    if browser is not None:
+        with contextlib.suppress(Exception):
+            await browser.close()
+    if manager is not None:
+        with contextlib.suppress(Exception):
+            await manager.stop()
+    _shared_browser = None
+    _playwright_manager = None
+    _browser_loop = None
+
+
+async def _get_shared_browser():
+    """Start Playwright/Chromium once and reuse it across map captures."""
+    global _playwright_manager, _shared_browser, _browser_loop
+    current_loop = asyncio.get_running_loop()
+    if _browser_loop is not None and _browser_loop is not current_loop:
+        await _close_shared_browser()
+    if _shared_browser is not None:
+        try:
+            if _shared_browser.is_connected():
+                return _shared_browser
+        except Exception:  # noqa: BLE001
+            pass
+        await _close_shared_browser()
+    from playwright.async_api import async_playwright
+
+    manager = async_playwright()
+    _playwright_manager = await manager.start()
+    try:
+        _shared_browser = await _playwright_manager.chromium.launch(
+            headless=True,
+            args=["--no-proxy-server"],
+        )
+    except Exception:
+        await _playwright_manager.stop()
+        _playwright_manager = None
+        raise
+    _browser_loop = current_loop
+    return _shared_browser
+
+
+async def shutdown_gmaps_browser() -> None:
+    """Idempotently close the shared browser and allow later reinitialization."""
+    global _capture_lock, _capture_lock_loop
+    loop = asyncio.get_running_loop()
+    if _capture_lock is None or _capture_lock_loop is not loop:
+        if _capture_lock_loop is not None and _capture_lock_loop is not loop:
+            await _close_shared_browser()
+        _capture_lock = asyncio.Lock()
+        _capture_lock_loop = loop
+    async with _capture_lock:
+        await _close_shared_browser()
+
+
+async def _close_capture_context(context) -> None:
+    if context is None:
+        return
+    close_task = asyncio.create_task(context.close())
+    try:
+        await asyncio.wait_for(asyncio.shield(close_task), timeout=5.0)
+    except TimeoutError:
+        close_task.cancel()
+        await asyncio.gather(close_task, return_exceptions=True)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.wait_for(asyncio.shield(close_task), timeout=5.0)
+        except (TimeoutError, asyncio.CancelledError):
+            close_task.cancel()
+            await asyncio.gather(close_task, return_exceptions=True)
+        raise
 
 # Google Maps changes its DOM names regularly. Find the map bitmap without
 # relying on any of those names: a candidate must be visible, occupy most of
@@ -211,21 +293,22 @@ async def capture_gmaps_base(
     os.makedirs(cache_dir, exist_ok=True)
     if time.monotonic() < _capture_retry_after:
         return _cached_or_placeholder(cache_path, viewport)
-    try:
-        from playwright.async_api import async_playwright
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                # Chromium otherwise reads the OS/registry proxy; a dead system
-                # proxy must not break a plain screenshot the HTTP layer can
-                # make directly.
-                args=["--no-proxy-server"],
-            )
+    global _capture_lock, _capture_lock_loop
+    loop = asyncio.get_running_loop()
+    if _capture_lock is None or _capture_lock_loop is not loop:
+        if _capture_lock_loop is not None and _capture_lock_loop is not loop:
+            await _close_shared_browser()
+        _capture_lock = asyncio.Lock()
+        _capture_lock_loop = loop
+    async with _capture_lock:
+        try:
+            browser = await _get_shared_browser()
+            context = None
             try:
-                page = await browser.new_page(
+                context = await browser.new_context(
                     viewport={"width": viewport[0], "height": viewport[1]}
                 )
+                page = await context.new_page()
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_selector("canvas", timeout=15000)
 
@@ -249,39 +332,29 @@ async def capture_gmaps_base(
                 if image is None:
                     raise ValueError("Google Maps canvas did not finish rendering")
             finally:
-                # Closing Chromium can involve IPC and must still be given a
-                # bounded chance to finish when the capture task is cancelled.
-                # Keep cancellation as the operation's outcome; never turn it
-                # into a cached/placeholder map.
-                close_task = asyncio.create_task(browser.close())
-                try:
-                    await asyncio.wait_for(asyncio.shield(close_task), timeout=5.0)
-                except TimeoutError:
-                    close_task.cancel()
-                    await asyncio.gather(close_task, return_exceptions=True)
-                except asyncio.CancelledError:
-                    try:
-                        await asyncio.wait_for(asyncio.shield(close_task), timeout=5.0)
-                    except (TimeoutError, asyncio.CancelledError):
-                        close_task.cancel()
-                        await asyncio.gather(close_task, return_exceptions=True)
-                    raise
+                # Recycle only this capture's context; Chromium remains alive
+                # for the next frame. Closing a context can involve IPC and
+                # must still be given a bounded chance when cancelled.
+                await _close_capture_context(context)
 
-        temporary_path = cache_path + ".tmp"
-        image.save(temporary_path, format="PNG")
-        os.replace(temporary_path, cache_path)
-        return image
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        _capture_retry_after = time.monotonic() + CAPTURE_FAILURE_BACKOFF_SECONDS
-        log.warning(
-            "Playwright Google Maps canvas export failed (%s); backing off %d min, "
-            "loading cache",
-            exc,
-            int(CAPTURE_FAILURE_BACKOFF_SECONDS / 60),
-        )
-        return _cached_or_placeholder(cache_path, viewport)
+            temporary_path = cache_path + ".tmp"
+            image.save(temporary_path, format="PNG")
+            os.replace(temporary_path, cache_path)
+            return image
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if _shared_browser is not None:
+                with contextlib.suppress(Exception):
+                    if not _shared_browser.is_connected():
+                        await _close_shared_browser()
+            _capture_retry_after = time.monotonic() + CAPTURE_FAILURE_BACKOFF_SECONDS
+            log.warning(
+                "Playwright Google Maps canvas export failed for %s (%s); backing off %d min, "
+                "loading cache",
+                url, exc, int(CAPTURE_FAILURE_BACKOFF_SECONDS / 60),
+            )
+            return _cached_or_placeholder(cache_path, viewport)
 
 
 def _cached_or_placeholder(

@@ -36,7 +36,7 @@ def test_probe_cache_ages_cached_countdowns_between_rotated_probes(operator):
     cache.set("probe", [eta])
 
     now[0] += 65
-    assert cache.get("probe")[0].minutes == 3
+    assert cache.get("probe")[0].minutes == pytest.approx(2.9166667)
     assert cache._store["probe"][1] == [eta]  # noqa: SLF001
 
 
@@ -57,7 +57,7 @@ def test_probe_cache_expires_only_after_multi_sweep_ceiling():
     cache.set("probe", [eta])
 
     now[0] += 419
-    assert cache.get("probe")[0].minutes == 994
+    assert cache.get("probe")[0].minutes == pytest.approx(993.0166667)
     now[0] += 2
     assert cache.get("probe") is None
     assert "probe" not in cache._store  # noqa: SLF001

@@ -13,7 +13,7 @@ from dashboard.maps.renderer import (
     project,
     render_map,
 )
-from dashboard.maps.tiles import capture_gmaps_base
+from dashboard.maps.tiles import capture_gmaps_base, shutdown_gmaps_browser
 from dashboard.models import EtaKind, RouteEtaGroup
 from dashboard.providers.route_geometry import Stop, fetch_route_geometry, select_probe_stops
 from dashboard.providers.transit import CTB_STOPS, GMB_STOPS, KMB_STOPS, fetch_probe_etas
@@ -234,5 +234,6 @@ __all__ = [
     "BusEstimate",
     "estimate_bus_positions",
     "fetch_traffic_map",
+    "shutdown_gmaps_browser",
     "project",
 ]

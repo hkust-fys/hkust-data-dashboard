@@ -486,10 +486,12 @@ async def test_collect_all_cancellation_awaits_provider_children(monkeypatch):
     from dashboard.providers import tracked_roads as tracked_roads_provider
 
     cancelled: list[str] = []
+    ready = {name: asyncio.Event() for name in ("weather", "map")}
 
     def blocking(name):
         async def run(*_args, **_kwargs):
             try:
+                ready[name].set()
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 cancelled.append(name)
@@ -517,8 +519,10 @@ async def test_collect_all_cancellation_awaits_provider_children(monkeypatch):
     monkeypatch.setattr(bot_module.maps, "fetch_traffic_map", blocking("map"))
 
     operation = asyncio.create_task(bot_module.collect_all(object(), _fake_settings()))
-    for _ in range(4):
-        await asyncio.sleep(0)
+    await asyncio.wait_for(
+        asyncio.gather(*(event.wait() for event in ready.values())),
+        timeout=1.0,
+    )
     operation.cancel()
     with pytest.raises(asyncio.CancelledError):
         await operation

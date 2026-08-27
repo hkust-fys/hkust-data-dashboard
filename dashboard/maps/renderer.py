@@ -785,6 +785,7 @@ def _layout_bus_labels(
                     grid_step = metrics.integer(6)
                     start = max(1, round(edge_margin))
                     grid_candidates = []
+                    relaxed_grid_candidates = []
                     for top in range(
                         start, max(start + 1, size[1] - math.ceil(cluster_height)), grid_step
                     ):
@@ -792,16 +793,27 @@ def _layout_bus_labels(
                             start, max(start + 1, size[0] - math.ceil(cluster_width)), grid_step
                         ):
                             candidate = (float(left), float(top), left + cluster_width, top + cluster_height)
-                            if not any(_rects_overlap(candidate, footprint, padding=0) for footprint in arrow_footprints):
-                                displacement = math.hypot(
-                                    (candidate[0] + candidate[2]) / 2 - anchor.x,
-                                    (candidate[1] + candidate[3]) / 2 - anchor.y,
-                                )
-                                grid_candidates.append(
-                                    (candidate, score(candidate, displacement, 0))
-                                )
+                            if any(_rects_overlap(candidate, footprint, padding=0) for footprint in arrow_footprints):
+                                continue
+                            displacement = math.hypot(
+                                (candidate[0] + candidate[2]) / 2 - anchor.x,
+                                (candidate[1] + candidate[3]) / 2 - anchor.y,
+                            )
+                            scored_candidate = (candidate, score(candidate, displacement, 0))
+                            relaxed_grid_candidates.append(scored_candidate)
+                            if not any(
+                                _rects_overlap(candidate, other, padding=collision_padding)
+                                for other in occupied
+                            ):
+                                grid_candidates.append(scored_candidate)
                     if grid_candidates:
                         chosen, _score = min(grid_candidates, key=lambda item: item[1])
+                    elif relaxed_grid_candidates:
+                        # Only overlap an occupied label as a last resort when
+                        # every arrow-safe grid slot is already occupied.
+                        chosen, _score = min(
+                            relaxed_grid_candidates, key=lambda item: item[1]
+                        )
                 if chosen is None:
                     top = min(
                         max(edge_margin, anchor.y - cluster_height / 2),

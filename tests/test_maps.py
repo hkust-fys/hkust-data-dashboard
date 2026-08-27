@@ -738,6 +738,30 @@ def test_grouped_label_spiral_avoids_initially_occupied_slots():
     assert not renderer._rects_overlap(rect, extra_arrow, padding=0)
 
 
+def test_grouped_grid_fallback_prefers_clear_slot_with_fixed_font_metrics():
+    """Exercise the grid branch independently of platform-installed fonts."""
+    class FixedWidthDraw:
+        def textlength(self, _text, font=None):
+            del font
+            return 104.078
+
+    markers = [
+        renderer.BusMarker(("792M TKO",), 120, 90, Operator.GMB, 0),
+        renderer.BusMarker(("91 Diamond Hill",), 124, 90, Operator.KMB, 0),
+    ]
+    occupied = [(0, 0, 240, 60), (0, 70, 110, 110), (130, 70, 240, 110)]
+    # Leave one arrow-safe grid slot below the occupied bands; the old grid
+    # fallback incorrectly preferred a closer slot overlapping the right band.
+    occupied.append((112, 160, 124, 172))
+    placed = renderer._layout_bus_labels(
+        markers, FixedWidthDraw(), renderer._font(13), (240, 180), occupied
+    )
+    assert len(placed) == 1
+    rect = placed[0].rect
+    assert not any(renderer._rects_overlap(rect, other) for other in occupied[:3])
+    assert not renderer._rects_overlap(rect, occupied[3], padding=0)
+
+
 def test_singleton_left_label_reserves_arrow_only_on_left_half():
     canvas = Image.new("RGBA", (180, 80), (255, 255, 255, 255))
     class RecordingDraw:

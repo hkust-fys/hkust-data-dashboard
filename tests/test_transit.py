@@ -448,6 +448,11 @@ async def test_canceling_one_probe_waiter_keeps_shared_refresh_alive(monkeypatch
 
 @pytest.mark.asyncio
 async def test_done_probe_task_inside_cadence_returns_cache(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(transit.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        transit, "_probe_cache", transit.ProbeEtaCache(clock=lambda: clock[0])
+    )
     probe = SimpleNamespace(operator="GMB", route="11", bound="seq-1", stop_id="stop",
                             route_id=1, sequence=1, index=0)
     cached = transit.ProbeEta("GMB", "11", "seq-1", "stop", 0, 3)

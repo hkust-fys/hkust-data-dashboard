@@ -725,7 +725,8 @@ def test_grouped_label_spiral_avoids_initially_occupied_slots():
         renderer.BusMarker(("91 Diamond Hill",), 124, 90, Operator.KMB, 0),
     ]
     occupied = [(0, 0, 240, 60), (0, 70, 110, 110), (130, 70, 240, 110)]
-    extra_arrow = (112, 148, 124, 160)
+    # Leave a genuinely clear lower grid slot across platform font metrics.
+    extra_arrow = (112, 160, 124, 172)
     occupied.append(extra_arrow)
     placed = renderer._layout_bus_labels(markers, draw, renderer._font(13), canvas.size, occupied)
     assert len(placed) == 1

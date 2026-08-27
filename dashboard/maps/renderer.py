@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import os
 from array import array
+from collections import OrderedDict
 from collections.abc import Iterable
 from functools import lru_cache
+from threading import RLock
 from typing import NamedTuple
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
@@ -18,9 +21,10 @@ from dashboard.models import Operator
 MAP_WIDTH = 960
 MAP_HEIGHT = 540
 LEGEND_WIDTH = 420
-LEGEND_HEIGHT = 110
+LEGEND_HEIGHT = 120
 LEGEND_DISPLAY_WIDTH = 840
 LEGEND_BAND_HEIGHT = 240
+LEGEND_ROW_CENTERS = (10, 30, 50, 70, 90, 110)
 MIN_MAP_WIDTH = 720
 MIN_MAP_HEIGHT = 405
 BASE_MAP_LAT = 22.3274138
@@ -101,6 +105,52 @@ DEFAULT_METRICS = RenderMetrics(1.0)
 
 class _OversizedMapError(ValueError):
     """A native render candidate cannot meet Discord's payload limit."""
+
+
+_TRAFFIC_CACHE_LIMIT = 4
+_QUALITY_CACHE_LIMIT = 8
+_QUALITY_HEADROOM_BYTES = 85_000
+_QUALITY_PROBE_INTERVAL = 8
+_QUALITY_LEVELS = (82, 78, 74, 70, 65, 60)
+_renderer_cache_lock = RLock()
+_traffic_cache: OrderedDict[tuple[int, int, bytes], TrafficOccupancy] = OrderedDict()
+_quality_cache: OrderedDict[tuple[int, int], dict[str, int]] = OrderedDict()
+_cache_counters = {
+    "traffic_hits": 0,
+    "traffic_misses": 0,
+    "traffic_evictions": 0,
+    "quality_hint_hits": 0,
+    "quality_probes": 0,
+    "quality_encodes": 0,
+}
+
+
+def _renderer_cache_stats(reset: bool = False) -> dict[str, int]:
+    """Return cheap renderer-cache counters for diagnostics and tests."""
+    with _renderer_cache_lock:
+        result = dict(_cache_counters)
+        result["traffic_entries"] = len(_traffic_cache)
+        result["quality_entries"] = len(_quality_cache)
+        if reset:
+            for key in _cache_counters:
+                _cache_counters[key] = 0
+        return result
+
+
+def _clear_renderer_caches() -> None:
+    """Clear bounded renderer caches; intended for deterministic tests."""
+    with _renderer_cache_lock:
+        _traffic_cache.clear()
+        _quality_cache.clear()
+        for key in _cache_counters:
+            _cache_counters[key] = 0
+
+
+def _traffic_cache_key(image: Image.Image) -> tuple[int, int, bytes]:
+    """Hash only final-size base pixels; overlays are never part of this key."""
+    rgb = image.convert("RGB")
+    digest = hashlib.blake2b(rgb.tobytes(), digest_size=16).digest()
+    return rgb.width, rgb.height, digest
 
 
 class TrafficOccupancy:
@@ -254,6 +304,36 @@ def _traffic_occupancy(
         mask = mask.filter(ImageFilter.MaxFilter(dilation * 2 + 1))
         snap_mask = snap_mask.filter(ImageFilter.MaxFilter(dilation * 2 + 1))
     return TrafficOccupancy(mask, snap_mask)
+
+
+def _cached_traffic_occupancy(
+    pristine_base: Image.Image, metrics: RenderMetrics = DEFAULT_METRICS
+) -> TrafficOccupancy:
+    """Reuse traffic masks while the final-size pristine screenshot is unchanged."""
+    key = _traffic_cache_key(pristine_base)
+    with _renderer_cache_lock:
+        cached = _traffic_cache.get(key)
+        if cached is not None:
+            _traffic_cache.move_to_end(key)
+            _cache_counters["traffic_hits"] += 1
+            return cached
+        _cache_counters["traffic_misses"] += 1
+
+    # Build outside the lock: concurrent render-map workers must not serialize
+    # expensive HSV/integral work. A duplicate build is harmless and avoids
+    # holding the lock while PIL processes a full screenshot.
+    computed = _traffic_occupancy(pristine_base, metrics)
+    with _renderer_cache_lock:
+        existing = _traffic_cache.get(key)
+        if existing is not None:
+            _traffic_cache.move_to_end(key)
+            return existing
+        _traffic_cache[key] = computed
+        _traffic_cache.move_to_end(key)
+        while len(_traffic_cache) > _TRAFFIC_CACHE_LIMIT:
+            _traffic_cache.popitem(last=False)
+            _cache_counters["traffic_evictions"] += 1
+    return computed
 
 
 def _render_metrics(size: tuple[int, int]) -> RenderMetrics:
@@ -903,7 +983,7 @@ def _dashed_rounded_rectangle(
     draw: ImageDraw.ImageDraw,
     rect: tuple[float, float, float, float],
     radius: int,
-    fill: tuple[int, int, int, int],
+    fill: tuple[int, int, int, int] | None,
     outline: tuple[int, int, int, int],
     dash: int = 4,
     gap: int = 3,
@@ -914,7 +994,8 @@ def _dashed_rounded_rectangle(
     scaled_radius = metrics.integer(radius)
     scaled_dash = metrics.px(dash, minimum=1.0)
     scaled_gap = metrics.px(gap, minimum=1.0)
-    draw.rounded_rectangle(rect, radius=scaled_radius, fill=fill)
+    if fill is not None:
+        draw.rounded_rectangle(rect, radius=scaled_radius, fill=fill)
 
     def dashed_line(a, b):
         length = math.hypot(b[0] - a[0], b[1] - a[1])
@@ -930,7 +1011,7 @@ def _dashed_rounded_rectangle(
                     (a[0] + ux * end, a[1] + uy * end),
                 ),
                 fill=outline,
-                width=metrics.integer(1),
+                width=metrics.integer(2),
             )
             travelled = end + scaled_gap
 
@@ -939,6 +1020,104 @@ def _dashed_rounded_rectangle(
     dashed_line((left + scaled_radius, bottom), (right - scaled_radius, bottom))
     dashed_line((left, top + scaled_radius), (left, bottom - scaled_radius))
     dashed_line((right, top + scaled_radius), (right, bottom - scaled_radius))
+
+
+def _draw_grouped_bus_outline(
+    draw: ImageDraw.ImageDraw,
+    rect: tuple[float, float, float, float],
+    rows: tuple[tuple[str, Operator, bool], ...],
+    metrics: RenderMetrics,
+) -> None:
+    """Draw one rounded perimeter without separators between label rows.
+
+    A mixed live/scheduled group keeps each row's solid/dashed treatment only
+    on its share of the outside edge.  Nothing is drawn across an internal row
+    boundary, so the stack remains one visual box.
+    """
+    left, top, right, bottom = rect
+    radius = metrics.integer(4)
+    outline = (20, 20, 20, 255)
+    width = metrics.integer(2)
+    row_height = (bottom - top) / len(rows)
+
+    reliability_styles = {row[2] for row in rows}
+    if len(reliability_styles) == 1:
+        if rows[0][2]:
+            _dashed_rounded_rectangle(
+                draw,
+                rect,
+                radius=4,
+                fill=None,
+                outline=outline,
+                metrics=metrics,
+            )
+        else:
+            draw.rounded_rectangle(
+                rect, radius=radius, outline=outline, width=width
+            )
+        return
+
+    def draw_straight(
+        start: tuple[float, float],
+        end: tuple[float, float],
+        dashed: bool,
+    ) -> None:
+        if not dashed:
+            draw.line((start, end), fill=outline, width=width)
+            return
+        dash = metrics.px(4, minimum=1.0)
+        gap = metrics.px(3, minimum=1.0)
+        length = math.hypot(end[0] - start[0], end[1] - start[1])
+        if length <= 0:
+            return
+        ux, uy = (end[0] - start[0]) / length, (end[1] - start[1]) / length
+        travelled = 0.0
+        while travelled < length:
+            segment_end = min(travelled + dash, length)
+            draw.line(
+                (
+                    (start[0] + ux * travelled, start[1] + uy * travelled),
+                    (start[0] + ux * segment_end, start[1] + uy * segment_end),
+                ),
+                fill=outline,
+                width=width,
+            )
+            travelled = segment_end + gap
+
+    first_dashed = rows[0][2]
+    last_dashed = rows[-1][2]
+    draw_straight((left + radius, top), (right - radius, top), first_dashed)
+    draw_straight((left + radius, bottom), (right - radius, bottom), last_dashed)
+
+    # Rounded corner arcs belong to the adjacent outer row.  PIL does not
+    # natively dash arcs; short arc strokes retain the same cadence.
+    corner_specs = (
+        ((left, top, left + 2 * radius, top + 2 * radius), 180, 270, first_dashed),
+        ((right - 2 * radius, top, right, top + 2 * radius), 270, 360, first_dashed),
+        ((right - 2 * radius, bottom - 2 * radius, right, bottom), 0, 90, last_dashed),
+        ((left, bottom - 2 * radius, left + 2 * radius, bottom), 90, 180, last_dashed),
+    )
+    for bounds, start, end, dashed in corner_specs:
+        if not dashed:
+            draw.arc(bounds, start=start, end=end, fill=outline, width=width)
+            continue
+        angle = start
+        dash_angle = 28
+        gap_angle = 20
+        while angle < end:
+            segment_end = min(angle + dash_angle, end)
+            draw.arc(
+                bounds, start=angle, end=segment_end, fill=outline, width=width
+            )
+            angle = segment_end + gap_angle
+
+    for index, (_text, _operator, dashed) in enumerate(rows):
+        row_top = top + index * row_height
+        row_bottom = top + (index + 1) * row_height
+        side_top = max(row_top, top + radius)
+        side_bottom = min(row_bottom, bottom - radius)
+        draw_straight((left, side_top), (left, side_bottom), dashed)
+        draw_straight((right, side_top), (right, side_bottom), dashed)
 
 
 def _draw_bus_route_marker(
@@ -953,23 +1132,16 @@ def _draw_bus_route_marker(
     """Draw one coloured route label with its arrow at the road anchor."""
     left, top, right, bottom = placement.rect
     anchor_x, anchor_y = placement.marker
-    # A short palette-colored leader preserves the association when displaced.
-    # It terminates exactly at the label edge.
+    # A short black leader preserves the association when displaced and
+    # terminates exactly at the label edge.
     end_x = min(max(anchor_x, left), right)
     end_y = min(max(anchor_y, top), bottom)
     if phase in {"all", "connector"} and (end_x, end_y) != (anchor_x, anchor_y):
-        palette = list(dict.fromkeys(
-            OPERATOR_COLORS.get(op, (100, 100, 100))
-            for _, op, _ in placement.rows
-        )) or [color]
-        for index, connector_color in enumerate(palette):
-            start = index / len(palette)
-            finish = (index + 1) / len(palette)
-            draw.line((anchor_x + (end_x - anchor_x) * start,
-                       anchor_y + (end_y - anchor_y) * start,
-                       anchor_x + (end_x - anchor_x) * finish,
-                       anchor_y + (end_y - anchor_y) * finish),
-                      fill=connector_color + (220,), width=metrics.integer(1))
+        draw.line(
+            (anchor_x, anchor_y, end_x, end_y),
+            fill=(0, 0, 0, 255),
+            width=metrics.integer(2),
+        )
     if phase == "connector":
         return
     if phase == "arrow":
@@ -985,31 +1157,43 @@ def _draw_bus_route_marker(
 
     if placement.rows:
         row_height = (bottom - top) / len(placement.rows)
-        # Paint each row independently so a mixed KMB/Citybus/GMB cluster is
-        # still immediately identifiable.  The outer outline is shared.
-        for index, (text, operator, row_unreliable) in enumerate(placement.rows):
-            row_top = top + index * row_height
-            row_bottom = top + (index + 1) * row_height
+        radius = metrics.integer(4)
+        # Fill each item without an internal gap or separator.  The first fill
+        # establishes the shared rounded silhouette; the bottom cap restores
+        # the same corner radius after subsequent row fills.
+        row_colors: list[tuple[int, int, int, int]] = []
+        for _text, operator, row_unreliable in placement.rows:
             row_color = OPERATOR_COLORS.get(operator, (100, 100, 100))
             if row_unreliable:
                 row_color = tuple(int(c + (255 - c) * 0.55) for c in row_color)
-            row_rect = (left, row_top, right, row_bottom)
-            draw.rectangle(row_rect, fill=row_color + (220,))
-            if row_unreliable:
-                _dashed_rounded_rectangle(
-                    draw, row_rect, radius=3, fill=row_color + (0,),
-                    outline=(90, 90, 90, 235),
-                    metrics=metrics,
-                )
+            row_colors.append(row_color + (255,))
+        draw.rounded_rectangle(placement.rect, radius=radius, fill=row_colors[0])
+        for index, (text, _operator, row_unreliable) in enumerate(placement.rows):
+            row_top = top + index * row_height
+            row_bottom = top + (index + 1) * row_height
+            if index:
+                if index == len(placement.rows) - 1:
+                    cap_top = max(row_top, bottom - 2 * radius)
+                    draw.rectangle(
+                        (left, row_top, right, bottom - radius),
+                        fill=row_colors[index],
+                    )
+                    draw.rounded_rectangle(
+                        (left, cap_top, right, bottom),
+                        radius=radius,
+                        fill=row_colors[index],
+                    )
+                else:
+                    draw.rectangle(
+                        (left, row_top, right, row_bottom),
+                        fill=row_colors[index],
+                    )
             draw.text(
                 (text_origin(text, left, right), row_top + metrics.px(2)), text,
-                fill=(235, 235, 235, 255) if row_unreliable else (255, 255, 255, 255),
+                fill=(25, 25, 25, 255) if row_unreliable else (255, 255, 255, 255),
                 font=font,
             )
-        draw.rounded_rectangle(
-            placement.rect, radius=metrics.integer(4),
-            outline=(20, 20, 20, 255), width=metrics.integer(1),
-        )
+        _draw_grouped_bus_outline(draw, placement.rect, placement.rows, metrics)
         colors = list(dict.fromkeys(OPERATOR_COLORS.get(operator, (100, 100, 100)) for _, operator, _ in placement.rows))
         if phase != "label":
             _draw_colored_bus_arrow(
@@ -1017,20 +1201,20 @@ def _draw_bus_route_marker(
             )
         return
     if unreliable:
-        # Timetable-derived estimate: paler fill, dashed outline, dim text.
+        # Timetable-derived estimate: opaque pale fill and high-contrast text.
         pale = tuple(int(c + (255 - c) * 0.55) for c in color)
         draw.rounded_rectangle(
-            placement.rect, radius=metrics.integer(4), fill=pale + (200,)
+            placement.rect, radius=metrics.integer(4), fill=pale + (255,)
         )
         _dashed_rounded_rectangle(
             draw,
             placement.rect,
             radius=4,
-            fill=pale + (0,),
-            outline=(90, 90, 90, 235),
+            fill=pale + (255,),
+            outline=(80, 80, 80, 255),
             metrics=metrics,
         )
-        text_fill = (235, 235, 235, 255)
+        text_fill = (25, 25, 25, 255)
     else:
         draw.rounded_rectangle(
             placement.rect, radius=metrics.integer(4), fill=color + (245,),
@@ -1082,7 +1266,7 @@ def _merge_bus_markers(
 ) -> list[BusMarker]:
     grouped: dict[
         tuple[Operator, str, int, int, int, bool],
-        tuple[set[str], float, float, float],
+        tuple[set[str], float, float, float, int],
     ] = {}
     projected = []
     for estimate in estimates:
@@ -1114,16 +1298,26 @@ def _merge_bus_markers(
             round(heading / math.radians(10)),
             unreliable,
         )
-        routes, *_rest = grouped.setdefault(key, (set(), x, y, heading))
-        routes.add(label)
-    return [
-        BusMarker(tuple(sorted(routes)), x, y, operator, heading, unreliable)
-        for (operator, _route, _x, _y, _heading, unreliable), (routes, x, y, heading)
-        in sorted(
-            grouped.items(),
-            key=lambda item: (item[0][0].value, item[1][1], item[1][2], item[0][1:]),
+        routes, canonical_x, canonical_y, canonical_heading, count = grouped.setdefault(
+            key, (set(), x, y, heading, 0)
         )
-    ]
+        routes.add(label)
+        grouped[key] = (routes, canonical_x, canonical_y, canonical_heading, count + 1)
+    markers: list[BusMarker] = []
+    for (
+        operator, _route, _x, _y, _heading, unreliable
+    ), (routes, x, y, heading, count) in sorted(
+        grouped.items(),
+        key=lambda item: (item[0][0].value, item[1][1], item[1][2], item[0][1:]),
+    ):
+        # Preserve multiplicity: layout coalesces these singleton markers into
+        # repeated rows while retaining one canonical arrow and leader.
+        markers.extend(
+            BusMarker((label,), x, y, operator, heading, unreliable)
+            for _ in range(count)
+            for label in sorted(routes)
+        )
+    return markers
 
 
 def _draw_gate_pins(
@@ -1164,37 +1358,78 @@ def _draw_legend(
     origin: tuple[float, float] = (0.0, 0.0),
 ) -> None:
     """Explain only dashboard-authored estimates and stop glyphs."""
-    del size  # The artwork retains a stable logical 420 x 110 coordinate space.
+    del size  # The artwork retains a stable logical 420 x 120 coordinate space.
     font = _font(metrics.font_size(12))
     x = origin[0] + metrics.px(10)
-    y = origin[1] + metrics.px(8)
-    draw.text((x, y), "Estimated buses (not GPS)", fill=(30, 30, 30, 255), font=font)
-    cursor_x = x + metrics.px(158)
-    for operator, color in OPERATOR_COLORS.items():
-        draw.rounded_rectangle(
-            (cursor_x, y + metrics.px(1), cursor_x + metrics.px(12),
-             y + metrics.px(10)),
-            radius=metrics.integer(2),
-            fill=color + (255,),
-            outline=(20, 20, 20, 255),
-            width=metrics.integer(1),
-        )
-        draw.text(
-            (cursor_x + metrics.px(15), y - metrics.px(2)), operator.value,
-            fill=(30, 30, 30, 255), font=font,
-        )
-        cursor_x += metrics.px(23) + draw.textlength(operator.value, font=font)
+    row_centers = tuple(
+        origin[1] + metrics.px(center) for center in LEGEND_ROW_CENTERS
+    )
 
-    row_y = y + metrics.px(27)
+    def centered_text_y(
+        text: str, text_font: ImageFont.ImageFont, center_y: float
+    ) -> float:
+        bounds = draw.textbbox((0, 0), text, font=text_font)
+        return center_y - (bounds[1] + bounds[3]) / 2
+
+    title = "Estimated buses (not GPS)"
+    draw.text(
+        (x, centered_text_y(title, font, row_centers[0])), title,
+        fill=(30, 30, 30, 255), font=font,
+    )
+    # Use actual rendered marker examples so the key explains arrow, leader,
+    # label colour, and operator together. Keep boxes tight to the text and
+    # show both live and timetable-derived styling.
+    sample_font = _font(metrics.font_size(11, minimum=7))
+    # A borderless 2x3 table: row labels occupy the first logical column and
+    # each operator keeps one fixed arrow/box anchor across both rows.
+    columns = (x + metrics.px(65), x + metrics.px(190), x + metrics.px(315))
+    operators = (Operator.KMB, Operator.CITYBUS, Operator.GMB)
+    row_label_font = _font(metrics.font_size(8, minimum=6))
+    for sample_y, row_label, unreliable in (
+        (row_centers[1], "live ETA", False),
+        (row_centers[2], "scheduled", True),
+    ):
+        draw.text(
+            (x, centered_text_y(row_label, row_label_font, sample_y)), row_label,
+            fill=(45, 45, 45, 255), font=row_label_font,
+        )
+        for anchor_x, operator in zip(columns, operators, strict=True):
+            label = operator.value
+            text_box = draw.textbbox((0, 0), label, font=sample_font)
+            label_width = text_box[2] - text_box[0]
+            label_height = text_box[3] - text_box[1]
+            padding = metrics.px(4)
+            vertical_padding = metrics.px(3)
+            box_left = anchor_x + metrics.px(17)
+            box_top = sample_y - (label_height + vertical_padding * 2) / 2
+            box_right = box_left + label_width + padding * 2
+            _draw_bus_route_marker(
+                draw,
+                LabelPlacement(
+                    label,
+                    (box_left, box_top, box_right, box_top + label_height + vertical_padding * 2),
+                    (anchor_x, sample_y), operator, 0.0, unreliable,
+                ),
+                OPERATOR_COLORS[operator], sample_font,
+                unreliable=unreliable, metrics=metrics,
+            )
+
     marker_size = metrics.integer(STOP_MARKER_SIZE, minimum=4)
+    stop_center_y = row_centers[3]
+    row_y = stop_center_y - (marker_size - 1) / 2
     draw.ellipse(
         (x, row_y, x + marker_size - 1, row_y + marker_size - 1),
         fill=SHUTTLE_STOP_COLOR + (255,),
         outline=(255, 255, 255, 255),
         width=metrics.integer(1),
     )
+    shuttle_label = "shuttle stop"
     draw.text(
-        (x + metrics.px(13), row_y - metrics.px(3)), "shuttle stop",
+        (
+            x + metrics.px(13),
+            centered_text_y(shuttle_label, font, stop_center_y),
+        ),
+        shuttle_label,
         fill=(30, 30, 30, 255), font=font,
     )
     public_x = x + metrics.px(112)
@@ -1204,38 +1439,34 @@ def _draw_legend(
         outline=(255, 255, 255, 255),
         width=metrics.integer(1),
     )
+    public_label = "public bus stop"
     draw.text(
-        (public_x + metrics.px(13), row_y - metrics.px(3)), "public bus stop",
+        (
+            public_x + metrics.px(13),
+            centered_text_y(public_label, font, stop_center_y),
+        ),
+        public_label,
         fill=(30, 30, 30, 255), font=font,
     )
-    # Unreliable (timetable-derived) marker swatch: pale with dashed outline.
-    pale_kmb = tuple(int(c + (255 - c) * 0.55) for c in OPERATOR_COLORS[Operator.KMB])
-    unreliable_x = x + metrics.px(240)
-    _dashed_rounded_rectangle(
-        draw,
-        (unreliable_x, row_y, unreliable_x + metrics.px(26),
-         row_y + metrics.px(13)),
-        radius=3,
-        fill=pale_kmb + (200,),
-        outline=(90, 90, 90, 235),
-        metrics=metrics,
-    )
-    draw.text(
-        (unreliable_x + metrics.px(31), row_y - metrics.px(3)),
-        "timetable only",
-        fill=(30, 30, 30, 255),
-        font=font,
-    )
-
     # Match the map's high-contrast, no-fill rectangle indicator.
+    traffic_center_y = row_centers[4]
     draw.rectangle(
-        (x, y + metrics.px(54), x + metrics.px(20), y + metrics.px(64)),
+        (
+            x,
+            traffic_center_y - metrics.px(5),
+            x + metrics.px(20),
+            traffic_center_y + metrics.px(5),
+        ),
         outline=ALERT_RECT_COLOR,
         width=metrics.integer(4),
     )
+    traffic_news_label = "traffic-news segment"
     draw.text(
-        (x + metrics.px(27), y + metrics.px(53)),
-        "traffic-news segment",
+        (
+            x + metrics.px(27),
+            centered_text_y(traffic_news_label, font, traffic_center_y),
+        ),
+        traffic_news_label,
         fill=(30, 30, 30, 255),
         font=font,
     )
@@ -1246,22 +1477,37 @@ def _draw_legend(
     swatch_x = traffic_x
     for color in GOOGLE_TRAFFIC_COLORS:
         draw.rounded_rectangle(
-            (swatch_x, y + metrics.px(55), swatch_x + metrics.px(13),
-             y + metrics.px(64)),
+            (
+                swatch_x,
+                traffic_center_y - metrics.px(4.5),
+                swatch_x + metrics.px(13),
+                traffic_center_y + metrics.px(4.5),
+            ),
             radius=metrics.integer(2), fill=color + (255,),
             outline=(50, 50, 50, 255), width=metrics.integer(1),
         )
         swatch_x += metrics.px(17)
+    google_traffic_label = "Google traffic"
     draw.text(
-        (swatch_x + metrics.px(3), y + metrics.px(55)), "Google traffic",
+        (
+            swatch_x + metrics.px(3),
+            centered_text_y(
+                google_traffic_label, compact_font, traffic_center_y
+            ),
+        ),
+        google_traffic_label,
         fill=(45, 45, 45, 255), font=compact_font,
     )
     attribution = "Map data © Google · Route geometry © Transport Department HKeMobility"
+    attribution_font = _font(metrics.font_size(9, minimum=7))
     draw.text(
-        (x, origin[1] + metrics.px(94)),
+        (
+            x,
+            centered_text_y(attribution, attribution_font, row_centers[5]),
+        ),
         attribution,
         fill=(65, 65, 65, 255),
-        font=_font(metrics.font_size(9, minimum=7)),
+        font=attribution_font,
     )
 
 
@@ -1288,7 +1534,7 @@ def _draw_colored_bus_arrow(
         draw.polygon(triangle, fill=colors[0] + (255,))
         draw.line(
             (*triangle, triangle[0]), fill=(25, 25, 25, 255),
-            width=metrics.integer(1), joint="curve",
+            width=metrics.integer(2), joint="curve",
         )
         return
     tip, left, right = triangle
@@ -1307,7 +1553,7 @@ def _draw_colored_bus_arrow(
         draw.polygon((tip, a, b), fill=color + (255,))
     draw.line(
         (tip, left, right, tip), fill=(25, 25, 25, 255),
-        width=metrics.integer(1), joint="curve",
+        width=metrics.integer(2), joint="curve",
     )
 
 
@@ -1327,12 +1573,12 @@ def _append_legend_band(canvas: Image.Image) -> Image.Image:
     scale = map_image.width / MAP_WIDTH
     band_height = max(1, round(LEGEND_BAND_HEIGHT * scale))
     legend = Image.new("RGB", (map_image.width, band_height), (246, 247, 249))
-    # The logical 420 x 110 legend is authored directly at its 2x display
+    # The logical 420 x 120 legend is authored directly at its 2x display
     # scale. This keeps type and shapes crisp instead of resizing a raster.
     legend_metrics = RenderMetrics(2 * scale)
     _draw_legend(
         ImageDraw.Draw(legend, "RGBA"), legend.size, legend_metrics,
-        origin=(60 * scale, 20 * scale),
+        origin=(60 * scale, 0.0),
     )
     composite = Image.new(
         "RGB", (map_image.width, map_image.height + band_height), (246, 247, 249)
@@ -1340,6 +1586,54 @@ def _append_legend_band(canvas: Image.Image) -> Image.Image:
     composite.paste(map_image, (0, 0))
     composite.paste(legend, (0, map_image.height))
     return composite
+
+
+def _quality_candidates(size: tuple[int, int]) -> tuple[int, ...]:
+    """Return one cached quality first, with a bounded recovery probe."""
+    with _renderer_cache_lock:
+        state = _quality_cache.get(size)
+        if state is None:
+            return _QUALITY_LEVELS
+        _quality_cache.move_to_end(size)
+        _cache_counters["quality_hint_hits"] += 1
+        state["renders"] += 1
+        quality = state["quality"]
+        candidates: list[int] = []
+        if (
+            state["renders"] >= _QUALITY_PROBE_INTERVAL
+            and state["bytes"] <= _QUALITY_HEADROOM_BYTES
+        ):
+            try:
+                quality_index = _QUALITY_LEVELS.index(quality)
+            except ValueError:
+                quality_index = 0
+            # _QUALITY_LEVELS is descending: the immediately preceding item
+            # is the next quality step, preventing a probe from jumping 74→82.
+            higher = (
+                _QUALITY_LEVELS[quality_index - 1]
+                if quality_index > 0
+                else None
+            )
+            if higher is not None:
+                candidates.append(higher)
+                state["renders"] = 0
+                _cache_counters["quality_probes"] += 1
+        candidates.append(quality)
+        candidates.extend(item for item in _QUALITY_LEVELS if item < quality)
+        return tuple(dict.fromkeys(candidates))
+
+
+def _remember_quality(size: tuple[int, int], quality: int, payload_bytes: int) -> None:
+    with _renderer_cache_lock:
+        previous = _quality_cache.get(size)
+        _quality_cache[size] = {
+            "quality": quality,
+            "bytes": payload_bytes,
+            "renders": previous.get("renders", 0) if previous else 0,
+        }
+        _quality_cache.move_to_end(size)
+        while len(_quality_cache) > _QUALITY_CACHE_LIMIT:
+            _quality_cache.popitem(last=False)
 
 
 ALERT_RECT_COLOR = (180, 0, 255, 255)
@@ -1431,7 +1725,10 @@ def _render_map_once(
     size = canvas.size
     metrics = _render_metrics(size)
     zoom = BASE_MAP_ZOOM + math.log2(metrics.scale)
-    traffic = _traffic_occupancy(canvas, metrics)
+    # This is keyed from the pristine final-size base, before any dashboard
+    # overlays, so a ten-second redraw can skip HSV/palette analysis when
+    # Google has not produced a new frame.
+    traffic = _cached_traffic_occupancy(canvas, metrics)
     draw = ImageDraw.Draw(canvas, "RGBA")
 
     route_paths = [list(line.path) for line in route_lines if len(getattr(line, "path", ())) >= 2]
@@ -1509,11 +1806,14 @@ def _render_map_once(
     image = _append_legend_band(canvas)
     # The caller rerenders overlays at smaller native resolutions when needed;
     # this pass must never resize an already-composed image.
-    for quality in (82, 78, 74, 70, 65, 60):
+    for quality in _quality_candidates(size):
+        with _renderer_cache_lock:
+            _cache_counters["quality_encodes"] += 1
         buffer.seek(0)
         buffer.truncate(0)
         image.save(buffer, format="WEBP", quality=quality, method=6)
         if buffer.tell() <= 100_000:
+            _remember_quality(size, quality, buffer.tell())
             return buffer.getvalue()
     raise _OversizedMapError("map WebP exceeds 100 KB at native resolution")
 

@@ -112,6 +112,97 @@ def test_scheduled_rows_render_unreliable():
     assert estimates[0].unreliable is True
 
 
+def test_two_stop_scheduled_ladder_is_retained():
+    """Two timetable rows at distinct stops corroborate an infrequent route bus."""
+    line = _line()
+    estimates = estimate_bus_positions(
+        [
+            Probe("KMB", "X", "outbound", 3, 2, kind=EtaKind.SCHEDULED),
+            Probe("KMB", "X", "outbound", 4, 4, kind=EtaKind.SCHEDULED),
+        ],
+        [line],
+    )
+    assert len(estimates) == 1
+    assert estimates[0].unreliable is True
+
+
+def test_lone_scheduled_probe_row_is_suppressed():
+    """A single timetable row must not create a phantom infrequent-route bus."""
+    line = _line()
+    assert estimate_bus_positions(
+        [Probe("KMB", "X", "outbound", 3, 2, kind=EtaKind.SCHEDULED)],
+        [line],
+    ) == []
+
+
+def test_sparse_scheduled_route_artifacts_are_suppressed():
+    """Observed long-ETA singleton rows from infrequent routes are phantoms."""
+    cases = (
+        ("KMB", "91M", "outbound", 21, 41.9, 23),
+        ("GMB", "104", "seq-1", 10, 19.9, 24),
+    )
+    for operator, route, bound, index, minutes, stop_count in cases:
+        line = _line(operator, route, bound, stop_count)
+        assert estimate_bus_positions(
+            [Probe(operator, route, bound, index, minutes, kind=EtaKind.SCHEDULED)],
+            [line],
+        ) == []
+
+
+def test_partial_scheduled_sweep_needs_distinct_stop_corroboration():
+    line = _line()
+    singleton = Probe("KMB", "X", "outbound", 3, 2, kind=EtaKind.SCHEDULED)
+    corroborating = Probe("KMB", "X", "outbound", 4, 4, kind=EtaKind.SCHEDULED)
+    assert estimate_bus_positions([singleton], [line]) == []
+    estimates = estimate_bus_positions([singleton, corroborating], [line])
+    assert len(estimates) == 1
+    assert estimates[0].unreliable is True
+
+
+def test_gmb11_close_realtime_convoy_remains_two_vehicles():
+    """Shared downstream stop observations prove two close live vehicles."""
+    line = _line("GMB", "11", "seq-1", 24)
+    estimates = estimate_bus_positions(
+        [
+            Probe("GMB", "11", "seq-1", 10, 4),
+            Probe("GMB", "11", "seq-1", 10, 2),
+            Probe("GMB", "11", "seq-1", 11, 4),
+            Probe("GMB", "11", "seq-1", 11, 2),
+        ],
+        [line],
+    )
+    assert len(estimates) == 2
+    assert sorted(estimate.position for estimate in estimates) == [9.0, 10.0]
+    assert all(not estimate.unreliable for estimate in estimates)
+
+
+def test_lone_realtime_probe_row_is_retained():
+    """A live one-stop observation remains useful even without corroboration."""
+    line = _line()
+    estimates = estimate_bus_positions(
+        [Probe("KMB", "X", "outbound", 3, 2, kind=EtaKind.REALTIME)],
+        [line],
+    )
+    assert len(estimates) == 1
+    assert estimates[0].unreliable is False
+
+
+def test_lone_scheduled_authoritative_gate_row_is_retained():
+    """A direct gate departure is authoritative despite having one stop row."""
+    line = _line()
+    estimates = estimate_bus_positions(
+        [],
+        [line],
+        authoritative_etas=[
+            AuthoritativeProbe(
+                "KMB", "X", "outbound", 3, 2, kind=EtaKind.SCHEDULED
+            )
+        ],
+    )
+    assert len(estimates) == 1
+    assert estimates[0].unreliable is True
+
+
 def test_realtime_ladder_is_reliable():
     line = _line()
     estimates = estimate_bus_positions(
@@ -198,6 +289,10 @@ def test_anchor_cluster_prefers_earliest_realtime_in_positional_order():
     estimates = estimate_bus_positions(
         [
             Probe("KMB", "X", "outbound", 0, 0, kind=EtaKind.SCHEDULED),
+            # Corroborate the scheduled departure at a second stop so this
+            # fixture continues to exercise spatial-order clustering rather
+            # than the sparse-timetable suppression rule.
+            Probe("KMB", "X", "outbound", 1, 2, kind=EtaKind.SCHEDULED),
             Probe("KMB", "X", "outbound", 13, 0, kind=EtaKind.REALTIME),
         ],
         [line],

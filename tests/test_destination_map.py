@@ -1,9 +1,10 @@
 """Destination-map tests: bound-correct wording from gate ETA groups."""
 
+import pytest
+
 from dashboard.maps import _destination_map
 from dashboard.models import EtaKind, EtaRow, Operator, RouteEtaGroup
 from dashboard.providers.route_geometry import RouteLine, Stop
-import pytest
 
 
 @pytest.mark.parametrize("official, expected", [

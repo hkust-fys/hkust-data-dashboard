@@ -10,7 +10,7 @@ import sys
 import types
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops
 
 from dashboard.maps import renderer, tiles
 from dashboard.models import EtaRow, Operator, RouteEtaGroup
@@ -326,6 +326,162 @@ async def test_disconnected_capture_failure_closes_shared_browser_without_deadlo
     await tiles.shutdown_gmaps_browser()
 
 
+@pytest.mark.asyncio
+async def test_capture_reuses_page_and_skips_unchanged_cache_write(tmp_path, monkeypatch):
+    class Browser:
+        def is_connected(self):
+            return True
+
+    class Page:
+        async def evaluate(self, _script):
+            return ["valid"]
+
+        async def close(self):
+            pass
+
+    page = Page()
+    create_calls = []
+    image = Image.new("RGB", (40, 20), (20, 40, 60))
+    async def create(_key):
+        create_calls.append(1)
+        tiles._shared_page = page
+        tiles._shared_context = object()
+        tiles._capture_key = _key
+        return page
+
+    monkeypatch.setattr(tiles, "_get_shared_browser", lambda: _resolved(Browser()))
+    monkeypatch.setattr(tiles, "_create_capture_page", create)
+    monkeypatch.setattr(tiles, "_decode_first_valid_canvas", lambda *_args: image.copy())
+    tiles._shared_browser = Browser()
+    tiles._shared_page = None
+    tiles._shared_context = None
+    tiles._capture_key = None
+    tiles._last_capture_digest = None
+    tiles._last_capture_image = None
+    tiles._last_capture_identity = None
+    tiles._capture_retry_after = 0.0
+    first = await tiles.capture_gmaps_base(str(tmp_path), viewport=(40, 20))
+    cache_path = tmp_path / tiles.cache_filename(tiles.GMAPS_BASE_URL, (40, 20))
+    first_mtime = cache_path.stat().st_mtime_ns
+    await asyncio.sleep(0.01)
+    second = await tiles.capture_gmaps_base(str(tmp_path), viewport=(40, 20))
+    assert first.tobytes() == second.tobytes() and first is not second
+    assert len(create_calls) == 1
+    assert cache_path.stat().st_mtime_ns == first_mtime
+    await tiles.shutdown_gmaps_browser()
+
+
+async def _resolved(value):
+    return value
+
+
+@pytest.mark.asyncio
+async def test_identical_pixels_switching_cache_directory_writes_both_targets(tmp_path, monkeypatch):
+    first_dir = tmp_path / "one"
+    second_dir = tmp_path / "two"
+    image = Image.new("RGB", (40, 20), (20, 40, 60))
+    class Page:
+        async def evaluate(self, _script):
+            return ["valid"]
+        async def close(self):
+            pass
+    page = Page()
+    async def create(key):
+        tiles._shared_page = page
+        tiles._shared_context = object()
+        tiles._capture_key = key
+        return page
+    monkeypatch.setattr(tiles, "_get_shared_browser", lambda: _resolved(object()))
+    monkeypatch.setattr(tiles, "_create_capture_page", create)
+    monkeypatch.setattr(tiles, "_decode_first_valid_canvas", lambda *_args: image.copy())
+    for name in ("_shared_page", "_shared_context", "_capture_key", "_last_capture_digest",
+                 "_last_capture_image", "_last_capture_identity"):
+        setattr(tiles, name, None)
+    tiles._capture_retry_after = 0.0
+    await tiles.capture_gmaps_base(str(first_dir), viewport=(40, 20))
+    await tiles.capture_gmaps_base(str(second_dir), viewport=(40, 20))
+    assert (first_dir / tiles.cache_filename(tiles.GMAPS_BASE_URL, (40, 20))).exists()
+    assert (second_dir / tiles.cache_filename(tiles.GMAPS_BASE_URL, (40, 20))).exists()
+    await tiles.shutdown_gmaps_browser()
+
+
+@pytest.mark.asyncio
+async def test_capture_page_settles_through_placeholders_before_valid_export(monkeypatch):
+    class Page:
+        def __init__(self):
+            self.calls = 0
+        async def goto(self, *_args, **_kwargs):
+            pass
+        async def wait_for_selector(self, *_args, **_kwargs):
+            pass
+        async def evaluate(self, _script):
+            self.calls += 1
+            return ["candidate"]
+    class Context:
+        async def new_page(self):
+            return page
+    class Browser:
+        async def new_context(self, **_kwargs):
+            return context
+    page, context = Page(), Context()
+    monkeypatch.setattr(tiles, "_get_shared_browser", lambda: _resolved(Browser()))
+    outcomes = iter([ValueError("placeholder"), ValueError("placeholder"), Image.new("RGB", (40, 20))])
+    def decode(*_args):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+    monkeypatch.setattr(tiles, "_decode_first_valid_canvas", decode)
+    monkeypatch.setattr(tiles.asyncio, "sleep", lambda _delay: _resolved(None))
+    tiles._shared_page = tiles._shared_context = tiles._capture_key = None
+    await tiles._create_capture_page(("https://example.test", (40, 20)))
+    assert page.calls == 3
+    await tiles._recycle_capture_page()
+
+
+@pytest.mark.asyncio
+async def test_recycle_cancellation_finishes_page_and_context_cleanup():
+    page_started = asyncio.Event()
+    page_release = asyncio.Event()
+    class Resource:
+        def __init__(self, is_page=False):
+            self.closed = False
+            self.is_page = is_page
+        async def close(self):
+            if self.is_page:
+                page_started.set()
+                await page_release.wait()
+            self.closed = True
+    page, context = Resource(True), Resource()
+    tiles._shared_page, tiles._shared_context = page, context
+    task = asyncio.create_task(tiles._recycle_capture_page())
+    await page_started.wait()
+    task.cancel()
+    page_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert page.closed and context.closed
+    assert tiles._shared_page is None and tiles._shared_context is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_clears_last_frame_identity():
+    class Browser:
+        def is_connected(self):
+            return True
+        async def close(self):
+            pass
+    tiles._shared_browser = Browser()
+    tiles._shared_context = tiles._shared_page = None
+    tiles._last_capture_digest = "digest"
+    tiles._last_capture_image = Image.new("RGB", (2, 2))
+    tiles._last_capture_identity = ("cache.png", ("url", (2, 2)))
+    await tiles.shutdown_gmaps_browser()
+    assert tiles._last_capture_digest is None
+    assert tiles._last_capture_image is None
+    assert tiles._last_capture_identity is None
+
+
 def test_interpolated_bus_arrow_uses_the_local_curved_road_tangent():
     # Eastbound road turns north: a bus after the bend must not keep the
     # route-wide eastbound heading.
@@ -432,10 +588,10 @@ def test_displaced_label_connector_runs_from_anchor_to_nearest_edge():
     draw = RecordingDraw(renderer.ImageDraw.Draw(canvas))
     placement = renderer.LabelPlacement("792M", (70, 20, 110, 38), (50, 30), Operator.GMB, 0)
     renderer._draw_bus_route_marker(draw, placement, renderer.OPERATOR_COLORS[Operator.GMB], renderer._font(13))
-    assert draw.line_calls[0] == ((50.0, 30.0, 70.0, 30.0), renderer.OPERATOR_COLORS[Operator.GMB] + (220,))
+    assert draw.line_calls[0] == ((50.0, 30.0, 70.0, 30.0), (0, 0, 0, 255))
 
 
-def test_mixed_group_connector_contains_each_operator_color():
+def test_mixed_group_connector_is_one_opaque_black_link():
     class RecordingDraw:
         def __init__(self, wrapped):
             self.wrapped, self.line_calls = wrapped, []
@@ -449,8 +605,8 @@ def test_mixed_group_connector_contains_each_operator_color():
     placement = renderer.LabelPlacement("91/792M", (90, 20, 170, 56), (50, 38), Operator.KMB, 0, False,
         (("91", Operator.KMB, False), ("792M", Operator.GMB, False)))
     renderer._draw_bus_route_marker(draw, placement, renderer.OPERATOR_COLORS[Operator.KMB], renderer._font(13), phase="connector")
-    assert renderer.OPERATOR_COLORS[Operator.KMB] + (220,) in draw.line_calls
-    assert renderer.OPERATOR_COLORS[Operator.GMB] + (220,) in draw.line_calls
+    assert draw.line_calls
+    assert set(draw.line_calls) == {(0, 0, 0, 255)}
 
 
 def test_bus_direction_arrow_is_centred_at_the_road_anchor():
@@ -638,11 +794,127 @@ def test_grouped_mixed_reliability_draws_pale_dashed_row():
     assert reliable != unreliable
     assert reliable[1] > reliable[0]
     assert unreliable[0] > reliable[0]
-    assert any(
-        70 <= x <= 180 and 58 <= y <= 76 and 70 <= canvas.getpixel((x, y))[0] <= 120
-        and abs(canvas.getpixel((x, y))[0] - canvas.getpixel((x, y))[1]) <= 15
-        for y in range(58, 77) for x in range(70, 181)
+    lower_edge = [canvas.getpixel((70, y)) for y in range(59, 72)]
+    assert any(max(pixel[:3]) < 80 for pixel in lower_edge)
+    assert any(max(pixel[:3]) > 100 for pixel in lower_edge)
+
+
+@pytest.mark.parametrize("rows", [
+    (("live", Operator.KMB, False), ("scheduled", Operator.GMB, True)),
+    (("scheduled", Operator.GMB, True), ("live", Operator.KMB, False)),
+])
+@pytest.mark.parametrize("scale", [1.0, 0.75])
+def test_grouped_rows_share_one_outline_without_horizontal_separators(rows, scale):
+    metrics = renderer.RenderMetrics(scale)
+    canvas = Image.new("RGBA", (round(240 * scale), round(120 * scale)), (255, 255, 255, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    top, bottom = 40 * scale, 78 * scale
+    left, right = 70 * scale, 190 * scale
+    placement = renderer.LabelPlacement(
+        "KMB/GMB", (left, top, right, bottom),
+        (77 * scale, (top + bottom) / 2), Operator.KMB, 0,
+        False, rows,
     )
+    renderer._draw_bus_route_marker(
+        draw, placement, renderer.OPERATOR_COLORS[Operator.KMB],
+        renderer._font(metrics.font_size(13)), metrics=metrics,
+    )
+    midpoint = (top + bottom) / 2
+    # The operator fill changes directly at the row boundary; no black/grey
+    # horizontal border is inserted through the combined box.
+    boundary_pixel = canvas.getpixel((round(right - 12 * scale), round(midpoint)))
+    assert max(boundary_pixel[:3]) > 90
+
+    # Each row still controls its own portion of the outside edge: live is a
+    # continuous stroke, while scheduled has visible dash gaps.
+    radius = metrics.integer(4)
+    for index, (_text, _operator, scheduled) in enumerate(rows):
+        row_top = top + index * (bottom - top) / len(rows)
+        row_bottom = top + (index + 1) * (bottom - top) / len(rows)
+        sample_top = math.ceil(max(row_top, top + radius) + 1)
+        sample_bottom = math.floor(min(row_bottom, bottom - radius) - 1)
+        samples = [
+            canvas.getpixel((round(left), y))
+            for y in range(sample_top, sample_bottom + 1)
+        ]
+        dark = sum(max(pixel[:3]) < 80 for pixel in samples)
+        assert dark > 0
+        if scheduled:
+            assert dark < len(samples)
+        else:
+            assert dark >= len(samples) - 1
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_same_reliability_group_has_one_rounded_outer_border(scheduled):
+    canvas = Image.new("RGBA", (240, 120), (255, 255, 255, 255))
+    rows = (
+        ("91 Diamond Hill", Operator.KMB, scheduled),
+        ("91 Diamond Hill", Operator.KMB, scheduled),
+    )
+    placement = renderer.LabelPlacement(
+        "91 Diamond Hill/91 Diamond Hill", (70, 40, 200, 78),
+        (60, 59), Operator.KMB, 0, scheduled, rows,
+    )
+    renderer._draw_bus_route_marker(
+        renderer.ImageDraw.Draw(canvas), placement,
+        renderer.OPERATOR_COLORS[Operator.KMB], renderer._font(13),
+    )
+    # Rounded outside corner and uninterrupted interior confirm that the two
+    # vehicle rows are items in one marker, not two bordered mini-boxes.
+    assert canvas.getpixel((70, 40)) == (255, 255, 255, 255)
+    assert max(canvas.getpixel((190, 59))[:3]) > 90
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.75])
+def test_timetable_label_is_opaque_and_high_contrast_at_native_scales(scale):
+    metrics = renderer.RenderMetrics(scale)
+    canvas = Image.new("RGBA", (960 if scale == 1 else 720, 120), (20, 20, 20, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    placement = renderer.LabelPlacement(
+        "91", (70 * scale, 40 * scale, 150 * scale, 62 * scale),
+        (30 * scale, 51 * scale), Operator.KMB, 0, True,
+    )
+    renderer._draw_bus_route_marker(
+        draw, placement, renderer.OPERATOR_COLORS[Operator.KMB], renderer._font(metrics.font_size(13)),
+        unreliable=True, metrics=metrics,
+    )
+    # The fill is opaque and the label includes genuinely dark text pixels.
+    fill = canvas.getpixel((round(100 * scale), round(45 * scale)))
+    assert fill[3] == 255
+    assert any(
+        canvas.getpixel((x, y))[0] < 70
+        for x in range(round(70 * scale), round(150 * scale) + 1)
+        for y in range(round(40 * scale), round(62 * scale) + 1)
+    )
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.75])
+def test_bus_arrow_and_connector_use_opaque_native_two_pixel_strokes(scale):
+    metrics = renderer.RenderMetrics(scale)
+
+    class RecordingDraw:
+        def __init__(self):
+            self.lines = []
+        def line(self, xy, *args, **kwargs):
+            self.lines.append(kwargs)
+        def polygon(self, *args, **kwargs):
+            pass
+
+    arrow_draw = RecordingDraw()
+    renderer._draw_colored_bus_arrow(arrow_draw, (40, 40), 0, [renderer.OPERATOR_COLORS[Operator.KMB]], metrics)
+    assert arrow_draw.lines[-1]["width"] == 2
+    assert arrow_draw.lines[-1]["fill"] == (25, 25, 25, 255)
+
+    canvas = Image.new("RGBA", (120, 80), (120, 120, 120, 255))
+    connector_draw = renderer.ImageDraw.Draw(canvas)
+    placement = renderer.LabelPlacement("91", (70, 20, 110, 38), (50, 30), Operator.KMB, 0)
+    renderer._draw_bus_route_marker(
+        connector_draw, placement, renderer.OPERATOR_COLORS[Operator.KMB], renderer._font(13),
+        phase="connector", metrics=metrics,
+    )
+    # A two-pixel opaque connector changes both rows around its midpoint.
+    assert canvas.getpixel((60, 30)) == (0, 0, 0, 255)
 
 
 def test_grouped_right_of_anchor_rows_keep_text_inside_box():
@@ -958,15 +1230,70 @@ def test_legend_uses_native_grey_band_without_inset_panel():
     assert renderer.ALERT_RECT_COLOR[:3] in {
         pixel for _count, pixel in legend.getcolors(maxcolors=1_000_000)
     }
-    swatch = legend.crop((10, 62, 31, 73))
-    assert (255, 255, 255) not in {
-        pixel for _count, pixel in swatch.getcolors(maxcolors=1_000_000)
-    }
     # Attribution is consolidated and minimized at the bottom of the band.
     source = renderer._draw_legend
     import inspect
     text = inspect.getsource(source)
     assert "Map data © Google · Route geometry © Transport Department HKeMobility" in text
+
+
+def test_legend_uses_actual_operator_marker_samples():
+    canvas = Image.new(
+        "RGBA", (renderer.LEGEND_WIDTH, renderer.LEGEND_HEIGHT),
+        (246, 247, 249, 255),
+    )
+    renderer._draw_legend(renderer.ImageDraw.Draw(canvas, "RGBA"), canvas.size)
+    assert canvas.getpixel((95, 28)) == renderer.OPERATOR_COLORS[Operator.KMB] + (245,)
+    assert canvas.getpixel((220, 28)) == renderer.OPERATOR_COLORS[Operator.CITYBUS] + (245,)
+    assert canvas.getpixel((345, 28)) == renderer.OPERATOR_COLORS[Operator.GMB] + (245,)
+    assert canvas.getpixel((95, 48))[3] == 255  # scheduled/pale variant
+
+
+def test_legend_operator_examples_form_an_aligned_table(monkeypatch):
+    placements = []
+    original = renderer._draw_bus_route_marker
+
+    def tracking(draw, placement, color, font, **kwargs):
+        placements.append(placement)
+        return original(draw, placement, color, font, **kwargs)
+
+    monkeypatch.setattr(renderer, "_draw_bus_route_marker", tracking)
+    canvas = Image.new(
+        "RGBA", (renderer.LEGEND_WIDTH, renderer.LEGEND_HEIGHT),
+        (246, 247, 249, 255),
+    )
+    renderer._draw_legend(renderer.ImageDraw.Draw(canvas, "RGBA"), canvas.size)
+
+    assert len(placements) == 6
+    live, scheduled = placements[:3], placements[3:]
+    assert [placement.operator for placement in live] == [
+        Operator.KMB, Operator.CITYBUS, Operator.GMB
+    ]
+    assert [placement.marker[0] for placement in live] == [75, 200, 325]
+    assert [placement.marker[0] for placement in scheduled] == [75, 200, 325]
+    assert {placement.marker[1] for placement in live} == {30}
+    assert {placement.marker[1] for placement in scheduled} == {50}
+    assert [
+        second - first
+        for first, second in zip(
+            renderer.LEGEND_ROW_CENTERS[:-1],
+            renderer.LEGEND_ROW_CENTERS[1:],
+            strict=True,
+        )
+    ] == [20, 20, 20, 20, 20]
+    for first, second in zip(live, scheduled, strict=True):
+        assert first.rect[0] == second.rect[0]
+        assert first.rect[2] == second.rect[2]
+        assert first.rect[3] < second.rect[1]
+
+    legend = Image.open(io.BytesIO(renderer.render_legend())).convert("RGB")
+    background = Image.new("RGB", legend.size, (246, 247, 249))
+    content = ImageChops.difference(legend, background).getbbox()
+    assert content is not None
+    left, top, right, bottom = content
+    assert left >= 10 and top >= 4
+    assert legend.width - right >= 15
+    assert legend.height - bottom >= 5
 
 
 def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_path, monkeypatch):
@@ -1038,7 +1365,7 @@ def test_render_map_draws_connectors_labels_then_arrows_in_global_passes(tmp_pat
             BusEstimate("792M TKO", 22.333400, 114.272881, Operator.GMB, 0.0),
         ], str(tmp_path), base_image=Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white")
     )
-    assert calls == ["connector", "connector", "label", "label", "arrow", "arrow"]
+    assert calls[:6] == ["connector", "connector", "label", "label", "arrow", "arrow"]
 
 
 def test_render_map_returns_bounded_webp_with_legend_band(tmp_path):
@@ -1088,12 +1415,16 @@ def test_attribution_remains_dark_and_legible_after_lossy_webp_at_native_sizes()
         decoded = Image.open(io.BytesIO(buffer.getvalue())).convert("RGB")
         mask = Image.new("L", decoded.size, 0)
         attribution = "Map data © Google · Route geometry © Transport Department HKeMobility"
-        origin = (60 * scale, height + 20 * scale)
-        text_xy = (origin[0] + metrics.px(10), origin[1] + metrics.px(94))
-        renderer.ImageDraw.Draw(mask).text(
-            text_xy, attribution, fill=255,
-            font=renderer._font(metrics.font_size(9, minimum=7)),
+        origin = (60 * scale, height)
+        attribution_font = renderer._font(metrics.font_size(9, minimum=7))
+        mask_draw = renderer.ImageDraw.Draw(mask)
+        bounds = mask_draw.textbbox((0, 0), attribution, font=attribution_font)
+        center_y = height + metrics.px(renderer.LEGEND_ROW_CENTERS[-1])
+        text_xy = (
+            origin[0] + metrics.px(10),
+            center_y - (bounds[1] + bounds[3]) / 2,
         )
+        mask_draw.text(text_xy, attribution, fill=255, font=attribution_font)
         bbox = mask.getbbox()
         assert bbox is not None
         glyph_luma = []
@@ -1196,8 +1527,63 @@ def test_bus_markers_merge_matching_route_operator_at_same_position():
         renderer.BASE_MAP_ZOOM,
         (renderer.MAP_WIDTH, renderer.MAP_HEIGHT),
     )
+    assert len(markers) == 3
+    assert [marker.routes for marker in markers] == [
+        ("91 Diamond Hill",), ("91 Diamond Hill",), ("91M Po Lam",)
+    ]
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.75])
+@pytest.mark.parametrize("reliabilities", [(False, False), (False, True)])
+def test_duplicate_estimates_stack_rows_but_share_one_anchor_marker(scale, reliabilities):
+    from dashboard.maps.positions import BusEstimate
+
+    size = (round(renderer.MAP_WIDTH * scale), round(renderer.MAP_HEIGHT * scale))
+    metrics = renderer.RenderMetrics(scale)
+    estimates = [
+        BusEstimate("91 Diamond Hill", 22.334, 114.230, Operator.KMB, 0.0, unreliable=flag)
+        for flag in reliabilities
+    ]
+    markers = renderer._merge_bus_markers(
+        estimates, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM + math.log2(scale), size, metrics,
+    )
+    canvas = Image.new("RGBA", size, (255, 255, 255, 255))
+    placements = renderer._layout_bus_labels(
+        markers, renderer.ImageDraw.Draw(canvas), renderer._font(metrics.font_size(13)),
+        size, metrics=metrics,
+    )
     assert len(markers) == 2
-    assert [marker.routes for marker in markers] == [("91 Diamond Hill",), ("91M Po Lam",)]
+    assert len(placements) == 1
+    assert len(placements[0].rows) == 2
+    assert [row[0] for row in placements[0].rows] == [
+        "91 Diamond Hill", "91 Diamond Hill"
+    ]
+    assert [row[2] for row in placements[0].rows] == list(reliabilities)
+
+    class RecordingDraw:
+        def __init__(self):
+            self.lines = 0
+            self.polygons = 0
+
+        def line(self, *_args, **_kwargs):
+            self.lines += 1
+
+        def polygon(self, *_args, **_kwargs):
+            self.polygons += 1
+
+    connector = RecordingDraw()
+    renderer._draw_bus_route_marker(
+        connector, placements[0], renderer.OPERATOR_COLORS[Operator.KMB],
+        renderer._font(metrics.font_size(13)), phase="connector", metrics=metrics,
+    )
+    arrow = RecordingDraw()
+    renderer._draw_bus_route_marker(
+        arrow, placements[0], renderer.OPERATOR_COLORS[Operator.KMB],
+        renderer._font(metrics.font_size(13)), phase="arrow", metrics=metrics,
+    )
+    assert connector.lines == 1
+    assert arrow.polygons == 1
 
 
 def test_off_map_bus_prediction_has_no_marker_or_label():
@@ -1305,7 +1691,7 @@ def test_native_legend_uses_scaled_metrics_without_raster_resize(monkeypatch):
         Image.new("RGB", (renderer.MIN_MAP_WIDTH, renderer.MIN_MAP_HEIGHT), "white")
     )
     assert composite.size == (720, 585)
-    assert calls == [((720, 180), 1.5, (45.0, 15.0))]
+    assert calls == [((720, 180), 1.5, (45.0, 0.0))]
 
 
 def test_generators_survive_native_candidate_retries(tmp_path, monkeypatch):
@@ -1393,7 +1779,10 @@ def test_scaled_authored_metrics_cover_fonts_arrows_and_traffic(tmp_path, monkey
     )
     assert len(encoded) <= 100_000
     decoded = Image.open(io.BytesIO(encoded))
-    assert decoded.size == (renderer.MIN_MAP_WIDTH, renderer.MIN_MAP_HEIGHT + 180)
+    assert decoded.size == (
+        renderer.MIN_MAP_WIDTH,
+        renderer.MIN_MAP_HEIGHT + round(renderer.LEGEND_BAND_HEIGHT * 0.75),
+    )
     assert 10 in font_sizes  # map labels/gate labels
     assert 18 in font_sizes  # 12 px legend copy authored directly at 1.5x
 

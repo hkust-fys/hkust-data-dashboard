@@ -39,6 +39,12 @@ CAPTURE_FAILURE_BACKOFF_SECONDS = 10 * 60.0
 _capture_retry_after = 0.0
 _playwright_manager = None
 _shared_browser = None
+_shared_context = None
+_shared_page = None
+_capture_key: tuple[str, tuple[int, int]] | None = None
+_last_capture_digest: str | None = None
+_last_capture_image: Image.Image | None = None
+_last_capture_identity: tuple[str, tuple[str, tuple[int, int]]] | None = None
 _capture_lock: asyncio.Lock | None = None
 _capture_lock_loop = None
 _browser_loop = None
@@ -47,6 +53,12 @@ _browser_loop = None
 async def _close_shared_browser() -> None:
     """Close shared resources, retaining globals until both closes finish."""
     global _playwright_manager, _shared_browser, _browser_loop
+    global _shared_context, _shared_page, _capture_key
+    global _last_capture_digest, _last_capture_image, _last_capture_identity
+    await _recycle_capture_page()
+    _last_capture_digest = None
+    _last_capture_image = None
+    _last_capture_identity = None
     browser, manager = _shared_browser, _playwright_manager
     if browser is not None:
         with contextlib.suppress(Exception):
@@ -102,22 +114,73 @@ async def shutdown_gmaps_browser() -> None:
         await _close_shared_browser()
 
 
-async def _close_capture_context(context) -> None:
-    if context is None:
-        return
-    close_task = asyncio.create_task(context.close())
+async def _bounded_close(resource) -> bool:
+    """Close a Playwright resource, returning whether cancellation occurred."""
+    if resource is None:
+        return False
+    close = getattr(resource, "close", None)
+    if close is None:
+        return False
+    task = asyncio.create_task(close())
+    cancelled = False
     try:
-        await asyncio.wait_for(asyncio.shield(close_task), timeout=5.0)
-    except TimeoutError:
-        close_task.cancel()
-        await asyncio.gather(close_task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
     except asyncio.CancelledError:
+        cancelled = True
         try:
-            await asyncio.wait_for(asyncio.shield(close_task), timeout=5.0)
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
         except (TimeoutError, asyncio.CancelledError):
-            close_task.cancel()
-            await asyncio.gather(close_task, return_exceptions=True)
-        raise
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        except Exception:
+            await asyncio.gather(task, return_exceptions=True)
+    except Exception:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    return cancelled
+
+
+async def _recycle_capture_page() -> None:
+    """Close the persistent page/context, retaining the browser process."""
+    global _shared_context, _shared_page, _capture_key
+    page, context = _shared_page, _shared_context
+    _shared_page = None
+    _shared_context = None
+    _capture_key = None
+    cancelled = await _bounded_close(page)
+    context_cancelled = await _bounded_close(context)
+    if cancelled or context_cancelled:
+        raise asyncio.CancelledError
+
+
+def _capture_digest(image: Image.Image) -> str:
+    """Hash normalized RGB pixels, excluding encoder/file metadata."""
+    rgb = image.convert("RGB")
+    return hashlib.sha256(rgb.tobytes()).hexdigest()
+
+
+async def _create_capture_page(key: tuple[str, tuple[int, int]]):
+    """Create, navigate, and settle a page, tolerating loading placeholders."""
+    global _shared_context, _shared_page, _capture_key
+    browser = await _get_shared_browser()
+    _shared_context = await browser.new_context(
+        viewport={"width": key[1][0], "height": key[1][1]}
+    )
+    _shared_page = await _shared_context.new_page()
+    _capture_key = key
+    await _shared_page.goto(key[0], wait_until="domcontentloaded", timeout=30000)
+    await _shared_page.wait_for_selector("canvas", timeout=15000)
+    deadline = asyncio.get_running_loop().time() + 25.0
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            data_urls = await _shared_page.evaluate(CANVAS_EXPORT_SCRIPT)
+            _decode_first_valid_canvas(data_urls, key[1])
+        except ValueError:
+            await asyncio.sleep(1.0)
+            continue
+        await asyncio.sleep(1.5)
+        return _shared_page
+    raise ValueError("Google Maps canvas did not finish rendering")
 
 # Google Maps changes its DOM names regularly. Find the map bitmap without
 # relying on any of those names: a candidate must be visible, occupy most of
@@ -286,7 +349,8 @@ async def capture_gmaps_base(
     viewport: tuple[int, int] = (VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
 ) -> Image.Image:
     """Export Google Maps' visible map canvas with its traffic layer."""
-    global _capture_retry_after
+    global _capture_retry_after, _shared_context, _shared_page, _capture_key
+    global _last_capture_digest, _last_capture_image, _last_capture_identity
     # Version the cache so a previously captured 1920x1080/zoom-15 map can
     # never be reused as the new zoom-14 base.
     cache_path = os.path.join(cache_dir, cache_filename(url, viewport))
@@ -301,49 +365,43 @@ async def capture_gmaps_base(
         _capture_lock = asyncio.Lock()
         _capture_lock_loop = loop
     async with _capture_lock:
+        key = (url, viewport)
         try:
-            browser = await _get_shared_browser()
-            context = None
-            try:
-                context = await browser.new_context(
-                    viewport={"width": viewport[0], "height": viewport[1]}
-                )
-                page = await context.new_page()
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_selector("canvas", timeout=15000)
+            await _get_shared_browser()
+            if _capture_key != key or _shared_page is None or _shared_context is None:
+                await _recycle_capture_page()
+                await _create_capture_page(key)
 
-                # Google first paints an opaque 256 px tile-placeholder grid.
-                # Poll until a detailed canvas appears, then recapture after a
-                # short settling interval so late roads, labels, and traffic
-                # paint operations are included.
-                deadline = asyncio.get_running_loop().time() + 25.0
-                image = None
-                while asyncio.get_running_loop().time() < deadline:
-                    try:
-                        data_urls = await page.evaluate(CANVAS_EXPORT_SCRIPT)
-                        _decode_first_valid_canvas(data_urls, viewport)
-                    except ValueError:
-                        await asyncio.sleep(1.0)
-                        continue
-                    await asyncio.sleep(1.5)
-                    data_urls = await page.evaluate(CANVAS_EXPORT_SCRIPT)
+            # A crashed page can be recovered once without throwing away the
+            # browser process. This also handles transient evaluation errors.
+            for attempt in range(2):
+                try:
+                    data_urls = await _shared_page.evaluate(CANVAS_EXPORT_SCRIPT)
                     image = _decode_first_valid_canvas(data_urls, viewport)
                     break
-                if image is None:
-                    raise ValueError("Google Maps canvas did not finish rendering")
-            finally:
-                # Recycle only this capture's context; Chromium remains alive
-                # for the next frame. Closing a context can involve IPC and
-                # must still be given a bounded chance when cancelled.
-                await _close_capture_context(context)
-
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if attempt:
+                        raise
+                    await _recycle_capture_page()
+                    await _create_capture_page(key)
+            digest = _capture_digest(image)
+            identity = (os.path.abspath(cache_path), key)
+            if digest == _last_capture_digest and _last_capture_image is not None and identity == _last_capture_identity:
+                return _last_capture_image.copy()
             temporary_path = cache_path + ".tmp"
             image.save(temporary_path, format="PNG")
             os.replace(temporary_path, cache_path)
+            _last_capture_digest = digest
+            _last_capture_image = image.copy()
+            _last_capture_identity = identity
             return image
         except asyncio.CancelledError:
+            await _recycle_capture_page()
             raise
         except Exception as exc:  # noqa: BLE001
+            await _recycle_capture_page()
             if _shared_browser is not None:
                 with contextlib.suppress(Exception):
                     if not _shared_browser.is_connected():

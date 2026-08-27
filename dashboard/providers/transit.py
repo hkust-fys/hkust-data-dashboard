@@ -8,6 +8,7 @@ to call concurrently.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -107,8 +108,46 @@ class _GmbGateCache:
 
 _gmb_gate_cache = _GmbGateCache()
 
-# ETA TTL is the provider cache window; the bot renders at its own cadence.
-TRANSIT_TTL_SECONDS = 25.0
+# ETA network refreshes are deliberately slower than the map/render cadence.
+# The dashboard may render every ten seconds, but polling the estimator feeds
+# every render tick causes avoidable bursts (especially against GMB). Cached
+# observations are aged and served between refreshes.
+TRANSIT_NETWORK_REFRESH_SECONDS = 30.0
+
+
+@dataclass
+class _GateEtaCache:
+    stored: tuple[float, list[EtaRow], datetime | None, list[str]] | None = None
+
+    def set(
+        self,
+        rows: list[EtaRow],
+        latest: datetime | None,
+        failed: list[str],
+    ) -> None:
+        self.stored = (time.monotonic(), list(rows), latest, list(failed))
+
+    def get(self) -> tuple[list[EtaRow], datetime | None, list[str]] | None:
+        if self.stored is None:
+            return None
+        stamped, rows, latest, failed = self.stored
+        elapsed_minutes = int(max(0.0, time.monotonic() - stamped) // 60.0)
+        aged: list[EtaRow] = []
+        for row in rows:
+            if row.minutes is None:
+                aged.append(row)
+            elif row.minutes - elapsed_minutes >= 0:
+                aged.append(replace(row, minutes=row.minutes - elapsed_minutes))
+        return aged, latest, list(failed)
+
+
+_gate_eta_cache = _GateEtaCache()
+_gate_network_refresh_at: float | None = None
+_gate_refresh_task: asyncio.Task | None = None
+_probe_network_refresh_at: float | None = None
+_probe_refresh_task: asyncio.Task | None = None
+_gate_refresh_waiters = 0
+_probe_refresh_waiters = 0
 
 
 # --------------------------------------------------------------------------
@@ -428,13 +467,48 @@ async def fetch_transit_etas(
     failing does not discard the others; failed operator names are returned so
     the renderer can surface an error.
     """
+    global _gate_network_refresh_at, _gate_refresh_task, _gate_refresh_waiters
+    now_mono = time.monotonic()
+    cached = _gate_eta_cache.get()
+    if (cached is not None and _gate_network_refresh_at is not None
+            and now_mono - _gate_network_refresh_at < TRANSIT_NETWORK_REFRESH_SECONDS):
+        rows, latest, failed = cached
+        return group_etas(rows), latest, failed
+
+    if _gate_refresh_task is None or _gate_refresh_task.done():
+        # Claim the refresh slot and publish the task before awaiting it. A
+        # concurrent cold-start caller joins this task instead of seeing an
+        # artificial empty response or launching another operator sweep.
+        _gate_network_refresh_at = now_mono
+        _gate_refresh_task = asyncio.create_task(_refresh_gate_etas(client))
+    task = _gate_refresh_task
+    _gate_refresh_waiters += 1
+    waiter_registered = True
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        _gate_refresh_waiters -= 1
+        waiter_registered = False
+        if not task.done() and _gate_refresh_waiters == 0:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            _gate_network_refresh_at = None
+        raise
+    finally:
+        if waiter_registered and _gate_refresh_waiters > 0:
+            _gate_refresh_waiters -= 1
+        if task.done() and _gate_refresh_task is task:
+            _gate_refresh_task = None
+
+
+async def _refresh_gate_etas(
+    client: HttpClient,
+) -> tuple[list[RouteEtaGroup], datetime | None, list[str]]:
+    """Perform one uncached gate sweep; callers coordinate through the task."""
     now = datetime.now(UTC)
     results = await client.gather_any(
-        [
-            _fetch_kmb(client, now),
-            _fetch_citybus(client, now),
-            _fetch_gmb(client, now),
-        ]
+        [_fetch_kmb(client, now), _fetch_citybus(client, now), _fetch_gmb(client, now)]
     )
     operator_names = ["KMB", "Citybus", "GMB"]
     rows: list[EtaRow] = []
@@ -449,6 +523,7 @@ async def fetch_transit_etas(
         for row in result:
             if row.source_time and (latest is None or row.source_time > latest):
                 latest = row.source_time
+    _gate_eta_cache.set(rows, latest, failed)
     return group_etas(rows), latest, failed
 
 
@@ -459,8 +534,8 @@ async def fetch_transit_etas(
 # Probe cache holds the last value per fetch group. The ceiling is deliberately
 # longer than a complete sweep so early and late groups coexist, while still
 # removing departed vehicles during a prolonged provider outage. Twenty GMB
-# groups per 10-second cycle cover the current 91-group set in about 50 seconds
-# until any 403 response steps the live limit down.
+# groups per 30-second network refresh cover the current 91-group set in about
+# 150 seconds until any 403 response steps the live limit down.
 # The 15-minute ceiling therefore still bounds prolonged outage staleness.
 PROBE_TTL_SECONDS = 900.0
 
@@ -479,7 +554,14 @@ class ProbeEta:
 
 
 def _probe_cache_key(probe) -> str:
-    return f"{probe.operator}:{probe.route}:{probe.bound}:{probe.stop_id}"
+    key = f"{probe.operator}:{probe.route}:{probe.bound}:{probe.stop_id}"
+    # GMB circular routes can visit the same physical stop more than once in
+    # one route sequence.  The response distinguishes those visits by
+    # stop_seq, so retain one cache entry per official occurrence while the
+    # fetch-group key below still performs only one HTTP request per stop.
+    if probe.operator == "GMB":
+        key += f":{probe.index}"
+    return key
 
 
 def _fetch_group_key(probe) -> str:
@@ -650,13 +732,28 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
             continue
         if entry.get("route_seq") != probe.sequence:
             continue
+        # A physical stop can occur more than once on a circular route.  An
+        # ETA entry belongs only to its official occurrence; treating every
+        # matching route entry as this probe creates phantom ladders.
+        entry_stop_seq = entry.get("stop_seq")
+        if entry_stop_seq is not None:
+            try:
+                if int(entry_stop_seq) != int(probe.index) + 1:
+                    continue
+            except (TypeError, ValueError):
+                continue
         last = -1
         for eta in entry.get("eta") or []:
-            diff = eta.get("diff")
-            try:
-                minutes = float(diff) if diff is not None else None
-            except (TypeError, ValueError):
-                minutes = None
+            # GMB supplies an exact arrival timestamp alongside rounded
+            # integer `diff`.  The timestamp keeps staggered stop probes on a
+            # common clock and reduces false ladder splits at minute edges.
+            minutes = _precise_minutes_until(eta.get("timestamp"), now)
+            if minutes is None:
+                diff = eta.get("diff")
+                try:
+                    minutes = float(diff) if diff is not None else None
+                except (TypeError, ValueError):
+                    minutes = None
             if minutes is None or minutes < last:
                 continue
             last = minutes
@@ -675,6 +772,62 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
 
 
 async def fetch_probe_etas(
+    client: HttpClient,
+    probes: Sequence[Any],
+    max_per_cycle: int = 36,
+) -> list[ProbeEta]:
+    """Return cached probe observations, refreshing the network at most every 30s."""
+    global _probe_network_refresh_at, _probe_refresh_task, _probe_refresh_waiters
+    if not probes:
+        return []
+    now_mono = time.monotonic()
+    if ((_probe_refresh_task is None or _probe_refresh_task.done())
+            and _probe_network_refresh_at is not None
+            and now_mono - _probe_network_refresh_at < TRANSIT_NETWORK_REFRESH_SECONDS):
+        return _collect_probe_cache(probes)
+    if _probe_refresh_task is None or _probe_refresh_task.done():
+        _probe_network_refresh_at = now_mono
+        _probe_refresh_task = asyncio.create_task(
+            _refresh_probe_etas(client, probes, max_per_cycle)
+        )
+    task = _probe_refresh_task
+    _probe_refresh_waiters += 1
+    waiter_registered = True
+    try:
+        await asyncio.shield(task)
+        # The shared refresh is parameterized by its first caller's probe
+        # subset. Re-collect from this caller's keys after it completes so a
+        # concurrent caller never receives another caller's marker list.
+        return _collect_probe_cache(probes)
+    except asyncio.CancelledError:
+        _probe_refresh_waiters -= 1
+        waiter_registered = False
+        if not task.done() and _probe_refresh_waiters == 0:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            _probe_network_refresh_at = None
+        raise
+    finally:
+        if waiter_registered and _probe_refresh_waiters > 0:
+            _probe_refresh_waiters -= 1
+        if task.done() and _probe_refresh_task is task:
+            _probe_refresh_task = None
+
+
+def _collect_probe_cache(probes: Sequence[Any]) -> list[ProbeEta]:
+    unique: dict[str, Any] = {}
+    for probe in probes:
+        unique.setdefault(_probe_cache_key(probe), probe)
+    return [
+        eta
+        for key in unique
+        if (cached := _probe_cache.get(key)) is not None
+        for eta in cached
+    ]
+
+
+async def _refresh_probe_etas(
     client: HttpClient,
     probes: Sequence[Any],
     max_per_cycle: int = 36,

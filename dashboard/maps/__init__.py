@@ -167,23 +167,71 @@ async def fetch_traffic_map(
     current TD traffic news; it never represents a whole transit route.
     """
     base_image_task = asyncio.create_task(capture_gmaps_base(cache_dir=cache_dir))
+    operation_tasks: list[asyncio.Task[object]] = [base_image_task]
     public_stops: list[Stop] = []
     route_lines: list[object] = []
     # Disk-backed geometry is immediate; a cold cache is independently bounded
     # by the provider.  Start it alongside browser capture so routing trouble
     # can never delay launching the required Google Maps screenshot.
     geometry_task = asyncio.create_task(fetch_route_geometry(client, cache_dir=cache_dir))
+    operation_tasks.append(geometry_task)
+    base_image: object | None = None
+    probe_task: asyncio.Task[object] | None = None
     try:
-        base_image = await base_image_task
-        geometry = await geometry_task
-        public_stops = geometry.stops
-        route_lines = list(geometry.routes)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("public stop geometry unavailable: %s", type(exc).__name__)
+        # Geometry determines the probe set, so it is the first dependency we
+        # await.  The browser capture remains in flight while a cold geometry
+        # cache is populated, and the probe sweep starts as soon as the lines
+        # are available rather than waiting for the screenshot.
+        try:
+            geometry = await geometry_task
+        except Exception as exc:  # noqa: BLE001
+            log.warning("public stop geometry unavailable: %s", type(exc).__name__)
+        else:
+            public_stops = geometry.stops
+            route_lines = list(geometry.routes)
+            probes = select_probe_stops(route_lines) if route_lines else []
+            probe_task = asyncio.create_task(fetch_probe_etas(client, probes))
+            operation_tasks.append(probe_task)
+
+        # Collect independent work together.  return_exceptions keeps a
+        # failed probe or capture from cancelling its sibling, while the
+        # finally block below guarantees cleanup on parent cancellation.
+        capture_result, probe_result = await asyncio.gather(
+            base_image_task,
+            probe_task if probe_task is not None else asyncio.sleep(0, result=None),
+            return_exceptions=True,
+        )
+        if isinstance(capture_result, BaseException):
+            log.warning("Google traffic map capture failed: %s", type(capture_result).__name__)
+        else:
+            base_image = capture_result
+
+        estimates: list[BusEstimate] = []
+        probe_etas = []
+        if probe_task is not None:
+            if isinstance(probe_result, BaseException):
+                log.warning("probe ETA estimation failed: %s", type(probe_result).__name__)
+            else:
+                probe_etas = probe_result or []
+                try:
+                    estimates = estimate_bus_positions(
+                        probe_etas,
+                        route_lines,
+                        _destination_map(groups or [], route_lines),
+                        _authoritative_etas(groups or [], route_lines),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("probe ETA estimation failed: %s", type(exc).__name__)
+                    estimates = []
+        log.info(
+            "map markers: %d probe ETAs -> %d bus estimates",
+            len(probe_etas),
+            len(estimates),
+        )
     finally:
-        # If the parent is cancelled (or capture/geometry fails), do not leave
-        # the sibling task running beyond this map operation.
-        siblings = [task for task in (base_image_task, geometry_task) if not task.done()]
+        # If the parent is cancelled (or an operation fails), do not leave a
+        # sibling task running beyond this map operation.
+        siblings = [task for task in operation_tasks if not task.done()]
         for task in siblings:
             task.cancel()
         if siblings:
@@ -194,27 +242,8 @@ async def fetch_traffic_map(
             Stop("HKUST-S", "HKUST South Gate", 22.333360, 114.262881),
         ]
 
-    estimates: list[BusEstimate] = []
-    if route_lines:
-        probes = select_probe_stops(route_lines)
-        # Keep this initialized: a provider failure should still leave the
-        # required Google base map renderable without estimated markers.
-        probe_etas = []
-        try:
-            probe_etas = await fetch_probe_etas(client, probes)
-            estimates = estimate_bus_positions(
-                probe_etas,
-                route_lines,
-                _destination_map(groups or [], route_lines),
-                _authoritative_etas(groups or [], route_lines),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("probe ETA estimation failed: %s", type(exc).__name__)
-        log.info(
-            "map markers: %d probe ETAs -> %d bus estimates",
-            len(probe_etas),
-            len(estimates),
-        )
+    if base_image is None:
+        return None, []
     try:
         webp = await asyncio.to_thread(
             render_map,

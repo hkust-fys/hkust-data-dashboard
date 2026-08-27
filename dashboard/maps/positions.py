@@ -200,6 +200,14 @@ def estimate_bus_positions(
             if position < 0 or position > stops_count - 1:
                 continue
             unreliable = all(rung[2] for rung in ladder)
+            # A lone scheduled probe row is not enough evidence to reconstruct
+            # a vehicle on an infrequent route: it can be a stale timetable
+            # departure rather than a bus currently in service.  Require
+            # either live evidence, a direct/authoritative gate rung, or
+            # corroboration from two distinct probe stops.  Do not apply this
+            # to realtime rows, even when only one stop reported the vehicle.
+            if unreliable and not direct and len({rung[1] for rung in ladder}) < 2:
+                continue
             section = min(math.floor(position), stops_count - 2)
             bucket = candidates.setdefault(
                 (operator_name, route, bound, section), []
@@ -232,6 +240,11 @@ def estimate_bus_positions(
         clusters: list[list[tuple[float, bool, frozenset[int], bool]]] = [[anchors[0]]]
         for anchor in anchors[1:]:
             cluster_stops = set().union(*(item[2] for item in clusters[-1]))
+            # Shared stop provenance means that one source snapshot exposed
+            # both departures simultaneously.  Keep them distinct even when
+            # their inferred positions are close: upstream stops stop listing
+            # a bus after it passes, so far-away upstream ETAs do not refute a
+            # close pair confirmed at downstream stops.
             if (abs(anchor[0] - clusters[-1][-1][0]) <= 1.0
                     and cluster_stops.isdisjoint(anchor[2])):
                 clusters[-1].append(anchor)

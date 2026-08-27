@@ -1,7 +1,8 @@
 """Transit provider tests: KMB/Citybus/GMB parsing, ordering, markers, and the
 verified GMB directional-variant IDs."""
 
-from datetime import UTC
+import asyncio
+from datetime import UTC, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -25,7 +26,17 @@ def _reset_gmb_state(monkeypatch):
     monkeypatch.setattr(transit, "_gmb_cooldown_until", 0.0)
     monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 20)
     transit._gmb_gate_cache._stored = None  # noqa: SLF001
+    transit._gate_eta_cache.stored = None  # noqa: SLF001
     transit._probe_cache._store.clear()  # noqa: SLF001
+    monkeypatch.setattr(transit, "_gate_network_refresh_at", None)
+    monkeypatch.setattr(transit, "_probe_network_refresh_at", None)
+    monkeypatch.setattr(transit, "_gate_refresh_task", None)
+    monkeypatch.setattr(transit, "_probe_refresh_task", None)
+    monkeypatch.setattr(transit, "_gate_refresh_waiters", 0)
+    monkeypatch.setattr(transit, "_probe_refresh_waiters", 0)
+    # Existing parser/rotation tests intentionally model successive refreshes;
+    # cadence behavior is covered explicitly by the tests below.
+    monkeypatch.setattr(transit, "TRANSIT_NETWORK_REFRESH_SECONDS", 0.0)
 
 
 @pytest.mark.parametrize("operator", ["KMB", "CTB", "GMB"])
@@ -61,6 +72,48 @@ def test_probe_cache_expires_only_after_multi_sweep_ceiling():
     now[0] += 2
     assert cache.get("probe") is None
     assert "probe" not in cache._store  # noqa: SLF001
+
+
+def test_gmb_probe_parser_uses_matching_stop_sequence_and_precise_timestamp():
+    now = s.utc()
+    probe = SimpleNamespace(
+        operator="GMB", route="104", bound="seq-1", stop_id="gate",
+        route_id=2007200, sequence=1, index=0,
+    )
+    raw = {
+        "data": [
+            {
+                "enabled": True, "route_id": 2007200, "route_seq": 1,
+                "stop_seq": 24,
+                "eta": [{"diff": 1, "timestamp": (now + timedelta(minutes=1)).isoformat()}],
+            },
+            {
+                "enabled": True, "route_id": 2007200, "route_seq": 1,
+                "stop_seq": 1,
+                "eta": [
+                    {
+                        "diff": 99,
+                        "timestamp": (now + timedelta(seconds=90)).isoformat(),
+                    },
+                    {"diff": 4},
+                ],
+            },
+        ]
+    }
+    rows = transit._parse_probe_etas(probe, raw, now)  # noqa: SLF001
+    assert [row.minutes for row in rows] == pytest.approx([1.5, 4.0])
+    assert {row.index for row in rows} == {0}
+
+
+def test_gmb_repeated_physical_stop_occurrences_have_distinct_cache_keys():
+    first = SimpleNamespace(
+        operator="GMB", route="104", bound="seq-1", stop_id="gate", index=0,
+    )
+    returning = SimpleNamespace(
+        operator="GMB", route="104", bound="seq-1", stop_id="gate", index=23,
+    )
+    assert transit._probe_cache_key(first) != transit._probe_cache_key(returning)  # noqa: SLF001
+    assert transit._fetch_group_key(first) == transit._fetch_group_key(returning)  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -228,6 +281,187 @@ class _StubClient:
         from datetime import datetime
 
         return datetime.now(UTC)
+
+
+@pytest.mark.asyncio
+async def test_gate_refresh_interval_serves_cached_rows(monkeypatch):
+    """A ten-second render must not trigger another operator sweep."""
+    calls = 0
+    row = s.eta_row("91", "Diamond Hill", "S", 5)
+
+    async def fetch(_client, _now):
+        nonlocal calls
+        calls += 1
+        return [row]
+
+    monkeypatch.setattr(transit, "TRANSIT_NETWORK_REFRESH_SECONDS", 30.0)
+    monkeypatch.setattr(transit, "_fetch_kmb", fetch)
+    monkeypatch.setattr(transit, "_fetch_citybus", fetch)
+    monkeypatch.setattr(transit, "_fetch_gmb", fetch)
+
+    class Client:
+        async def gather_any(self, coroutines):
+            return await asyncio.gather(*coroutines)
+
+    import asyncio
+
+    first, _, _ = await transit.fetch_transit_etas(Client())
+    second, _, _ = await transit.fetch_transit_etas(Client())
+    assert calls == 3
+    assert [r.minutes for r in first[0].rows] == [5, 5, 5]
+    assert [r.minutes for r in second[0].rows] == [5, 5, 5]
+
+
+@pytest.mark.asyncio
+async def test_probe_refresh_interval_serves_aged_cache(monkeypatch):
+    probe = SimpleNamespace(
+        operator="GMB", route="11", bound="seq-1", stop_id="stop",
+        route_id=1, sequence=1, index=0,
+    )
+    calls = 0
+
+    async def fetch(_client, _probe):
+        nonlocal calls
+        calls += 1
+        return {"data": [{"enabled": True, "route_id": 1, "route_seq": 1,
+                           "eta": [{"diff": 4}]}]}
+
+    monkeypatch.setattr(transit, "TRANSIT_NETWORK_REFRESH_SECONDS", 30.0)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    first = await transit.fetch_probe_etas(object(), [probe])
+    second = await transit.fetch_probe_etas(object(), [probe])
+    assert calls == 1
+    assert first[0].minutes == pytest.approx(4)
+    assert second[0].minutes <= first[0].minutes
+
+
+@pytest.mark.asyncio
+async def test_refresh_cadence_uses_deterministic_clock_and_ages_correctly(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(transit.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        transit, "_probe_cache", transit.ProbeEtaCache(clock=lambda: clock[0])
+    )
+    monkeypatch.setattr(transit, "TRANSIT_NETWORK_REFRESH_SECONDS", 30.0)
+    gate_calls = 0
+    row = s.eta_row("91", "Diamond Hill", "S", 5)
+
+    async def gate_fetch(_client, _now):
+        nonlocal gate_calls
+        gate_calls += 1
+        return [row]
+
+    monkeypatch.setattr(transit, "_fetch_kmb", gate_fetch)
+    monkeypatch.setattr(transit, "_fetch_citybus", gate_fetch)
+    monkeypatch.setattr(transit, "_fetch_gmb", gate_fetch)
+
+    class Client:
+        async def gather_any(self, coroutines):
+            import asyncio
+            return await asyncio.gather(*coroutines)
+
+    first, _, _ = await transit.fetch_transit_etas(Client())
+    clock[0] += 10
+    ten_seconds, _, _ = await transit.fetch_transit_etas(Client())
+    assert gate_calls == 3
+    assert ten_seconds[0].rows[0].minutes == first[0].rows[0].minutes
+    clock[0] += 20
+    resumed, _, _ = await transit.fetch_transit_etas(Client())
+    assert gate_calls == 6
+    assert resumed[0].rows[0].minutes == 5
+
+    probe = SimpleNamespace(
+        operator="GMB", route="11", bound="seq-1", stop_id="probe-stop",
+        route_id=1, sequence=1, index=0,
+    )
+    probe_calls = 0
+
+    async def probe_fetch(_client, _probe):
+        nonlocal probe_calls
+        probe_calls += 1
+        return {"data": [{"enabled": True, "route_id": 1, "route_seq": 1,
+                           "eta": [{"diff": 4}]}]}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", probe_fetch)
+    first_probe = await transit.fetch_probe_etas(object(), [probe])
+    clock[0] += 10
+    aged_probe = await transit.fetch_probe_etas(object(), [probe])
+    assert probe_calls == 1
+    assert aged_probe[0].minutes == pytest.approx(first_probe[0].minutes - 1 / 6)
+    clock[0] += 20
+    await transit.fetch_probe_etas(object(), [probe])
+    assert probe_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_probe_callers_receive_only_their_requested_markers(monkeypatch):
+    probes = [
+        SimpleNamespace(operator="GMB", route=route, bound="seq-1", stop_id=route,
+                        route_id=1, sequence=1, index=0)
+        for route in ("first", "second")
+    ]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(_client, probe):
+        started.set()
+        await release.wait()
+        return {"data": [{"enabled": True, "route_id": 1, "route_seq": 1,
+                           "eta": [{"diff": 4}]}]}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    first_task = asyncio.create_task(transit.fetch_probe_etas(object(), probes[:1]))
+    await started.wait()
+    second_task = asyncio.create_task(transit.fetch_probe_etas(object(), probes[1:]))
+    await asyncio.sleep(0)
+    release.set()
+    first, second = await asyncio.gather(first_task, second_task)
+    assert {eta.route for eta in first} == {"first"}
+    assert second == []
+
+
+@pytest.mark.asyncio
+async def test_canceling_one_probe_waiter_keeps_shared_refresh_alive(monkeypatch):
+    probe = SimpleNamespace(operator="GMB", route="11", bound="seq-1", stop_id="stop",
+                            route_id=1, sequence=1, index=0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(_client, _probe):
+        started.set()
+        await release.wait()
+        return {"data": [{"enabled": True, "route_id": 1, "route_seq": 1,
+                           "eta": [{"diff": 4}]}]}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    first = asyncio.create_task(transit.fetch_probe_etas(object(), [probe]))
+    await started.wait()
+    second = asyncio.create_task(transit.fetch_probe_etas(object(), [probe]))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    result = await second
+    assert result and result[0].route == "11"
+
+
+@pytest.mark.asyncio
+async def test_done_probe_task_inside_cadence_returns_cache(monkeypatch):
+    probe = SimpleNamespace(operator="GMB", route="11", bound="seq-1", stop_id="stop",
+                            route_id=1, sequence=1, index=0)
+    cached = transit.ProbeEta("GMB", "11", "seq-1", "stop", 0, 3)
+    transit._probe_cache.set(transit._probe_cache_key(probe), [cached])  # noqa: SLF001
+    transit._probe_network_refresh_at = transit.time.monotonic()  # noqa: SLF001
+    transit._probe_refresh_task = asyncio.create_task(asyncio.sleep(0))  # noqa: SLF001
+    await asyncio.sleep(0)
+
+    async def must_not_fetch(_client, _probe):
+        raise AssertionError("refresh should be gated")
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", must_not_fetch)
+    result = await transit.fetch_probe_etas(object(), [probe])
+    assert result == [cached]
 
 
 @pytest.mark.asyncio

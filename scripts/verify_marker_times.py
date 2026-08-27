@@ -20,9 +20,22 @@ if str(ROOT) not in sys.path:
 from dashboard.config import Settings  # noqa: E402
 from dashboard.http import HttpClient  # noqa: E402
 from dashboard.maps import _authoritative_etas, _destination_map  # noqa: E402
-from dashboard.maps.positions import _label_for, _path_segment_length, estimate_bus_positions  # noqa: E402
-from dashboard.providers.route_geometry import fetch_route_geometry, select_probe_stops  # noqa: E402
-from dashboard.providers.transit import CTB_STOPS, GMB_STOPS, KMB_STOPS, fetch_probe_etas, fetch_transit_etas  # noqa: E402
+from dashboard.maps.positions import (  # noqa: E402
+    _label_for,
+    _path_segment_length,
+    estimate_bus_positions,
+)
+from dashboard.providers.route_geometry import (  # noqa: E402
+    fetch_route_geometry,
+    select_probe_stops,
+)
+from dashboard.providers.transit import (  # noqa: E402
+    CTB_STOPS,
+    GMB_STOPS,
+    KMB_STOPS,
+    fetch_probe_etas,
+    fetch_transit_etas,
+)
 
 
 def _operator(value: object) -> str:

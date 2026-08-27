@@ -279,6 +279,7 @@ def _to_payload(results: dict[str, object]) -> DashboardPayload:
         statuses, incidents, roadworks, capture_time, traffic_stale = [], [], [], None, []
 
     # The map provider returns the Google base image and retained markers.
+    map_result_present = "traffic_map" in results
     smap_result = results.get("traffic_map")
     if isinstance(smap_result, Exception):
         map_webp: bytes | None = None
@@ -286,7 +287,8 @@ def _to_payload(results: dict[str, object]) -> DashboardPayload:
         map_webp = smap_result[0]
     else:
         map_webp = None
-    if map_webp is None:
+    map_initializing = not map_result_present
+    if map_webp is None and map_result_present:
         errors.append("traffic map unavailable")
     map_source_time = None
 
@@ -304,6 +306,7 @@ def _to_payload(results: dict[str, object]) -> DashboardPayload:
         incidents=incidents,
         capture_time=capture_time,
         traffic_map_webp=map_webp,
+        traffic_map_initializing=map_initializing,
         transit_source_time=transit_source_time,
         map_source_time=map_source_time,
         roadworks=roadworks,

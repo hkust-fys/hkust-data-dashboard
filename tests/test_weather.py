@@ -10,6 +10,7 @@ from PIL import Image
 from dashboard.models import WeatherWarning
 from dashboard.providers.weather import (
     _fetch_warning_icons,
+    _normalize_warning_icon,
     _warning_icon_cache,
     _warning_metadata_from_warntoday,
     parse_observations,
@@ -197,6 +198,40 @@ async def test_warning_icon_bytes_are_fetched_once_and_cached():
     assert first.icon_data.startswith(b"\x89PNG")
     assert second.icon_data == first.icon_data
     assert client.calls == 1
+
+
+def test_normalize_warning_gif_selects_visible_frame_and_writes_static_png():
+    frames = [Image.new("RGBA", (8, 8), (255, 255, 255, 0)), Image.new("RGBA", (8, 8), (255, 0, 0, 255))]
+    output = io.BytesIO()
+    frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0, disposal=2)
+
+    normalized = _normalize_warning_icon(output.getvalue())
+
+    assert normalized is not None
+    assert normalized.startswith(b"\x89PNG")
+    with Image.open(io.BytesIO(normalized)) as image:
+        assert image.format == "PNG"
+        assert image.getbbox() is not None
+        assert image.getpixel((4, 4))[:3] == (255, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_warning_gif_is_cached_as_static_png():
+    frames = [Image.new("RGBA", (8, 8), (255, 255, 255, 0)), Image.new("RGBA", (8, 8), (0, 0, 255, 255))]
+    output = io.BytesIO()
+    frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0, disposal=2)
+    payload = output.getvalue()
+
+    class Client:
+        async def fetch_bytes(self, _url, max_bytes):
+            assert max_bytes == 256 * 1024
+            return payload
+
+    _warning_icon_cache.clear()
+    warning = WeatherWarning("WTS", "Thunderstorm Warning", icon_url="https://www.hko.gov.hk/images_e/ts.gif")
+    await _fetch_warning_icons(Client(), [warning])
+    assert warning.icon_data.startswith(b"\x89PNG")
+    assert b"GIF" not in warning.icon_data[:16]
 
 
 @pytest.mark.asyncio

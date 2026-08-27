@@ -193,13 +193,7 @@ def _build_weather_embed(weather: WeatherConditions | None) -> discord.Embed | N
     snap = weather.snapshot
 
     lines: list[str] = []
-    thumbnail: str | None = None
     if warnings:
-        # Discord has one thumbnail slot; keep the first official icon visible
-        # and leave all warning names inline in the description.
-        icons = [w.icon_url for w in warnings if w.icon_url]
-        if icons:
-            thumbnail = icons[0]
         for w in warnings:
             line = _esc(w.name)
             if w.issued_at:
@@ -230,8 +224,6 @@ def _build_weather_embed(weather: WeatherConditions | None) -> discord.Embed | N
     if len(value) > DESC_MAX:
         value = value[: DESC_MAX - 1] + "…"
     embed = discord.Embed(color=0xE0AF68, title=title, description=value)
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
     source_time = snap.source_time if snap and snap.source_time else weather.warning_time
     return _set_source_timestamp(embed, "HKO", source_time)
 
@@ -280,6 +272,18 @@ def _build_traffic_map_embed(
         description=description,
     )
     embed.set_image(url="attachment://traffic-map.webp")
+    return _set_source_timestamp(embed, "Google traffic", source_time)
+
+
+def _build_traffic_map_initializing_embed(
+    source_time: datetime | None = None,
+) -> discord.Embed:
+    """Show the map's reserved slot while its first capture is still pending."""
+    embed = discord.Embed(
+        title="Traffic map initializing",
+        color=0x2563EB,
+        description="The traffic map is being prepared.",
+    )
     return _set_source_timestamp(embed, "Google traffic", source_time)
 
 
@@ -448,6 +452,7 @@ def build_payload(
     errors: list[str] | None = None,
     roads: object | None = None,
     now: datetime | None = None,
+    traffic_map_initializing: bool = False,
 ) -> DashboardPayload:
     """Compose the dashboard payload, enforcing every Discord limit.
 
@@ -458,7 +463,9 @@ def build_payload(
     payload = DashboardPayload()
     checked_at = now or datetime.now(UTC)
 
-    # 1. Image-first traffic map.
+    # 1. Image-first traffic map. During incremental startup, reserve this
+    # slot even before the map provider has returned; a present-but-failed
+    # result is handled as a genuine source error below instead.
     if traffic_map_webp:
         map_embed = _build_traffic_map_embed(
             traffic_map_webp,
@@ -475,6 +482,10 @@ def build_payload(
                     source_time=map_source_time,
                 )
             )
+    elif traffic_map_initializing:
+        payload.embeds.append(
+            _build_traffic_map_initializing_embed(map_source_time or checked_at)
+        )
 
     # 3. Traffic text is a separate pane so the map remains legible.
     payload.embeds.append(

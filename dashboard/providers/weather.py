@@ -44,6 +44,7 @@ HKO_ORIGIN = "https://www.hko.gov.hk/"
 WARNTODAY_URL = "https://www.hko.gov.hk/wxinfo/dailywx/wxwarntoday.json"
 WARNTODAY_TTL_SECONDS = 5 * 60.0
 _warning_icon_cache: dict[str, bytes] = {}
+_WARNING_ICON_MAX_BYTES = 256 * 1024
 
 # The Pre-No. 8 Special Announcement is HKO's ~2-hour advance notice before
 # Tropical Cyclone Warning Signal No. 8. It appears as a statement in the
@@ -336,20 +337,56 @@ async def _fetch_warning_icons(
             warning.icon_data = cached
             return
         try:
-            data = await client.fetch_bytes(warning.icon_url, max_bytes=256 * 1024)
+            data = await client.fetch_bytes(warning.icon_url, max_bytes=_WARNING_ICON_MAX_BYTES)
         except Exception as exc:  # noqa: BLE001
             log.warning("HKO warning icon fetch failed for %s: %s", warning.code, exc)
             return
         try:
-            with Image.open(io.BytesIO(data)) as icon:
-                icon.verify()
+            normalized = _normalize_warning_icon(data)
         except (OSError, UnidentifiedImageError, Image.DecompressionBombError):
             log.warning("HKO warning icon response was not a valid image for %s", warning.code)
             return
-        _warning_icon_cache[warning.icon_url] = data
-        warning.icon_data = data
+        if normalized is None:
+            log.warning("HKO warning icon response had no usable frame for %s", warning.code)
+            return
+        _warning_icon_cache[warning.icon_url] = normalized
+        warning.icon_data = normalized
 
     await asyncio.gather(*(load(warning) for warning in warnings))
+
+
+def _normalize_warning_icon(data: bytes) -> bytes | None:
+    """Return one deterministic, static PNG frame from an HKO icon.
+
+    HKO publishes blinking GIFs whose blank frame must not become the
+    dashboard's thumbnail.  Score every frame by the amount of visible
+    foreground (alpha coverage and contrast against its corner background),
+    retaining the earliest frame on ties for deterministic output.
+    """
+    with Image.open(io.BytesIO(data)) as source:
+        best: tuple[int, int, Image.Image] | None = None
+        frame_count = getattr(source, "n_frames", 1)
+        for index in range(frame_count):
+            source.seek(index)
+            frame = source.convert("RGBA")
+            pixels = frame.load()
+            background = pixels[0, 0]
+            foreground = 0
+            for pixel in frame.getdata():
+                if pixel[3] and (pixel[:3] != background[:3] or pixel[3] != background[3]):
+                    foreground += 1
+            # Alpha coverage breaks ties for flat-colour icons; foreground
+            # contrast is the primary signal for blink/blank frames.
+            score = foreground * 2 + sum(1 for pixel in frame.getdata() if pixel[3])
+            candidate = (score, -index, frame.copy())
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+        if best is None:
+            return None
+        output = io.BytesIO()
+        best[2].save(output, format="PNG", optimize=True)
+    normalized = output.getvalue()
+    return normalized if normalized and len(normalized) <= _WARNING_ICON_MAX_BYTES else None
 
 
 async def fetch_weather_conditions(

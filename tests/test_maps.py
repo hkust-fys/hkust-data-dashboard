@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import io
 import math
 import sys
@@ -365,8 +365,8 @@ def test_public_stop_markers_are_offset_on_opposite_road_sides(tmp_path, monkeyp
     captured: list[tuple[float, float, float]] = []
     original = renderer._draw_marker_on_left
 
-    def tracking(draw, x, y, heading, color, square):
-        result = original(draw, x, y, heading, color, square)
+    def tracking(draw, x, y, heading, color, square, metrics=renderer.DEFAULT_METRICS):
+        result = original(draw, x, y, heading, color, square, metrics)
         if square:
             captured.append((result[0], result[1], heading))
         return result
@@ -391,9 +391,7 @@ def test_stop_glyphs_are_eight_pixels():
         assert (right - left, bottom - top) == (8, 8)
 
 
-def test_bus_estimate_is_a_colored_route_pill_with_embedded_white_direction_triangle():
-    import inspect
-
+def test_bus_estimate_has_operator_colored_arrow_separate_from_label():
     canvas = Image.new("RGBA", (80, 80), (120, 120, 120, 255))
     renderer._draw_bus_route_marker(
         renderer.ImageDraw.Draw(canvas),
@@ -404,13 +402,58 @@ def test_bus_estimate_is_a_colored_route_pill_with_embedded_white_direction_tria
     colors = {pixel[:3] for _count, pixel in canvas.getcolors(maxcolors=1_000_000)}
     assert (20, 20, 20) in colors  # compact dark label outline
     assert renderer.OPERATOR_COLORS[Operator.KMB] in colors
-    assert (255, 255, 255) in colors  # route text and embedded direction triangle
-    assert "draw.line" not in inspect.getsource(renderer._draw_bus_route_marker)
+    assert canvas.getpixel((20, 30))[:3] == renderer.OPERATOR_COLORS[Operator.KMB]
     assert not hasattr(renderer, "_draw_bus_marker")
     assert not hasattr(renderer, "_draw_bus_label_pointer")
 
 
-def test_bus_direction_arrow_is_centred_in_the_pill_at_the_road_anchor():
+def test_mixed_operator_arrow_contains_each_operator_color():
+    canvas = Image.new("RGBA", (80, 80), (120, 120, 120, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    renderer._draw_colored_bus_arrow(draw, (40, 40), 0, [
+        renderer.OPERATOR_COLORS[Operator.KMB], renderer.OPERATOR_COLORS[Operator.GMB]
+    ])
+    colors = {canvas.getpixel((x, y))[:3] for x in range(34, 47) for y in range(34, 47)}
+    assert renderer.OPERATOR_COLORS[Operator.KMB] in colors
+    assert renderer.OPERATOR_COLORS[Operator.GMB] in colors
+    assert (25, 25, 25) in colors
+
+
+def test_displaced_label_connector_runs_from_anchor_to_nearest_edge():
+    class RecordingDraw:
+        def __init__(self, wrapped):
+            self.wrapped, self.line_calls = wrapped, []
+        def line(self, xy, *args, **kwargs):
+            self.line_calls.append((xy, kwargs.get("fill")))
+            return self.wrapped.line(xy, *args, **kwargs)
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+    canvas = Image.new("RGBA", (120, 80), (120, 120, 120, 255))
+    draw = RecordingDraw(renderer.ImageDraw.Draw(canvas))
+    placement = renderer.LabelPlacement("792M", (70, 20, 110, 38), (50, 30), Operator.GMB, 0)
+    renderer._draw_bus_route_marker(draw, placement, renderer.OPERATOR_COLORS[Operator.GMB], renderer._font(13))
+    assert draw.line_calls[0] == ((50.0, 30.0, 70.0, 30.0), renderer.OPERATOR_COLORS[Operator.GMB] + (220,))
+
+
+def test_mixed_group_connector_contains_each_operator_color():
+    class RecordingDraw:
+        def __init__(self, wrapped):
+            self.wrapped, self.line_calls = wrapped, []
+        def line(self, xy, *args, **kwargs):
+            self.line_calls.append(kwargs.get("fill"))
+            return self.wrapped.line(xy, *args, **kwargs)
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+    canvas = Image.new("RGBA", (180, 100), (120, 120, 120, 255))
+    draw = RecordingDraw(renderer.ImageDraw.Draw(canvas))
+    placement = renderer.LabelPlacement("91/792M", (90, 20, 170, 56), (50, 38), Operator.KMB, 0, False,
+        (("91", Operator.KMB, False), ("792M", Operator.GMB, False)))
+    renderer._draw_bus_route_marker(draw, placement, renderer.OPERATOR_COLORS[Operator.KMB], renderer._font(13), phase="connector")
+    assert renderer.OPERATOR_COLORS[Operator.KMB] + (220,) in draw.line_calls
+    assert renderer.OPERATOR_COLORS[Operator.GMB] + (220,) in draw.line_calls
+
+
+def test_bus_direction_arrow_is_centred_at_the_road_anchor():
     marker = renderer.BusMarker(("91",), 40, 40, Operator.KMB, 0.0)
     canvas = Image.new("RGBA", (120, 90), (120, 120, 120, 255))
     draw = renderer.ImageDraw.Draw(canvas)
@@ -421,10 +464,7 @@ def test_bus_direction_arrow_is_centred_in_the_pill_at_the_road_anchor():
         sum(point[1] for point in triangle) / 3,
     )
     assert centroid == placement.marker == (marker.x, marker.y)
-    assert placement.rect[0] <= marker.x <= placement.rect[2]
-    assert placement.rect[1] <= marker.y <= placement.rect[3]
-    assert (placement.rect[1] + placement.rect[3]) / 2 == marker.y
-    assert placement.rect[0] < marker.x < placement.rect[2]
+    assert not renderer._rects_overlap(placement.rect, renderer._arrow_footprint(placement.marker), padding=0)
 
 
 def test_bus_label_layout_stacks_collisions_without_overlap_and_deterministic():
@@ -439,16 +479,16 @@ def test_bus_label_layout_stacks_collisions_without_overlap_and_deterministic():
     second = renderer._layout_bus_labels(markers, draw, font, canvas.size)
     assert first == second
     # Every marker keeps a pill (nothing dropped) and every pill keeps its
-    # white pointer inside its own box.
-    assert len(first) == len(markers)
+    # Every marker retains a visible label and immutable arrow anchor.
+    assert len(first) == 2
     for placement in first:
         left, top, right, bottom = placement.rect
         assert 0 <= left < right <= canvas.width
         assert 0 <= top < bottom <= canvas.height
-        assert right - left >= 20  # full-size pill, never squashed
+        assert right - left >= 8  # full-size label, never squashed
         pointer_x, pointer_y = placement.marker
-        assert left + 2 <= pointer_x <= right - 2
-        assert top + 2 <= pointer_y <= bottom - 2
+        assert 0 <= pointer_x <= canvas.width
+        assert 0 <= pointer_y <= canvas.height
     # Stacked pills never overlap each other.
     for index, placement in enumerate(first):
         assert all(
@@ -467,11 +507,331 @@ def test_bus_label_layout_merges_convoy_on_the_road_row():
     placed = renderer._layout_bus_labels(markers, draw, font, canvas.size)
     assert len(placed) == 1
     placement = placed[0]
-    # Road row: pill vertically centred on the anchor with the white triangle
-    # exactly at the road point.
-    assert (placement.rect[1] + placement.rect[3]) / 2 == 80
     assert placement.marker == (150, 80)
-    assert placement.rect[0] < 150 < placement.rect[2]
+    assert not renderer._rects_overlap(placement.rect, renderer._arrow_footprint(placement.marker), padding=0)
+
+
+def test_bus_label_layout_uses_left_side_when_right_is_blocked():
+    canvas = Image.new("RGBA", (180, 100), (255, 255, 255, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    marker = renderer.BusMarker(("792M TKO",), 140, 50, Operator.GMB, 0)
+    placed = renderer._layout_bus_labels(
+        [marker], draw, renderer._font(13), canvas.size,
+        placed_rects=[(120, 35, 178, 65)],
+    )
+    assert placed[0].rect[2] <= 120
+    assert placed[0].marker == (140, 50)
+
+
+def test_bus_label_layout_clusters_same_anchor_with_per_row_operator_colors():
+    canvas = Image.new("RGBA", (240, 120), (255, 255, 255, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    markers = [
+        renderer.BusMarker(("792M TKO",), 100, 60, Operator.GMB, 0),
+        renderer.BusMarker(("91 Diamond Hill",), 106, 61, Operator.KMB, 0),
+    ]
+    placed = renderer._layout_bus_labels(markers, draw, renderer._font(13), canvas.size)
+    assert len(placed) == 1
+    assert [row[1] for row in placed[0].rows] == [Operator.GMB, Operator.KMB]
+    assert placed[0].marker == (100, 60)
+
+
+def test_bus_label_layout_keeps_opposite_direction_arrows_separate():
+    canvas = Image.new("RGBA", (240, 120), (255, 255, 255, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    markers = [
+        renderer.BusMarker(("91 east",), 100, 60, Operator.KMB, 0),
+        renderer.BusMarker(("91 west",), 101, 60, Operator.KMB, math.pi),
+    ]
+    placed = renderer._layout_bus_labels(markers, draw, renderer._font(13), canvas.size)
+    assert len(placed) == 2
+    assert {placement.marker for placement in placed} == {(100, 58.0), (101, 62.0)}
+
+
+def test_bus_label_layout_offsets_grouped_direction_against_opposite_group():
+    canvas = Image.new("RGBA", (240, 120), (255, 255, 255, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    markers = [
+        renderer.BusMarker(("91",), 100, 60, Operator.KMB, 0),
+        renderer.BusMarker(("91M",), 104, 60, Operator.KMB, 0),
+        renderer.BusMarker(("792M",), 101, 60, Operator.GMB, math.pi),
+    ]
+    placed = renderer._layout_bus_labels(markers, draw, renderer._font(13), canvas.size)
+    assert len(placed) == 2
+    assert {placement.marker for placement in placed} == {(100.0, 58.0), (101.0, 62.0)}
+
+
+def test_grouped_label_spiral_avoids_initially_occupied_slots():
+    canvas = Image.new("RGBA", (240, 180), (255, 255, 255, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    markers = [
+        renderer.BusMarker(("792M TKO",), 120, 90, Operator.GMB, 0),
+        renderer.BusMarker(("91 Diamond Hill",), 124, 90, Operator.KMB, 0),
+    ]
+    occupied = [(0, 0, 240, 60), (0, 70, 110, 110), (130, 70, 240, 110)]
+    extra_arrow = (112, 148, 124, 160)
+    occupied.append(extra_arrow)
+    placed = renderer._layout_bus_labels(markers, draw, renderer._font(13), canvas.size, occupied)
+    assert len(placed) == 1
+    rect = placed[0].rect
+    assert 0 <= rect[0] < rect[2] <= canvas.width
+    assert 0 <= rect[1] < rect[3] <= canvas.height
+    assert not renderer._rects_overlap(rect, occupied[0])
+    assert not renderer._rects_overlap(rect, occupied[1])
+    assert not renderer._rects_overlap(rect, occupied[2])
+    assert not renderer._rects_overlap(rect, extra_arrow, padding=0)
+
+
+def test_singleton_left_label_reserves_arrow_only_on_left_half():
+    canvas = Image.new("RGBA", (180, 80), (255, 255, 255, 255))
+    class RecordingDraw:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.text_calls = []
+
+        def text(self, xy, text, *args, **kwargs):
+            self.text_calls.append((xy, text))
+            return self.wrapped.text(xy, text, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    draw = RecordingDraw(renderer.ImageDraw.Draw(canvas))
+    placement = renderer.LabelPlacement("792M TKO", (20, 25, 105, 43), (100, 34), Operator.GMB, 0)
+    renderer._draw_bus_route_marker(draw, placement, renderer.OPERATOR_COLORS[Operator.GMB], renderer._font(13))
+    text_x, _ = draw.text_calls[-1][0]
+    width = draw.textlength("792M TKO", font=renderer._font(13))
+    assert text_x == 24
+    assert text_x + width <= 101
+
+
+def test_displaced_singleton_text_stays_inside_selected_box():
+    canvas = Image.new("RGBA", (180, 80), (255, 255, 255, 255))
+    class RecordingDraw:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.text_calls = []
+        def text(self, xy, text, *args, **kwargs):
+            self.text_calls.append((xy, text))
+            return self.wrapped.text(xy, text, *args, **kwargs)
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+    draw = RecordingDraw(renderer.ImageDraw.Draw(canvas))
+    placement = renderer.LabelPlacement("792M TKO", (120, 25, 210, 43), (95, 34), Operator.GMB, 0)
+    renderer._draw_bus_route_marker(draw, placement, renderer.OPERATOR_COLORS[Operator.GMB], renderer._font(13))
+    text_x, _ = draw.text_calls[-1][0]
+    width = draw.textlength("792M TKO", font=renderer._font(13))
+    assert text_x == 124
+    assert text_x + width <= 206
+
+
+def test_grouped_mixed_reliability_draws_pale_dashed_row():
+    canvas = Image.new("RGBA", (240, 120), (255, 255, 255, 255))
+    draw = renderer.ImageDraw.Draw(canvas)
+    placement = renderer.LabelPlacement(
+        "11/792M", (70, 40, 180, 76), (77, 58), Operator.GMB, 0,
+        False, (("11", Operator.GMB, False), ("792M", Operator.GMB, True)),
+    )
+    renderer._draw_bus_route_marker(draw, placement, renderer.OPERATOR_COLORS[Operator.GMB], renderer._font(13))
+    reliable = canvas.getpixel((130, 49))
+    unreliable = canvas.getpixel((130, 67))
+    assert reliable != unreliable
+    assert reliable[1] > reliable[0]
+    assert unreliable[0] > reliable[0]
+    assert any(
+        70 <= x <= 180 and 58 <= y <= 76 and 70 <= canvas.getpixel((x, y))[0] <= 120
+        and abs(canvas.getpixel((x, y))[0] - canvas.getpixel((x, y))[1]) <= 15
+        for y in range(58, 77) for x in range(70, 181)
+    )
+
+
+def test_grouped_right_of_anchor_rows_keep_text_inside_box():
+    canvas = Image.new("RGBA", (240, 120), (255, 255, 255, 255))
+    class RecordingDraw:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.text_calls = []
+        def text(self, xy, text, *args, **kwargs):
+            self.text_calls.append((xy, text))
+            return self.wrapped.text(xy, text, *args, **kwargs)
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+    draw = RecordingDraw(renderer.ImageDraw.Draw(canvas))
+    placement = renderer.LabelPlacement(
+        "11/792M", (120, 40, 220, 76), (100, 58), Operator.GMB, 0,
+        False, (("11", Operator.GMB, False), ("792M", Operator.GMB, True)),
+    )
+    renderer._draw_bus_route_marker(draw, placement, renderer.OPERATOR_COLORS[Operator.GMB], renderer._font(13))
+    for ((text_x, _y), _text), (text, _operator, _unreliable) in zip(
+        draw.text_calls, placement.rows, strict=True
+    ):
+        assert text_x == 124
+        assert text_x + draw.textlength(text, font=renderer._font(13)) <= 216
+
+
+def test_traffic_mask_ignores_pale_green_land_and_keeps_google_traffic_colors():
+    base = Image.new("RGB", (80, 40), (202, 239, 211))
+    draw = renderer.ImageDraw.Draw(base)
+    captured_palette = (
+        (22, 224, 152), (255, 224, 104), (250, 198, 49),
+        (247, 74, 85), (169, 39, 39),
+    )
+    assert captured_palette == renderer.GOOGLE_TRAFFIC_COLORS
+    for index, color in enumerate(captured_palette):
+        draw.rectangle((5 + index * 14, 17, 15 + index * 14, 21), fill=color)
+    occupancy = renderer._traffic_occupancy(base)
+    assert occupancy.overlap((0, 0, 4, 8))[0] == 0
+    for index in range(5):
+        count, _area = occupancy.overlap((5 + index * 14, 15, 16 + index * 14, 24))
+        assert count > 0
+
+
+def test_traffic_colored_pixels_steer_bus_label_to_clear_candidate():
+    canvas = Image.new("RGBA", (240, 120), "white")
+    draw = renderer.ImageDraw.Draw(canvas)
+    mask = Image.new("L", canvas.size, 0)
+    renderer.ImageDraw.Draw(mask).rectangle((0, 0, 99, 119), fill=255)
+    traffic = renderer.TrafficOccupancy(mask)
+    marker = renderer.BusMarker(("91 Diamond Hill",), 110, 60, Operator.KMB, 0)
+    placement = renderer._layout_bus_labels(
+        [marker], draw, renderer._font(13), canvas.size, traffic=traffic
+    )[0]
+    assert placement.marker == (110, 60)
+    assert placement.rect[0] >= 120
+    assert traffic.overlap(placement.rect)[0] == 0
+
+
+def test_grouped_label_also_avoids_traffic_colored_candidate():
+    canvas = Image.new("RGBA", (280, 160), "white")
+    draw = renderer.ImageDraw.Draw(canvas)
+    mask = Image.new("L", canvas.size, 0)
+    renderer.ImageDraw.Draw(mask).rectangle((0, 0, 129, 159), fill=255)
+    traffic = renderer.TrafficOccupancy(mask)
+    markers = [
+        renderer.BusMarker(("91 Diamond Hill",), 140, 80, Operator.KMB, 0),
+        renderer.BusMarker(("11 Choi Hung",), 143, 80, Operator.GMB, 0),
+    ]
+    placement = renderer._layout_bus_labels(
+        markers, draw, renderer._font(13), canvas.size, traffic=traffic
+    )[0]
+    assert placement.rect[0] >= 150
+    assert traffic.overlap(placement.rect)[0] == 0
+
+
+def test_unavoidable_traffic_keeps_bus_label_local_and_bounded():
+    canvas = Image.new("RGBA", (180, 90), "white")
+    traffic = renderer.TrafficOccupancy(Image.new("L", canvas.size, 255))
+    marker = renderer.BusMarker(("792M TKO",), 90, 45, Operator.GMB, 0)
+    placement = renderer._layout_bus_labels(
+        [marker], renderer.ImageDraw.Draw(canvas), renderer._font(13), canvas.size,
+        traffic=traffic,
+    )[0]
+    left, top, right, bottom = placement.rect
+    assert 0 <= left < right <= canvas.width
+    assert 0 <= top < bottom <= canvas.height
+    assert (top + bottom) / 2 == pytest.approx(marker.y)
+    assert min(abs(right - marker.x), abs(left - marker.x)) <= 11
+    assert traffic.overlap(placement.rect)[0] > 0
+
+
+def test_bus_anchor_snaps_perpendicularly_to_traffic_band():
+    base = Image.new("RGB", (200, 120), (232, 238, 233))
+    renderer.ImageDraw.Draw(base).line((70, 50, 130, 50), fill=(22, 224, 152), width=5)
+    occupancy = renderer._traffic_occupancy(base)
+    snapped = occupancy.snap_anchor((100, 60), 0.0)
+    assert snapped[0] == pytest.approx(100)
+    assert 48 <= snapped[1] <= 52
+    assert math.hypot(snapped[0] - 100, snapped[1] - 60) <= 10
+
+
+def test_bus_anchor_without_traffic_retains_exact_route_anchor():
+    occupancy = renderer.TrafficOccupancy(Image.new("L", (200, 120), 0))
+    assert occupancy.snap_anchor((100, 60), 0.75) == (100, 60)
+
+
+def test_bus_anchor_does_not_jump_forward_to_along_route_traffic():
+    mask = Image.new("L", (200, 120), 0)
+    renderer.ImageDraw.Draw(mask).rectangle((107, 58, 145, 62), fill=255)
+    occupancy = renderer.TrafficOccupancy(mask)
+    assert occupancy.snap_anchor((100, 60), 0.0) == (100, 60)
+
+
+def test_saturated_circular_map_icon_does_not_attract_bus_anchor():
+    base = Image.new("RGB", (200, 120), (232, 238, 233))
+    renderer.ImageDraw.Draw(base).ellipse((96, 48, 104, 56), fill=(247, 74, 85))
+    occupancy = renderer._traffic_occupancy(base)
+    assert occupancy.snap_anchor((100, 60), 0.0) == (100, 60)
+
+
+def test_strong_right_road_band_beats_weak_left_speck():
+    mask = Image.new("L", (200, 120), 0)
+    draw = renderer.ImageDraw.Draw(mask)
+    draw.line((92, 52, 108, 52), fill=255, width=1)  # credible but weak left trace
+    draw.line((70, 69, 130, 69), fill=255, width=5)  # dense right road band
+    occupancy = renderer.TrafficOccupancy(mask)
+    snapped = occupancy.snap_anchor((100, 60), 0.0)
+    assert snapped[1] > 60
+    assert snapped[0] == pytest.approx(100)
+
+
+def test_strong_left_road_band_beats_weak_center_trace():
+    mask = Image.new("L", (200, 120), 0)
+    draw = renderer.ImageDraw.Draw(mask)
+    draw.line((92, 60, 108, 60), fill=255, width=1)
+    draw.line((70, 50, 130, 50), fill=255, width=5)
+    occupancy = renderer.TrafficOccupancy(mask)
+    snapped = occupancy.snap_anchor((100, 60), 0.0)
+    assert snapped[1] < 60
+    assert snapped != (100, 60)
+
+
+def test_left_side_anchor_snap_reverses_with_opposing_heading():
+    mask = Image.new("L", (200, 120), 0)
+    draw = renderer.ImageDraw.Draw(mask)
+    draw.rectangle((75, 49, 125, 52), fill=255)
+    draw.rectangle((75, 68, 125, 71), fill=255)
+    occupancy = renderer.TrafficOccupancy(mask)
+    eastbound = occupancy.snap_anchor((100, 60), 0.0)
+    westbound = occupancy.snap_anchor((100, 60), math.pi)
+    assert eastbound[1] < 60  # screen-up is left for eastbound traffic
+    assert westbound[1] > 60  # screen-down is left after heading reversal
+    assert eastbound[0] == pytest.approx(westbound[0], abs=0.01)
+
+
+def test_traffic_snap_then_opposing_separation_keeps_each_arrow_on_its_left():
+    mask = Image.new("L", (240, 120), 0)
+    renderer.ImageDraw.Draw(mask).line((70, 60, 170, 60), fill=255, width=5)
+    traffic = renderer.TrafficOccupancy(mask)
+    original = (120.0, 60.0)
+    east_anchor = traffic.snap_anchor(original, 0.0)
+    west_anchor = traffic.snap_anchor(original, math.pi)
+    markers = [
+        renderer.BusMarker(("91 east",), *east_anchor, Operator.KMB, 0.0),
+        renderer.BusMarker(("91 west",), *west_anchor, Operator.KMB, math.pi),
+    ]
+    canvas = Image.new("RGBA", mask.size, "white")
+    placements = renderer._layout_bus_labels(
+        markers, renderer.ImageDraw.Draw(canvas), renderer._font(13), canvas.size,
+        traffic=traffic,
+    )
+    by_heading = {round(placement.heading): placement.marker for placement in placements}
+    east = by_heading[0]
+    west = by_heading[3]
+    # Screen travel left normals: east=(0,-1), west=(0,+1).
+    assert east[1] < east_anchor[1]
+    assert west[1] > west_anchor[1]
+    assert east[0] == pytest.approx(original[0])
+    assert west[0] == pytest.approx(original[0])
+
+
+def test_bus_anchor_snap_radius_scales_with_native_candidate():
+    mask = Image.new("L", (150, 90), 0)
+    draw = renderer.ImageDraw.Draw(mask)
+    draw.rectangle((55, 32, 95, 34), fill=255)  # just beyond the 0.75x radius
+    occupancy = renderer.TrafficOccupancy(mask)
+    anchor = (75, 45)
+    assert occupancy.snap_anchor(anchor, 0.0, renderer.RenderMetrics(0.75)) == anchor
+    assert occupancy.snap_anchor(anchor, 0.0, renderer.DEFAULT_METRICS)[1] < anchor[1]
 
 
 def test_public_stops_merge_by_place_and_direction_but_keep_opposite_direction():
@@ -631,9 +991,16 @@ def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_pa
     drawn: list[renderer.LabelPlacement] = []
     original = renderer._draw_bus_route_marker
 
-    def tracking(draw, placement, color, font, unreliable=False):
-        drawn.append(placement)
-        return original(draw, placement, color, font, unreliable=unreliable)
+    def tracking(
+        draw, placement, color, font, unreliable=False, phase="all",
+        metrics=renderer.DEFAULT_METRICS,
+    ):
+        if phase == "label":
+            drawn.append(placement)
+        return original(
+            draw, placement, color, font, unreliable=unreliable, phase=phase,
+            metrics=metrics,
+        )
 
     monkeypatch.setattr(renderer, "_draw_bus_route_marker", tracking)
     renderer.render_map(
@@ -642,11 +1009,36 @@ def test_render_map_keeps_bus_and_minibus_markers_with_short_destinations(tmp_pa
         route_lines=lines,
         base_image=Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white"),
     )
-    assert {placement.operator for placement in drawn} == {Operator.KMB, Operator.GMB}
-    assert {placement.text for placement in drawn} == {
-        "91 Diamond Hill",
-        "11 Choi Hung",
+    assert len(drawn) == 1
+    assert {operator for _text, operator, _unreliable in drawn[0].rows} == {
+        Operator.KMB,
+        Operator.GMB,
     }
+    assert drawn[0].text == "11 Choi Hung/91 Diamond Hill"
+
+
+def test_render_map_draws_connectors_labels_then_arrows_in_global_passes(tmp_path, monkeypatch):
+    from dashboard.maps.positions import BusEstimate
+
+    calls = []
+    original = renderer._draw_bus_route_marker
+    def tracking(
+        draw, placement, color, font, unreliable=False, phase="all",
+        metrics=renderer.DEFAULT_METRICS,
+    ):
+        calls.append(phase)
+        return original(
+            draw, placement, color, font, unreliable=unreliable, phase=phase,
+            metrics=metrics,
+        )
+    monkeypatch.setattr(renderer, "_draw_bus_route_marker", tracking)
+    renderer.render_map(
+        [
+            BusEstimate("91 Diamond Hill", 22.333360, 114.252881, Operator.KMB, 0.0),
+            BusEstimate("792M TKO", 22.333400, 114.272881, Operator.GMB, 0.0),
+        ], str(tmp_path), base_image=Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white")
+    )
+    assert calls == ["connector", "connector", "label", "label", "arrow", "arrow"]
 
 
 def test_render_map_returns_bounded_webp_with_legend_band(tmp_path):
@@ -675,6 +1067,53 @@ def test_render_legend_is_standalone_opaque_png_with_all_key_labels():
     # The artwork contains the stable explanatory labels and more than one
     # fill colour, rather than being a blank/transparent attachment.
     assert len(image.getcolors(maxcolors=1_000_000)) > 10
+    palette = {pixel for _count, pixel in image.getcolors(maxcolors=1_000_000)}
+    captured_traffic_cores = {
+        (22, 224, 152), (255, 224, 104), (250, 198, 49),
+        (247, 74, 85), (169, 39, 39),
+    }
+    assert captured_traffic_cores <= palette
+
+
+def test_attribution_remains_dark_and_legible_after_lossy_webp_at_native_sizes():
+    for width, height in ((960, 540), (720, 405)):
+        scale = width / renderer.MAP_WIDTH
+        metrics = renderer.RenderMetrics(2 * scale)
+        composite = renderer._append_legend_band(
+            Image.new("RGB", (width, height), (238, 241, 245))
+        )
+        buffer = io.BytesIO()
+        composite.save(buffer, format="WEBP", quality=60, method=6)
+        assert len(buffer.getvalue()) <= 100_000
+        decoded = Image.open(io.BytesIO(buffer.getvalue())).convert("RGB")
+        mask = Image.new("L", decoded.size, 0)
+        attribution = "Map data © Google · Route geometry © Transport Department HKeMobility"
+        origin = (60 * scale, height + 20 * scale)
+        text_xy = (origin[0] + metrics.px(10), origin[1] + metrics.px(94))
+        renderer.ImageDraw.Draw(mask).text(
+            text_xy, attribution, fill=255,
+            font=renderer._font(metrics.font_size(9, minimum=7)),
+        )
+        bbox = mask.getbbox()
+        assert bbox is not None
+        glyph_luma = []
+        nearby_background_luma = []
+        pixels = decoded.load()
+        mask_pixels = mask.load()
+        for y in range(max(0, bbox[1] - 2), min(decoded.height, bbox[3] + 2)):
+            for x in range(max(0, bbox[0] - 2), min(decoded.width, bbox[2] + 2)):
+                luma = sum(pixels[x, y]) / 3
+                if mask_pixels[x, y] >= 128:
+                    glyph_luma.append(luma)
+                elif mask_pixels[x, y] == 0:
+                    nearby_background_luma.append(luma)
+        assert glyph_luma and nearby_background_luma
+        assert sum(glyph_luma) / len(glyph_luma) < 145
+        assert (
+            sum(nearby_background_luma) / len(nearby_background_luma)
+            - sum(glyph_luma) / len(glyph_luma)
+            >= 70
+        )
 
 
 def test_render_map_does_not_paint_legend_over_lower_left(tmp_path):
@@ -774,12 +1213,207 @@ def test_off_map_bus_prediction_has_no_marker_or_label():
     assert markers == []
 
 
-def test_legend_has_no_obsolete_google_traffic_or_direction_explanation():
+def test_native_fallback_scales_projection_with_resized_base(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_once(
+        estimates, cache_dir, public_stops=(), route_lines=(), base_image=None,
+        affected_road_paths=(),
+    ):
+        del estimates, cache_dir, public_stops, route_lines, affected_road_paths
+        scale = base_image.width / renderer.MAP_WIDTH
+        zoom = renderer.BASE_MAP_ZOOM + math.log2(scale)
+        calls.append((base_image.size, renderer.project(
+            22.33336, 114.252881, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
+            zoom, base_image.size,
+        )))
+        if len(calls) == 1:
+            raise renderer._OversizedMapError("map WebP exceeds 100 KB at native resolution")
+        return b"native"
+
+    monkeypatch.setattr(renderer, "_render_map_once", fake_once)
+    assert renderer.render_map(
+        [], str(tmp_path),
+        base_image=Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white"),
+    ) == b"native"
+    assert [size for size, _point in calls] == [(960, 540), (864, 486)]
+    full = calls[0][1]
+    reduced = calls[1][1]
+    assert reduced[0] == pytest.approx(full[0] * 0.9)
+    assert reduced[1] == pytest.approx(full[1] * 0.9)
+
+
+def test_native_fallback_rerenders_authored_overlays_without_resizing_composite(
+    tmp_path, monkeypatch,
+):
+    render_sizes = []
+    resize_calls = []
+    original_resize = Image.Image.resize
+    resize_depth = 0
+
+    def tracking_resize(self, size, *args, **kwargs):
+        nonlocal resize_depth
+        if resize_depth == 0:
+            resize_calls.append((self.size, size))
+        resize_depth += 1
+        try:
+            return original_resize(self, size, *args, **kwargs)
+        finally:
+            resize_depth -= 1
+
+    def fake_once(
+        estimates, cache_dir, public_stops=(), route_lines=(), base_image=None,
+        affected_road_paths=(),
+    ):
+        del estimates, cache_dir, public_stops, route_lines, affected_road_paths
+        render_sizes.append(base_image.size)
+        if len(render_sizes) < 4:
+            raise renderer._OversizedMapError("map WebP exceeds 100 KB at native resolution")
+        return b"small-enough"
+
+    monkeypatch.setattr(Image.Image, "resize", tracking_resize)
+    monkeypatch.setattr(renderer, "_render_map_once", fake_once)
+    assert renderer.render_map(
+        [], str(tmp_path),
+        base_image=Image.new("RGB", (renderer.MAP_WIDTH, renderer.MAP_HEIGHT), "white"),
+    ) == b"small-enough"
+    assert render_sizes == [(960, 540), (864, 486), (778, 438), (720, 405)]
+    assert resize_calls == [
+        ((960, 540), (864, 486)),
+        ((960, 540), (778, 438)),
+        ((960, 540), (720, 405)),
+    ]
+    assert all(source[1] <= renderer.MAP_HEIGHT for source, _target in resize_calls)
+    assert all(source[1] * renderer.MAP_WIDTH == source[0] * renderer.MAP_HEIGHT
+               for source, _target in resize_calls)
+
+
+def test_native_legend_uses_scaled_metrics_without_raster_resize(monkeypatch):
+    calls = []
+
+    def tracking_legend(draw, size, metrics=renderer.DEFAULT_METRICS, origin=(0, 0)):
+        del draw
+        calls.append((size, metrics.scale, origin))
+
+    def forbidden_resize(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("legend artwork must be drawn natively")
+
+    monkeypatch.setattr(renderer, "_draw_legend", tracking_legend)
+    monkeypatch.setattr(Image.Image, "resize", forbidden_resize)
+    composite = renderer._append_legend_band(
+        Image.new("RGB", (renderer.MIN_MAP_WIDTH, renderer.MIN_MAP_HEIGHT), "white")
+    )
+    assert composite.size == (720, 585)
+    assert calls == [((720, 180), 1.5, (45.0, 15.0))]
+
+
+def test_generators_survive_native_candidate_retries(tmp_path, monkeypatch):
+    from dashboard.maps.positions import BusEstimate
+
+    estimate = BusEstimate("91 Diamond Hill", 22.33336, 114.252881, Operator.KMB, 0.0)
+    stop = Stop("gate", "HKUST", 22.33336, 114.262881)
+    line = RouteLine("91", "KMB", "outbound", [stop])
+    path = [(22.333, 114.250), (22.334, 114.251)]
+    seen = []
+
+    def fake_once(
+        estimates, cache_dir, public_stops=(), route_lines=(), base_image=None,
+        affected_road_paths=(),
+    ):
+        del cache_dir
+        seen.append((
+            list(estimates), list(public_stops), list(route_lines),
+            [list(item) for item in affected_road_paths], base_image.size,
+        ))
+        if len(seen) == 1:
+            raise renderer._OversizedMapError("map WebP exceeds 100 KB at native resolution")
+        return b"done"
+
+    monkeypatch.setattr(renderer, "_render_map_once", fake_once)
+    assert renderer.render_map(
+        (item for item in [estimate]), str(tmp_path),
+        public_stops=(item for item in [stop]),
+        route_lines=(item for item in [line]),
+        base_image=Image.new("RGB", (960, 540), "white"),
+        affected_road_paths=((point for point in path) for _ in range(1)),
+    ) == b"done"
+    assert len(seen) == 2
+    for estimates, stops, lines, paths, _size in seen:
+        assert estimates == [estimate]
+        assert stops == [stop]
+        assert lines == [line]
+        assert paths == [path]
+
+
+def test_scaled_authored_metrics_cover_fonts_arrows_and_traffic(tmp_path, monkeypatch):
+    metrics = renderer.RenderMetrics(0.75)
+    assert metrics.font_size(13) == 10
+    triangle = renderer._bus_direction_arrow_triangle((50, 50), 0.0, metrics)
+    assert triangle[0] == pytest.approx((54.5, 50.0))
+    assert renderer._arrow_footprint((50, 50), metrics) == pytest.approx(
+        (45.5, 45.5, 54.5, 54.5)
+    )
+
+    canvas = Image.new("RGBA", (720, 405), (41, 96, 166, 255))
+    zoom = renderer.BASE_MAP_ZOOM + math.log2(metrics.scale)
+    path = [(renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON - 0.001),
+            (renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON + 0.001)]
+    assert renderer._draw_alerted_road_rectangles(
+        canvas, [path], renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
+        zoom, canvas.size, metrics,
+    ) == 1
+    magenta = [
+        (x, y) for y in range(canvas.height) for x in range(canvas.width)
+        if canvas.getpixel((x, y)) == renderer.ALERT_RECT_COLOR
+    ]
+    assert magenta
+    xs = [point[0] for point in magenta]
+    expected_points = [renderer.project(
+        lat, lon, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON, zoom, canvas.size
+    ) for lat, lon in path]
+    assert min(xs) == pytest.approx(min(point[0] for point in expected_points) - 5.25, abs=1)
+    assert max(xs) == pytest.approx(max(point[0] for point in expected_points) + 5.25, abs=1)
+    # A 4 px logical traffic outline becomes three native pixels at 0.75x.
+    mid_x = round(sum(point[0] for point in expected_points) / 2)
+    vertical_pixels = [y for y in range(canvas.height)
+                       if canvas.getpixel((mid_x, y)) == renderer.ALERT_RECT_COLOR]
+    assert len(vertical_pixels) == 6
+
+    font_sizes = []
+    original_font = renderer._font
+
+    def tracking_font(size):
+        font_sizes.append(size)
+        return original_font(size)
+
+    monkeypatch.setattr(renderer, "_font", tracking_font)
+    encoded = renderer._render_map_once(
+        [], str(tmp_path), base_image=Image.new("RGB", (720, 405), (238, 241, 245))
+    )
+    assert len(encoded) <= 100_000
+    decoded = Image.open(io.BytesIO(encoded))
+    assert decoded.size == (renderer.MIN_MAP_WIDTH, renderer.MIN_MAP_HEIGHT + 180)
+    assert 10 in font_sizes  # map labels/gate labels
+    assert 18 in font_sizes  # 12 px legend copy authored directly at 1.5x
+
+
+def test_legend_has_compact_google_traffic_key_without_obsolete_explanation():
     import inspect
 
     source = inspect.getsource(renderer._draw_legend)
     assert "Estimated buses (not GPS)" in source
+    assert "Google traffic" in source
     assert "Live traffic speed" not in source
     assert "traffic jam" not in source
     assert "Arrows show both travel directions" not in source
+
+
+def test_google_traffic_legend_is_swatch_first():
+    import inspect
+
+    source = inspect.getsource(renderer._draw_legend)
+    assert source.index("for color in GOOGLE_TRAFFIC_COLORS") < source.index(
+        '"Google traffic"'
+    )
     assert "Map data © Google" in source

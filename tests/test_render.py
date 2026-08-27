@@ -212,6 +212,39 @@ def test_build_payload_omits_map_legend_without_map():
     assert all(file.filename != "traffic-map-legend.png" for file in payload.files)
 
 
+def test_build_payload_shows_initializing_map_in_reserved_first_slot():
+    now = s.utc()
+    payload = build_payload(
+        weather=None,
+        groups=[],
+        statuses=[],
+        incidents=[],
+        capture_time=now,
+        traffic_map_webp=None,
+        traffic_map_initializing=True,
+        now=now,
+    )
+    assert payload.embeds[0].title == "Traffic map initializing"
+    assert payload.embeds[1].title == "🚦 Traffic news"
+    assert payload.embeds[0].timestamp == now
+    assert not payload.embeds[0].image.url
+    assert not payload.files
+
+
+def test_build_payload_present_failed_map_keeps_source_error():
+    payload = build_payload(
+        weather=None,
+        groups=[],
+        statuses=[],
+        incidents=[],
+        capture_time=s.utc(),
+        traffic_map_webp=None,
+        errors=["traffic map unavailable"],
+    )
+    assert payload.embeds[0].title == "🚦 Traffic news"
+    assert "traffic map unavailable" in payload.embeds[-1].fields[0].value
+
+
 def test_payload_keeps_one_map_attachment_before_traffic_news():
     source = io.BytesIO()
     Image.new("RGB", (960, 540), (80, 120, 160)).save(source, format="WEBP")
@@ -420,7 +453,7 @@ def test_traffic_summary_ignores_detector_statuses_and_color():
 
 
 def test_weather_embed_multiple_warning_icons():
-    """The first available official warning icon is the thumbnail."""
+    """Direct weather embeds never expose animated source GIF URLs."""
     from dashboard.models import WeatherConditions, WeatherWarning
     from dashboard.render import _build_weather_embed
 
@@ -436,11 +469,26 @@ def test_weather_embed_multiple_warning_icons():
     assert "tc8ne.issuing.gif" not in value
     assert "rainb.issuing.gif" not in value
     assert "Gale Signal No. 8 NE" in value  # warning name is inline text, not a title
-    assert embed.thumbnail.url.endswith("tc8ne.issuing.gif")
+    assert embed.thumbnail.url is None
+    assert "thumbnail" not in embed.to_dict()
 
     single = _build_weather_embed(WeatherConditions(warnings=warnings[:1]))
-    assert single.thumbnail is not None
-    assert single.thumbnail.url.endswith("tc8ne.issuing.gif")
+    assert single.thumbnail.url is None
+    assert "thumbnail" not in single.to_dict()
+
+
+def test_weather_embed_omits_thumbnail_when_static_icons_are_unavailable():
+    from dashboard.models import WeatherConditions, WeatherWarning
+    from dashboard.render import _build_weather_embed
+
+    embed = _build_weather_embed(WeatherConditions(warnings=[WeatherWarning(
+        code="WRAINA", name="Amber Rainstorm Warning Signal",
+        icon_url="https://www.hko.gov.hk/images_e/raina.gif",
+    )]))
+
+    assert embed is not None
+    assert embed.thumbnail.url is None
+    assert "thumbnail" not in embed.to_dict()
 
 
 def test_weather_embed_omits_long_warning_statement():

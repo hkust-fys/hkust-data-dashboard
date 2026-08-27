@@ -3,6 +3,20 @@
 from dashboard.maps import _destination_map
 from dashboard.models import EtaKind, EtaRow, Operator, RouteEtaGroup
 from dashboard.providers.route_geometry import RouteLine, Stop
+import pytest
+
+
+@pytest.mark.parametrize("official, expected", [
+    ("Hang Hau Station Public Transport Interchange", "Hang Hau"),
+    ("PO LAM BUS TERMINUS", "Po Lam"),
+    ("H.K.U.S.T. (NORTH)", "HKUST"),
+    ("NGAU CHI WAN BBI - CHOI HUNG STATION", "Choi Hung"),
+    ("MONG KOK STATION", "Mong Kok"),
+    ("Kwun Tong(Circular)", "Kwun Tong"),
+])
+def test_exact_destination_shorthand_variants(official, expected):
+    from dashboard.maps import _shorthand
+    assert _shorthand(official) == expected
 
 
 def _line(operator: str, route: str, bound: str, destination: str, stops):
@@ -55,6 +69,15 @@ def test_official_terminus_is_the_fallback_without_groups():
     result = _destination_map([], [line])
     # Official termini pass through the shorthand normalizer.
     assert result[("KMB", "91", "outbound")] == "Diamond Hill"
+
+
+def test_11m_empty_destination_uses_final_official_stop_name():
+    line = _line("GMB", "11M", "seq-2", "", [
+        ("A", "HKUST", 22.338, 114.262),
+        ("B", "Hang Hau Station Public Transport Interchange", 22.317, 114.267),
+    ])
+    result = _destination_map([], [line])
+    assert result[("GMB", "11M", "seq-2")] == "Hang Hau"
 
 
 def test_ambiguous_destination_does_not_overwrite_other_bound():

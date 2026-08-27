@@ -158,6 +158,24 @@ async def test_to_payload_surfaces_provider_errors():
     )
 
 
+def test_to_payload_distinguishes_missing_map_from_present_failure():
+    initializing = _to_payload({"traffic": ([], [], [], None)})
+    assert initializing.embeds[0].title == "Traffic map initializing"
+    assert not any(
+        e.fields and "traffic map unavailable" in e.fields[0].value
+        for e in initializing.embeds
+    )
+
+    failed = _to_payload(
+        {"traffic": ([], [], [], None), "traffic_map": ValueError("capture failed")}
+    )
+    assert failed.embeds[0].title == "🚦 Traffic news"
+    assert any(
+        e.fields and "traffic map unavailable" in e.fields[0].value
+        for e in failed.embeds
+    )
+
+
 def test_to_payload_uses_news_and_roadwork_times_without_detector_legend():
     from datetime import timedelta
 

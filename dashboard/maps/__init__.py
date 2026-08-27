@@ -32,8 +32,14 @@ _DESTINATION_SHORTHAND: dict[str, str] = {
     "diamond hill station": "Diamond Hill",
     "clear water bay bus terminus": "Clear Water Bay",
     "hang hau village": "Hang Hau",
+    "hang hau station public transport interchange": "Hang Hau",
+    "po lam bus terminus": "Po Lam",
+    "h.k.u.s.t. (north)": "HKUST",
+    "ngau chi wan bbi - choi hung station": "Choi Hung",
+    "mong kok station": "Mong Kok",
     "sai kung": "Sai Kung",
     "kwun tong (circular)": "Kwun Tong",
+    "kwun tong(circular)": "Kwun Tong",
 }
 
 
@@ -60,6 +66,9 @@ def _destination_map(
     for line in route_lines:
         key = (str(line.operator), str(line.route), str(line.bound))
         destination = str(getattr(line, "destination", "") or "").strip()
+        if not destination:
+            stops = list(getattr(line, "stops", ()) or ())
+            destination = str(getattr(stops[-1], "name", "") or "").strip() if stops else ""
         if destination:
             out[key] = _shorthand(destination)
 

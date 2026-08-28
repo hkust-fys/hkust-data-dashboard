@@ -177,7 +177,7 @@ def test_error_embed_shows_provider_failures():
 
 
 def test_traffic_map_embed_is_image_onlyish_and_timestamped():
-    from dashboard.render import _build_traffic_map_embed
+    from dashboard.render import _build_traffic_map_embed, traffic_map_filename
 
     webp = b"RIFF" + b"\x00" * 64
     embed = _build_traffic_map_embed(webp, s.utc())
@@ -188,7 +188,7 @@ def test_traffic_map_embed_is_image_onlyish_and_timestamped():
     assert "delay" not in desc
     assert "HKeMobility" in desc
     assert not embed.fields
-    assert embed.image.url == "attachment://traffic-map.webp"
+    assert embed.image.url == f"attachment://{traffic_map_filename(webp)}"
     assert embed.timestamp == s.utc()
     assert embed.footer.text == "Google traffic"
 
@@ -197,6 +197,15 @@ def test_traffic_map_embed_omitted_without_png():
     from dashboard.render import _build_traffic_map_embed
 
     assert _build_traffic_map_embed(None, s.utc()) is None
+
+
+def test_traffic_map_filename_is_stable_and_content_addressed():
+    from dashboard.render import traffic_map_filename
+
+    assert traffic_map_filename(b"same") == traffic_map_filename(b"same")
+    assert traffic_map_filename(b"same") != traffic_map_filename(b"changed")
+    assert traffic_map_filename(b"same").startswith("traffic-map-")
+    assert traffic_map_filename(b"same").endswith(".webp")
 
 
 def test_build_payload_omits_map_legend_without_map():
@@ -256,6 +265,7 @@ def test_payload_keeps_one_map_attachment_before_traffic_news():
         "🗺️ Traffic map", "🚦 Traffic news"
     ]
     assert len(payload.files) == 1
+    assert payload.embeds[0].image.url == f"attachment://{payload.files[0].filename}"
     map_image = Image.open(io.BytesIO(payload.files[0].data))
     assert map_image.size == (960, 540)
 

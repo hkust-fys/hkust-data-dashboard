@@ -7,6 +7,7 @@ fields/embed, 6000 aggregate chars/embed, 10 embeds/files per message.
 
 from __future__ import annotations
 
+import hashlib
 import io
 from datetime import UTC, datetime
 
@@ -261,6 +262,7 @@ def _build_transit_embed(
 def _build_traffic_map_embed(
     webp: bytes,
     source_time: datetime | None = None,
+    filename: str | None = None,
 ) -> discord.Embed | None:
     """Render the Google Maps base screenshot as an image pane."""
     if not webp:
@@ -271,8 +273,14 @@ def _build_traffic_map_embed(
         color=0x2563EB,
         description=description,
     )
-    embed.set_image(url="attachment://traffic-map.webp")
+    embed.set_image(url=f"attachment://{filename or traffic_map_filename(webp)}")
     return _set_source_timestamp(embed, "Google traffic", source_time)
+
+
+def traffic_map_filename(webp: bytes) -> str:
+    """Return the bounded, content-addressed filename for a map image."""
+    digest = hashlib.sha256(webp).hexdigest()[:12]
+    return f"traffic-map-{digest}.webp"
 
 
 def _build_traffic_map_initializing_embed(
@@ -467,15 +475,17 @@ def build_payload(
     # slot even before the map provider has returned; a present-but-failed
     # result is handled as a genuine source error below instead.
     if traffic_map_webp:
+        map_filename = traffic_map_filename(traffic_map_webp)
         map_embed = _build_traffic_map_embed(
             traffic_map_webp,
             map_source_time or checked_at,
+            map_filename,
         )
         if map_embed is not None:
             payload.embeds.append(map_embed)
             payload.files.append(
                 ImageAsset(
-                    filename="traffic-map.webp",
+                    filename=map_filename,
                     data=traffic_map_webp,
                     content_type="image/webp",
                     label="Traffic map",

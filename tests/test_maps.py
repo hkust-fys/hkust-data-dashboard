@@ -106,6 +106,78 @@ async def test_probe_failure_still_renders_google_base(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_marker_audit_failure_never_blocks_a_rendered_frame(monkeypatch, caplog):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+
+    line = RouteLine(
+        "91", "KMB", "outbound",
+        [Stop("a", "A", 22.33, 114.26), Stop("b", "B", 22.331, 114.261)],
+    )
+    audit_calls = 0
+
+    async def capture(*_args, **_kwargs):
+        return b"google-base"
+
+    async def geometry(*_args, **_kwargs):
+        return RouteGeometry(routes=[line])
+
+    async def probes(*_args, **_kwargs):
+        return []
+
+    def broken_audit(*_args, **_kwargs):
+        nonlocal audit_calls
+        audit_calls += 1
+        raise RuntimeError("audit test failure")
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", capture)
+    monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
+    monkeypatch.setattr(maps, "fetch_probe_etas", probes)
+    monkeypatch.setattr(maps, "audit_marker_positions", broken_audit)
+    monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
+
+    image, _ = await maps.fetch_traffic_map(object())
+
+    assert image == b"rendered"
+    assert audit_calls == 1
+    assert "marker audit unavailable" in caplog.text
+
+
+def test_marker_issue_warning_key_is_deduplicated_and_bounded():
+    import dashboard.maps as maps
+
+    maps._logged_marker_issue_keys.clear()
+    key = (("GMB", "11", "seq-1"), "checkpoint", 4, "no unique later-stop ETA match")
+    assert maps._first_marker_issue(key)
+    assert not maps._first_marker_issue(key)
+    maps._logged_marker_issue_keys.clear()
+
+
+def test_marker_issue_warning_key_deduplicates_gmb_pair_details():
+    import dashboard.maps as maps
+
+    maps._logged_marker_issue_keys.clear()
+    key = (("GMB", "11", "seq-1"), "gmb-marker-pair", 12, "stacked")
+    assert maps._first_marker_issue(key)
+    assert not maps._first_marker_issue(key)
+    maps._logged_marker_issue_keys.clear()
+
+
+def test_marker_issue_warning_key_evicts_oldest_deterministically(monkeypatch):
+    import dashboard.maps as maps
+
+    monkeypatch.setattr(maps, "_MARKER_ISSUE_KEY_LIMIT", 2)
+    maps._logged_marker_issue_keys.clear()
+    assert maps._first_marker_issue(("oldest",))
+    assert maps._first_marker_issue(("middle",))
+    assert maps._first_marker_issue(("newest",))
+    assert list(maps._logged_marker_issue_keys) == [("middle",), ("newest",)]
+    assert maps._first_marker_issue(("oldest",))
+    assert not maps._first_marker_issue(("newest",))
+    maps._logged_marker_issue_keys.clear()
+
+
+@pytest.mark.asyncio
 async def test_map_cancellation_cleans_up_capture_and_geometry(monkeypatch):
     import asyncio
 

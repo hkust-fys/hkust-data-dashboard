@@ -1,14 +1,11 @@
-"""Live source-to-marker timing diagnostic (no raw upstream data is printed)."""
+"""Live frame-by-frame source-to-marker timing diagnostic."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import math
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import aiohttp
 from dotenv import load_dotenv
@@ -20,212 +17,229 @@ if str(ROOT) not in sys.path:
 from dashboard.config import Settings  # noqa: E402
 from dashboard.http import HttpClient  # noqa: E402
 from dashboard.maps import _authoritative_etas, _destination_map  # noqa: E402
-from dashboard.maps.positions import (  # noqa: E402
-    _label_for,
-    _path_segment_length,
-    estimate_bus_positions,
+from dashboard.maps.marker_audit import (  # noqa: E402
+    _match,
+    audit_marker_positions,
 )
+from dashboard.maps.positions import estimate_bus_positions  # noqa: E402
 from dashboard.providers.route_geometry import (  # noqa: E402
     fetch_route_geometry,
     select_probe_stops,
 )
 from dashboard.providers.transit import (  # noqa: E402
-    CTB_STOPS,
-    GMB_STOPS,
-    KMB_STOPS,
     fetch_probe_etas,
     fetch_transit_etas,
 )
 
 
-def _operator(value: object) -> str:
-    return {"Citybus": "CTB", "Operator.CITYBUS": "CTB"}.get(str(value), str(value))
+def _issue_summary(frame: int, issue: dict) -> str:
+    detail = issue.get("detail") or {}
+    match = detail.get("match") or {}
+    checkpoint = detail.get("checkpoint", detail.get("gate_index", "-"))
+    reason = detail.get("reason", "one-to-one mismatch")
+    return (
+        f"ISSUE frame={frame} route={'/'.join(issue['key'])} "
+        f"kind={issue['kind']} checkpoint={checkpoint} reason={reason} "
+        f"unmatched_source={match.get('unmatched_source_values', [])} "
+        f"source_tokens={match.get('unmatched_source_observations', [])} "
+        f"unmatched_marker={match.get('unmatched_marker_values', [])} "
+        f"marker_id={detail.get('marker_id', '-')} "
+        f"position={detail.get('position', '-')} "
+        f"marker_sources={detail.get('source_observations', [])} "
+        f"gate_rows={detail.get('gate_rows', [])} "
+        f"checkpoint_rows={detail.get('checkpoint_rows', [])} "
+        f"route_markers={detail.get('route_markers', [])}"
+    )
 
 
-def _gate_specs() -> dict[tuple[str, str, str], tuple[str, str]]:
-    out: dict[tuple[str, str, str], tuple[str, str]] = {}
-    for item in KMB_STOPS:
-        out[("KMB", item["route"], {"S": "outbound", "N": "inbound"}[item["gate"]])] = (item["stop"], item["dest"])
-    for item in CTB_STOPS:
-        out[("CTB", item["route"], {"O": "outbound", "I": "inbound"}[item["gate"]])] = (item["stop"], item["dest"])
-    for stop, routes in GMB_STOPS.items():
-        for route, dest, _gate, _route_id, seq in routes:
-            out[("GMB", route, f"seq-{seq}")] = (str(stop), dest)
-    return out
+def _route_key(value: object) -> tuple[str, str, str]:
+    operator = str(getattr(value, "operator", ""))
+    if operator.startswith("Operator."):
+        operator = {
+            "Operator.KMB": "KMB",
+            "Operator.CITYBUS": "CTB",
+            "Operator.GMB": "GMB",
+        }.get(operator, operator)
+    return (
+        operator,
+        str(getattr(value, "route", "")),
+        str(getattr(value, "bound", "") or ""),
+    )
 
 
-@dataclass(frozen=True)
-class Projection:
-    position: float
-    distance_m: float
-    heading: float
-
-
-def _project(line, lat: float, lon: float) -> Projection | None:
-    """Project onto a route using runtime's metre-valued segment metric."""
-    path, offsets = list(line.path), list(line.stop_offsets)
-    if len(path) < 2 or len(offsets) != len(line.stops):
-        return None
-    best: tuple[float, float, float] | None = None
-    travelled = 0.0
-    for a, b in zip(path, path[1:], strict=False):
-        dy, dx = b[0] - a[0], b[1] - a[1]
-        denom = dy * dy + dx * dx
-        t = 0.0 if denom == 0 else max(0.0, min(1.0, ((lat - a[0]) * dy + (lon - a[1]) * dx) / denom))
-        q = (a[0] + t * dy, a[1] + t * dx)
-        segment = _path_segment_length(a, b)
-        distance = _path_segment_length((lat, lon), q)
-        if best is None or distance < best[0]:
-            best = (distance, travelled + t * segment, math.atan2(dy, dx))
-        travelled += segment
-    if best is None:
-        return None
-    distance_m, along, heading = best
-    for index, (start, end) in enumerate(zip(offsets, offsets[1:], strict=False)):
-        if start <= along <= end and end > start:
-            return Projection(index + (along - start) / (end - start), distance_m, heading)
-    return Projection(float(len(offsets) - 1), distance_m, heading)
-
-
-def _angle_delta(a: float, b: float) -> float:
-    return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
-
-
-def _assign_markers(estimates, lines, destinations):
-    """Assign markers, preferring estimator metadata over visual inference."""
-    result: dict[tuple[str, str, str], list[tuple[object, float]]] = {}
-    for marker in estimates:
-        code = _operator(marker.operator)
-        route = str(getattr(marker, "route", "") or marker.label.split(" ", 1)[0])
-        bound = str(getattr(marker, "bound", "") or "")
-        exact = [line for line in lines if _operator(line.operator) == code and line.route == route and (not bound or line.bound == bound)]
-        if len(exact) == 1 and getattr(marker, "position", None) is not None:
-            line = exact[0]
-            result.setdefault((code, line.route, line.bound), []).append((marker, float(marker.position)))
+def _watched_state(
+    key: tuple[str, str, str],
+    probe_etas: list[object],
+    authoritative: list[object],
+    estimates: list[object],
+) -> tuple[object, ...]:
+    """Return a deterministic, compact source/ownership snapshot for one route."""
+    sources = {"probe": probe_etas, "gate": authoritative}
+    rows = tuple(
+        (
+            kind,
+            index,
+            int(row.index),
+            round(float(row.minutes), 2),
+            str(getattr(getattr(row, "kind", ""), "value", getattr(row, "kind", ""))),
+        )
+        for kind, source in sources.items()
+        for index, row in enumerate(source)
+        if getattr(row, "minutes", None) is not None and _route_key(row) == key
+    )
+    tracks = []
+    for marker_id, marker in enumerate(estimates):
+        if _route_key(marker) != key:
             continue
-        ranked = []
-        for line in lines:
-            if _operator(line.operator) != code or line.route != route or (bound and line.bound != bound):
+        owned = []
+        for token in sorted(getattr(marker, "source_observations", ())):
+            kind, index = token
+            source = sources.get(kind, ())
+            if not 0 <= index < len(source):
+                owned.append((kind, index, "missing"))
                 continue
-            projection = _project(line, marker.lat, marker.lon)
-            if projection:
-                score = projection.distance_m + 50.0 * _angle_delta(marker.heading, projection.heading)
-                ranked.append((score, line, projection))
-        if ranked:
-            _score, line, projection = min(ranked, key=lambda item: item[0])
-            result.setdefault((code, line.route, line.bound), []).append((marker, projection.position))
-    return result
+            row = source[index]
+            owned.append(
+                (
+                    kind,
+                    index,
+                    int(row.index),
+                    round(float(row.minutes), 2),
+                    round(int(row.index) - float(row.minutes) / 2.0, 3),
+                )
+            )
+        tracks.append(
+            (
+                marker_id,
+                round(float(marker.position), 3),
+                bool(marker.unreliable),
+                tuple(owned),
+            )
+        )
+    return rows, tuple(tracks)
 
 
-def _one_to_one(source: list[int], marker: list[int]) -> tuple[list[tuple[int, int]], list[int], list[int]]:
-    """Pair ordered departures without reusing a marker."""
-    left, right = sorted(source), sorted(marker)
-    pairs = list(zip(left, right, strict=False))
-    return pairs, left[len(pairs):], right[len(pairs):]
-
-
-def _probe_gate_anchors(probe_etas, key, gate_index: int, stop_count: int) -> list[int]:
-    """Convert downstream probe announcements into implied gate ETAs."""
-    anchors = []
-    for eta in probe_etas:
-        if eta.minutes is None or (_operator(eta.operator), eta.route, eta.bound) != key:
-            continue
-        raw_position = eta.index - eta.minutes / 2.0
-        if 0 <= raw_position <= stop_count - 1 and raw_position <= gate_index + 0.5:
-            anchors.append(round((gate_index - raw_position) * 2))
-    return sorted(anchors)
-
-
-async def _run(cycles: int) -> int:
+async def _run(
+    frames: int,
+    interval: float = 10.0,
+    watch_routes: tuple[tuple[str, str, str], ...] = (),
+) -> int:
     settings = Settings.from_env(require_keys=False)
     async with aiohttp.ClientSession() as session:
         client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
         try:
-            geometry = await fetch_route_geometry(client, cache_dir=settings.cache_dir)
+            geometry = await fetch_route_geometry(
+                client,
+                cache_dir=settings.cache_dir,
+            )
             lines = list(geometry.routes)
             probes = select_probe_stops(lines)
-            groups, _latest, failed = await fetch_transit_etas(client)
-            probe_etas = []
-            for _ in range(max(1, cycles)):
+            failed_routes: set[str] = set()
+            provider_failures: set[str] = set()
+            conclusive_checks = 0
+            total_checks = 0
+            watched_previous: dict[tuple[str, str, str], tuple[object, ...]] = {}
+            for frame_index in range(frames):
+                groups, _latest, failed = await fetch_transit_etas(client)
+                provider_failures.update(failed or [])
                 probe_etas = await fetch_probe_etas(client, probes)
-            destinations = _destination_map(groups, lines)
-            authoritative = _authoritative_etas(groups, lines)
-            estimates = estimate_bus_positions(probe_etas, lines, destinations, authoritative)
-        except Exception as exc:
+                destinations = _destination_map(groups, lines)
+                authoritative = _authoritative_etas(groups, lines)
+                estimates = estimate_bus_positions(
+                    probe_etas,
+                    lines,
+                    destinations,
+                    authoritative,
+                )
+                audit = audit_marker_positions(
+                    probe_etas,
+                    authoritative,
+                    estimates,
+                    lines,
+                    frame_id=frame_index + 1,
+                    seed=frame_index + 1,
+                )
+                total_checks += len(audit["checks"])
+                inconclusive = sum(
+                    bool(check.get("inconclusive")) for check in audit["checks"]
+                )
+                conclusive_checks += len(audit["checks"]) - inconclusive
+                kinds = sorted({str(check.get("kind")) for check in audit["checks"]})
+                print(
+                    f"FRAME {frame_index + 1}/{frames} "
+                    f"checks={len(audit['checks'])} "
+                    f"kinds={','.join(kinds) or 'none'} "
+                    f"inconclusive={inconclusive} markers={len(estimates)} "
+                    f"issues={len(audit['issues'])} "
+                    f"status={'PASS' if audit['ok'] else 'FAIL'}"
+                )
+                for issue in audit["issues"]:
+                    print(_issue_summary(frame_index + 1, issue))
+                    failed_routes.add("/".join(issue["key"]))
+                for key in watch_routes:
+                    watched = _watched_state(
+                        key, probe_etas, authoritative, estimates
+                    )
+                    if watched_previous.get(key) == watched:
+                        continue
+                    watched_previous[key] = watched
+                    rows, tracks = watched
+                    print(
+                        f"WATCH frame={frame_index + 1} route={'/'.join(key)} "
+                        f"rows={rows} tracks={tracks}"
+                    )
+                if frame_index + 1 < frames:
+                    await asyncio.sleep(interval)
+        except Exception as exc:  # noqa: BLE001
             print(f"STATUS INCONCLUSIVE reason={type(exc).__name__}")
             return 2
 
-    lines_by_key = {(_operator(line.operator), line.route, line.bound): line for line in lines}
-    assigned = _assign_markers(estimates, lines, destinations)
-    checks = 0
-    failures: list[str] = []
-    for key, line in lines_by_key.items():
-        spec = _gate_specs().get(key)
-        if not spec:
-            continue
-        stop_id, _destination = spec
-        exact_authoritative = [eta for eta in authoritative if (eta.operator, eta.route, eta.bound) == key]
-        excluded_undeparted = sum(1 for eta in exact_authoritative if eta.minutes > 0 and eta.index - eta.minutes / 2.0 < 0)
-        source = [eta for eta in exact_authoritative if not (eta.minutes > 0 and eta.index - eta.minutes / 2.0 < 0)]
-        gate_indices = [i for i, stop in enumerate(line.stops) if stop.stop_id == stop_id]
-        marker_rows = assigned.get(key, [])
-        if not source or not gate_indices or not marker_rows:
-            continue
-        gate_index = gate_indices[0]
-        upstream = [(marker, pos) for marker, pos in marker_rows if pos <= gate_index + 0.5]
-        if not upstream:
-            continue
-        source_minutes = sorted(int(eta.minutes) for eta in source)
-        marker_minutes = sorted(round((gate_index - pos) * 2) for _marker, pos in upstream)
-        pairs, unmatched_source, unmatched_markers = _one_to_one(source_minutes, marker_minutes)
-        deltas = [abs(source_minute - marker_minute) for source_minute, marker_minute in pairs]
-        probe_anchors = _probe_gate_anchors(probe_etas, key, gate_index, len(line.stops))
-        checks += 1
-        label_ok = all(marker.label == _label_for(key[1], key[0], key[2], pos, line.stops, destinations) for marker, pos in marker_rows)
-        timing_ok = bool(deltas) and max(deltas) <= 2 and not unmatched_source
-        status = "PASS" if timing_ok and label_ok else "FAIL"
-        print(f"{key[0]:5} {key[1]:4} {key[2]:8} source={source_minutes} marker={marker_minutes} matched={len(pairs)}/{len(source_minutes)} unmatched_source={unmatched_source} unmatched_marker={unmatched_markers} excluded_undeparted={excluded_undeparted} probe_anchors={probe_anchors} max_delta={max(deltas) if deltas else 'NA'}m label={'ok' if label_ok else 'BAD'} unreliable=NA {status}")
-        if status == "FAIL":
-            failures.append("/".join(key))
-
-    if failed or checks == 0:
-        print("STATUS INCONCLUSIVE reason=" + ("upstream-failures" if failed else "insufficient-current-ETAs"))
+    if provider_failures or conclusive_checks == 0:
+        reason = "upstream-failures" if provider_failures else "no-conclusive-checks"
+        print(f"STATUS INCONCLUSIVE reason={reason}")
         return 2
-    if failures:
-        print("STATUS FAIL routes=" + ",".join(failures))
+    if failed_routes:
+        print("STATUS FAIL routes=" + ",".join(sorted(failed_routes)))
         return 1
-    print(f"STATUS PASS checks={checks} reliability=inconclusive")
+    print(f"STATUS PASS frames={frames} checks={total_checks}")
     return 0
 
 
 def _self_test() -> int:
-    line = SimpleNamespace(path=[(0.0, 0.0), (0.0, 0.001)], stop_offsets=[0.0, 111.0], stops=[SimpleNamespace(stop_id="a"), SimpleNamespace(stop_id="b")])
-    projection = _project(line, 0.0, 0.0005)
-    assert projection and abs(projection.position - 0.5) < 0.05, projection
-    assert _operator("Citybus") == "CTB"
-    pairs, unmatched_source, unmatched_markers = _one_to_one([3, 8, 12], [2, 9])
-    assert pairs == [(3, 2), (8, 9)] and unmatched_source == [12] and not unmatched_markers
-    line.operator, line.route, line.bound = "CTB", "792M", "inbound"
-    marker = SimpleNamespace(operator="Citybus", route="792M", bound="inbound", position=0.25, label="792M TKO", lat=0.0, lon=0.0, heading=0.0)
-    assigned = _assign_markers([marker], [line], {})
-    assert list(assigned) == [("CTB", "792M", "inbound")] and assigned[("CTB", "792M", "inbound")][0][1] == 0.25
-    downstream = SimpleNamespace(operator="CTB", route="792M", bound="inbound", index=3, minutes=4)
-    assert _probe_gate_anchors([downstream], ("CTB", "792M", "inbound"), 2, 5) == [2]
-    print("STATUS PASS self-test=meters,operator,projection,metadata,no-reuse,downstream-anchor")
+    matched = _match([20, 3], [3, 20], tolerance=0)
+    assert matched["pair_indices"] == [(1, 0), (0, 1)]
+    assert matched["cardinality"] == 2
+    print("STATUS PASS self-test=identity-preserving-one-to-one")
     return 0
 
 
 def main() -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cycles", type=int, default=4)
+    parser.add_argument("--cycles", "--frames", dest="frames", type=int, default=4)
+    parser.add_argument("--interval", type=float, default=10.0)
+    parser.add_argument(
+        "--watch-route",
+        action="append",
+        default=[],
+        metavar="OPERATOR/ROUTE/BOUND",
+        help="print changed source rows and marker ownership for one route",
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
-    if args.cycles < 1:
-        parser.error("--cycles must be >= 1")
-    return asyncio.run(_run(args.cycles))
+    if args.frames < 1:
+        parser.error("--frames must be >= 1")
+    if args.interval < 0:
+        parser.error("--interval must be >= 0")
+    watch_routes = []
+    for value in args.watch_route:
+        parts = tuple(part.strip() for part in value.split("/"))
+        if len(parts) != 3 or not all(parts):
+            parser.error("--watch-route must be OPERATOR/ROUTE/BOUND")
+        watch_routes.append(parts)
+    return asyncio.run(_run(args.frames, args.interval, tuple(watch_routes)))
 
 
 if __name__ == "__main__":

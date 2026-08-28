@@ -44,6 +44,7 @@ from dashboard.providers import traffic as traffic_provider
 from dashboard.providers import weather as weather_provider
 from dashboard.render import (
     build_payload,
+    traffic_map_filename,
 )
 from dashboard.runtime import startup_preflight
 
@@ -705,6 +706,11 @@ def discord_file(asset: ImageAsset) -> discord.File:
     return discord.File(io.BytesIO(asset.data), filename=asset.filename)
 
 
+def _is_traffic_map_filename(filename: str) -> bool:
+    """Recognize renderer-generated traffic-map attachments for dry-run output."""
+    return bool(re.fullmatch(r"traffic-map-[0-9a-f]{12}\.webp", filename))
+
+
 def _payload_fingerprint(payload: DashboardPayload) -> str:
     """Hash sent content, excluding render-time embed timestamps."""
     embeds = []
@@ -764,6 +770,9 @@ class CollectionSnapshot:
     generation: int
     completed_monotonic: float
     stale_providers: frozenset[str] = frozenset()
+    # Providers that have published (including an exception) for this
+    # generation.  The default keeps older test/dev constructors compatible.
+    settled_providers: frozenset[str] = frozenset()
 
 class DashboardUpdater:
     """Owns the session, providers, caches, and the single update loop."""
@@ -939,9 +948,12 @@ class DashboardUpdater:
         previous = self._snapshot
         merged: dict[str, object] = {}
         stale: set[str] = set()
+        settled: set[str] = set()
         if previous is not None:
             merged.update(previous.results)
             stale.update(previous.stale_providers)
+            if previous.generation == generation:
+                settled.update(previous.settled_providers)
             # At the beginning of a new collection, all retained values are
             # stale until their owning provider has supplied this generation.
             if previous.generation != generation:
@@ -954,11 +966,13 @@ class DashboardUpdater:
                 stale.add(name)
             else:
                 stale.discard(name)
+        settled.add(name)
         self._snapshot = CollectionSnapshot(
             results=merged,
             generation=generation,
             completed_monotonic=time.monotonic(),
             stale_providers=frozenset(stale),
+            settled_providers=frozenset(settled),
         )
 
     def _snapshot_payload(self) -> DashboardPayload | None:
@@ -977,9 +991,13 @@ class DashboardUpdater:
         await asyncio.sleep(0)
         if self._collection_task is not None and self._collection_task.done():
             self._collection_finished(self._collection_task)
+        payload_snapshot = self._snapshot
         payload = self._snapshot_payload()
         if payload is None:
             return
+        # Keep the generation paired with this payload.  The edit awaits
+        # Discord I/O, during which a newer provider snapshot may publish.
+        payload_generation = payload_snapshot.generation if payload_snapshot else 0
 
         if channel is None:
             # dry-run / dev: just keep the last payload for inspection
@@ -991,14 +1009,41 @@ class DashboardUpdater:
             self._message = await _ensure_dashboard_message(
                 channel, payload, view=self.live_view
             )
-        fingerprint = _payload_fingerprint(payload)
-        try:
-            if fingerprint != self._last_payload_fingerprint:
-                await _apply_payload(self._message, payload, view=self.live_view)
-                self._last_payload_fingerprint = fingerprint
-            self._last_good_payload = payload
-        except Exception as exc:  # noqa: BLE001
-            log.warning("edit failed (keeping last good): %s", exc)
+        map_pending = bool(
+            payload_snapshot is not None
+            and "traffic_map" in payload_snapshot.results
+            and "traffic_map" in payload_snapshot.stale_providers
+            and "traffic_map" not in payload_snapshot.settled_providers
+        )
+        if not map_pending:
+            fingerprint = _payload_fingerprint(payload)
+            try:
+                if fingerprint != self._last_payload_fingerprint:
+                    await _apply_payload(self._message, payload, view=self.live_view)
+                    self._last_payload_fingerprint = fingerprint
+                    map_asset = next(
+                        (asset for asset in payload.files
+                         if asset.filename == traffic_map_filename(asset.data)),
+                        None,
+                    )
+                    if map_asset is not None:
+                        map_hash = hashlib.sha256(map_asset.data).hexdigest()[:12]
+                        log.info(
+                            "dashboard edit succeeded collection_generation=%s "
+                            "payload_fingerprint=%s traffic_map_sha256=%s "
+                            "traffic_map_filename=%s",
+                            payload_generation, fingerprint[:12], map_hash, map_asset.filename,
+                        )
+                    else:
+                        log.info(
+                            "dashboard edit succeeded collection_generation=%s "
+                            "payload_fingerprint=%s traffic_map_sha256=none "
+                            "traffic_map_filename=none",
+                            payload_generation, fingerprint[:12],
+                        )
+                self._last_good_payload = payload
+            except Exception as exc:  # noqa: BLE001
+                log.warning("edit failed (keeping last good): %s", exc)
 
         # status thread + alerts (create the thread after the message exists)
         await self._ensure_thread()
@@ -1153,7 +1198,7 @@ async def run_dry_run(settings: Settings) -> None:
             with open(preview_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
             for asset in payload.files:
-                if asset.filename == "traffic-map.webp":
+                if _is_traffic_map_filename(asset.filename):
                     with open(os.path.join(".private", "traffic-map-preview.webp"), "wb") as f:
                         f.write(asset.data)
             log.info("dry-run preview written to %s", preview_path)

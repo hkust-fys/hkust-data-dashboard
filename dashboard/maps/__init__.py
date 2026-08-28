@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
+from dashboard.maps.marker_audit import audit_gmb_marker_pairs, audit_marker_positions
 from dashboard.maps.positions import BusEstimate, estimate_bus_positions
 from dashboard.maps.renderer import (
     MAP_HEIGHT,
@@ -19,6 +20,19 @@ from dashboard.providers.route_geometry import Stop, fetch_route_geometry, selec
 from dashboard.providers.transit import CTB_STOPS, GMB_STOPS, KMB_STOPS, fetch_probe_etas
 
 log = logging.getLogger(__name__)
+_frame_counter = 0
+_logged_marker_issue_keys: dict[tuple[object, ...], None] = {}
+_MARKER_ISSUE_KEY_LIMIT = 256
+
+
+def _first_marker_issue(key: tuple[object, ...]) -> bool:
+    """Return whether this bounded issue detail should be logged this run."""
+    if key in _logged_marker_issue_keys:
+        return False
+    _logged_marker_issue_keys[key] = None
+    if len(_logged_marker_issue_keys) > _MARKER_ISSUE_KEY_LIMIT:
+        del _logged_marker_issue_keys[next(iter(_logged_marker_issue_keys))]
+    return True
 
 
 # Compact display wording for marker labels: shorter than official termini
@@ -166,6 +180,9 @@ async def fetch_traffic_map(
     ``affected_road_paths`` contains only matched OSM road polylines from
     current TD traffic news; it never represents a whole transit route.
     """
+    global _frame_counter
+    _frame_counter += 1
+    frame_id = _frame_counter
     base_image_task = asyncio.create_task(capture_gmaps_base(cache_dir=cache_dir))
     operation_tasks: list[asyncio.Task[object]] = [base_image_task]
     public_stops: list[Stop] = []
@@ -207,6 +224,7 @@ async def fetch_traffic_map(
             base_image = capture_result
 
         estimates: list[BusEstimate] = []
+        authoritative = _authoritative_etas(groups or [], route_lines)
         probe_etas = []
         if probe_task is not None:
             if isinstance(probe_result, BaseException):
@@ -218,11 +236,87 @@ async def fetch_traffic_map(
                         probe_etas,
                         route_lines,
                         _destination_map(groups or [], route_lines),
-                        _authoritative_etas(groups or [], route_lines),
+                        authoritative,
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("probe ETA estimation failed: %s", type(exc).__name__)
                     estimates = []
+        try:
+            audit = audit_marker_positions(
+                probe_etas, authoritative, estimates, route_lines,
+                frame_id=frame_id, seed=frame_id,
+            )
+            marker_pairs = audit.get("gmb_marker_pairs", ())
+            log.info(
+                "marker audit frame=%d checks=%d inconclusive=%d issues=%d "
+                "marker_pairs=%d markers=%d status=%s",
+                frame_id,
+                len(audit["checks"]),
+                audit["stats"].get("inconclusive", 0),
+                len(audit["issues"]),
+                len(marker_pairs),
+                audit["stats"]["markers"],
+                "pass" if audit["ok"] and not marker_pairs else "fail",
+            )
+            for issue in audit["issues"]:
+                detail = issue.get("detail") or {}
+                match = detail.get("match") or {}
+                issue_key = (
+                    tuple(issue.get("key", ())),
+                    issue.get("kind", ""),
+                    detail.get("checkpoint", detail.get("gate_index", "-")),
+                    detail.get("reason", "one-to-one mismatch"),
+                )
+                if not _first_marker_issue(issue_key):
+                    continue
+                log.warning(
+                    "marker audit mismatch frame=%d route=%s kind=%s "
+                    "checkpoint=%s unmatched_source=%s source_tokens=%s "
+                    "unmatched_marker=%s marker_id=%s position=%s "
+                    "marker_sources=%s reason=%s",
+                    frame_id,
+                    "/".join(issue["key"]),
+                    issue["kind"],
+                    detail.get("checkpoint", detail.get("gate_index", "-")),
+                    match.get("unmatched_source_values", []),
+                    match.get("unmatched_source_observations", []),
+                    match.get("unmatched_marker_values", []),
+                    detail.get("marker_id", "-"),
+                    detail.get("position", "-"),
+                    detail.get("source_observations", []),
+                    detail.get("reason", "one-to-one mismatch"),
+                )
+                log.warning(
+                    "marker audit context frame=%d route=%s gate_rows=%s "
+                    "checkpoint_rows=%s route_markers=%s",
+                    frame_id,
+                    "/".join(issue["key"]),
+                    detail.get("gate_rows", []),
+                    detail.get("checkpoint_rows", []),
+                    detail.get("route_markers", []),
+                )
+            for pair in marker_pairs:
+                common = pair.get("common_stops", ())
+                pair_key = (
+                    tuple(pair.get("key", ())),
+                    "gmb-marker-pair",
+                    pair.get("common_stop_index", "-"),
+                    pair.get("classification", "nearby"),
+                )
+                if not _first_marker_issue(pair_key):
+                    continue
+                log.warning(
+                    "GMB marker pair frame=%d route=%s class=%s distance=%.2fpx "
+                    "markers=%s common=%s",
+                    frame_id,
+                    "/".join(pair.get("key", ())),
+                    pair.get("classification", "nearby"),
+                    pair.get("pixel_distance", 0.0),
+                    pair.get("marker_ids", []),
+                    common[:2],
+                )
+        except Exception as exc:  # audit must never prevent rendering
+            log.warning("marker audit unavailable frame=%d: %s", frame_id, type(exc).__name__)
         log.info(
             "map markers: %d probe ETAs -> %d bus estimates",
             len(probe_etas),
@@ -271,6 +365,8 @@ __all__ = [
     "MAP_WIDTH",
     "BusEstimate",
     "estimate_bus_positions",
+    "audit_marker_positions",
+    "audit_gmb_marker_pairs",
     "fetch_traffic_map",
     "shutdown_gmaps_browser",
     "project",

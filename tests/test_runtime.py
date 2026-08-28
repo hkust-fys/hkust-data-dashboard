@@ -16,6 +16,7 @@ from bot import (
     _resolve_dashboard_message,
     _to_payload,
 )
+from dashboard.models import DashboardPayload, ImageAsset
 from tests.fixtures import sample_data as s
 
 
@@ -252,6 +253,157 @@ async def test_updater_edits_same_message_and_no_duplicate(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_edit_log_keeps_payload_generation_when_new_snapshot_publishes(monkeypatch, caplog):
+    import bot as bot_module
+
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001 - exercise one presenter tick
+    updater._message = _FakeMessage(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"map")])
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    edit_started = asyncio.Event()
+    release_edit = asyncio.Event()
+
+    async def blocked_edit(_message, _payload, view=None):
+        edit_started.set()
+        await release_edit.wait()
+
+    monkeypatch.setattr(bot_module, "_apply_payload", blocked_edit)
+    tick = asyncio.create_task(updater._tick(object()))  # noqa: SLF001
+    await edit_started.wait()
+    updater._snapshot = bot_module.CollectionSnapshot({}, 2, 0.0)
+    release_edit.set()
+    with caplog.at_level("INFO", logger="bot"):
+        await tick
+
+    record = next(r.message for r in caplog.records if "dashboard edit succeeded" in r.message)
+    assert "collection_generation=1" in record
+    assert "collection_generation=2" not in record
+
+
+@pytest.mark.asyncio
+async def test_pending_retained_map_waits_for_settlement_then_updates(monkeypatch, caplog):
+    import discord
+
+    import bot as bot_module
+    from dashboard.render import traffic_map_filename
+
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = _FakeMessage(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+    old = b"old-map"
+    fresh = b"fresh-map"
+    old_payload = DashboardPayload(files=[ImageAsset(traffic_map_filename(old), old)])
+    fresh_payload = DashboardPayload(files=[ImageAsset(traffic_map_filename(fresh), fresh)])
+    current_payload = old_payload
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: current_payload)
+    edits: list[DashboardPayload] = []
+
+    async def record_edit(_message, payload, view=None):
+        edits.append(payload)
+
+    monkeypatch.setattr(bot_module, "_apply_payload", record_edit)
+    updater._snapshot = bot_module.CollectionSnapshot(
+        {"traffic_map": (old, [])}, 1, 0.0,
+        stale_providers=frozenset({"traffic_map"}),
+    )
+    await updater._tick(object())  # noqa: SLF001
+    assert not edits
+
+    current_payload = fresh_payload
+    updater._snapshot = bot_module.CollectionSnapshot(
+        {"traffic_map": (fresh, [])}, 2, 0.0,
+        settled_providers=frozenset({"traffic_map"}),
+    )
+    with caplog.at_level("INFO", logger="bot"):
+        await updater._tick(object())  # noqa: SLF001
+    assert len(edits) == 1
+    assert "collection_generation=2" in caplog.text
+    assert traffic_map_filename(fresh) in caplog.text
+
+    # A settled exception retains the old map but cannot suppress later edits.
+    current_payload = DashboardPayload(
+        files=[ImageAsset(traffic_map_filename(fresh), fresh)],
+        embeds=[discord.Embed(title="new source")],
+    )
+    updater._snapshot = bot_module.CollectionSnapshot(
+        {"traffic_map": RuntimeError("capture failed")}, 3, 0.0,
+        stale_providers=frozenset({"traffic_map"}),
+        settled_providers=frozenset({"traffic_map"}),
+    )
+    await updater._tick(object())  # noqa: SLF001
+    assert len(edits) == 2
+
+
+@pytest.mark.asyncio
+async def test_map_gate_uses_snapshot_paired_with_payload_during_message_resolution(monkeypatch):
+    import bot as bot_module
+    from dashboard.render import traffic_map_filename
+
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    old = b"old-map"
+    old_payload = DashboardPayload(files=[ImageAsset(traffic_map_filename(old), old)])
+    updater._snapshot = bot_module.CollectionSnapshot(
+        {"traffic_map": (old, [])}, 1, 0.0,
+        stale_providers=frozenset({"traffic_map"}),
+    )
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: old_payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+    resolving = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resolve(_channel, _payload, view=None):
+        resolving.set()
+        await release.wait()
+        return _FakeMessage(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+
+    monkeypatch.setattr(bot_module, "_ensure_dashboard_message", resolve)
+    edits = []
+    monkeypatch.setattr(bot_module, "_apply_payload", lambda *args, **kwargs: edits.append(args[1]))
+    tick = asyncio.create_task(updater._tick(object()))  # noqa: SLF001
+    await resolving.wait()
+    updater._snapshot = bot_module.CollectionSnapshot(
+        {"traffic_map": (b"new-map", [])}, 2, 0.0,
+        settled_providers=frozenset({"traffic_map"}),
+    )
+    release.set()
+    await tick
+    assert not edits
+
+
+@pytest.mark.asyncio
+async def test_cold_start_initializing_payload_is_not_suppressed(monkeypatch):
+    import discord
+
+    import bot as bot_module
+
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = _FakeMessage(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    payload = DashboardPayload(embeds=[discord.Embed(title="Traffic map initializing")])
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+    edits = []
+
+    async def record_edit(_message, edited_payload, view=None):
+        edits.append(edited_payload)
+
+    monkeypatch.setattr(bot_module, "_apply_payload", record_edit)
+    await updater._tick(object())  # noqa: SLF001
+    assert len(edits) == 1
+
+
+@pytest.mark.asyncio
 async def test_updater_without_ffmpeg_does_not_start_live_frame_loop():
     updater = DashboardUpdater(_fake_settings())
     await updater.start()
@@ -265,6 +417,15 @@ def test_payload_fingerprint_changes_when_map_bytes_change():
     first = DashboardPayload(files=[ImageAsset("map.png", b"first")])
     changed = DashboardPayload(files=[ImageAsset("map.png", b"second")])
     assert _payload_fingerprint(first) != _payload_fingerprint(changed)
+
+
+def test_dry_run_recognizes_content_addressed_traffic_map_filename():
+    import bot as bot_module
+    from dashboard.render import traffic_map_filename
+
+    assert bot_module._is_traffic_map_filename(traffic_map_filename(b"map"))
+    assert not bot_module._is_traffic_map_filename("traffic-map.webp")
+    assert not bot_module._is_traffic_map_filename("traffic-map-not-a-hash.webp")
 
 
 def test_payload_fingerprint_ignores_render_timestamp_but_keeps_content():

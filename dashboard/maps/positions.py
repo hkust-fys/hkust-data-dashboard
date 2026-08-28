@@ -1,12 +1,12 @@
-"""Estimated bus positions from probe-stop ETAs on official route geometry.
+"""Estimated vehicle positions from stop ETAs on official route geometry.
 
 Each tracked direction is an official ordered stop sequence with a validated
-HKeMobility road path.  An ETA of ``m`` minutes at the official stop with
-index ``i`` places a bus roughly ``m / 2`` stops upstream (two minutes per
-stop), clamped to the section between stop ``i - 1`` and stop ``i`` so one
-ETA can never smear an estimate across several stops.  Positions are
-arclength-interpolated on the official line; estimates landing on either
-terminus are dropped.
+HKeMobility road path. Probe rows first form vehicle ladders around the coarse
+``stop index - ETA / 2`` position. Around HKUST, ordered stop arrivals are
+associated one-to-one with authoritative gate arrivals so variable real travel
+times cannot split one journey into several markers. Unmatched live arrivals
+after HKUST remain independent passed vehicles. Final positions are
+arclength-interpolated on the matching official direction.
 """
 
 from __future__ import annotations
@@ -36,9 +36,19 @@ class BusEstimate:
     route: str = ""
     bound: str = ""
     position: float | None = None
+    # Official stop occurrences which contributed to this marker.  Separate
+    # BusEstimate objects retain vehicle multiplicity when two vehicles share
+    # the same occurrence; this set only records each vehicle's evidence.
+    source_indices: frozenset[int] = frozenset()
+    # Exact rows in the estimator inputs (kind, zero-based input offset).  Stop
+    # indices alone cannot distinguish two vehicles reported at one stop.
+    source_observations: frozenset[tuple[str, int]] = frozenset()
 
 
 MINUTES_PER_STOP = 2.0
+GATE_DOWNSTREAM_DRIFT_MINUTES = 15.0
+GATE_UPSTREAM_DRIFT_MINUTES = 25.0
+GATE_PASSAGE_SKEW_MINUTES = 3.0
 
 # Route-geometry operator codes -> dashboard Operator enum values.
 _OPERATOR_BY_CODE = {
@@ -46,6 +56,355 @@ _OPERATOR_BY_CODE = {
     "CTB": Operator.CITYBUS,
     "GMB": Operator.GMB,
 }
+
+
+def _align_gate_arrivals(
+    gate_rows: list[tuple[int, object]],
+    probe_rows: list[tuple[int, object]],
+    *,
+    gate_index: int,
+    checkpoint: int,
+) -> list[tuple[int, int]]:
+    """Associate one stop's ordered arrivals with ordered HKUST arrivals.
+
+    Feeds expose no stable vehicle ID across stops. Arrival order is stable,
+    though, and the ETA difference should have the same sign as the stop's
+    location relative to HKUST. Dynamic programming therefore maximises
+    order-preserving cardinality, then favours travel time nearest the coarse
+    two-minutes-per-stop expectation. The returned pairs are
+    ``(probe_input_index, gate_input_index)``.
+    """
+    gates = sorted(
+        (
+            (max(0.0, float(row.minutes)), input_index)
+            for input_index, row in gate_rows
+            if row.minutes is not None and row.kind is not EtaKind.UNAVAILABLE
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    probes = sorted(
+        (
+            (max(0.0, float(row.minutes)), input_index)
+            for input_index, row in probe_rows
+            if row.minutes is not None and row.kind is not EtaKind.UNAVAILABLE
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    if not gates or not probes or checkpoint == gate_index:
+        return []
+
+    expected_delta = (checkpoint - gate_index) * MINUTES_PER_STOP
+    # Gate rows are integral minutes while probe rows retain fractional source
+    # timestamps. Their countdown clocks can differ by rounding, but a later
+    # stop must not be associated with an ETA several minutes earlier than
+    # HKUST; that is an already-passed vehicle, not clock skew.
+    clock_skew_minutes = 1.25
+    passage_skew_minutes = GATE_PASSAGE_SKEW_MINUTES
+
+    # State: match count, travel-time error, original input-index pairs.
+    states: list[list[tuple[int, float, tuple[tuple[int, int], ...]]]] = [
+        [(0, 0.0, ()) for _ in range(len(probes) + 1)]
+        for _ in range(len(gates) + 1)
+    ]
+    for gate_offset in range(1, len(gates) + 1):
+        for probe_offset in range(1, len(probes) + 1):
+            choices = [
+                states[gate_offset - 1][probe_offset],
+                states[gate_offset][probe_offset - 1],
+            ]
+            gate_minutes, gate_input_index = gates[gate_offset - 1]
+            probe_minutes, probe_input_index = probes[probe_offset - 1]
+            delta = probe_minutes - gate_minutes
+            if checkpoint > gate_index:
+                compatible = (
+                    max(
+                        -passage_skew_minutes,
+                        expected_delta - GATE_DOWNSTREAM_DRIFT_MINUTES,
+                    )
+                    <= delta
+                    <= expected_delta + GATE_DOWNSTREAM_DRIFT_MINUTES
+                )
+            else:
+                compatible = (
+                    expected_delta - GATE_UPSTREAM_DRIFT_MINUTES
+                    <= delta
+                    <= min(
+                        clock_skew_minutes,
+                        expected_delta + GATE_UPSTREAM_DRIFT_MINUTES,
+                    )
+                )
+            if compatible:
+                previous = states[gate_offset - 1][probe_offset - 1]
+                choices.append(
+                    (
+                        previous[0] + 1,
+                        previous[1] + abs(delta - expected_delta),
+                        previous[2]
+                        + ((probe_input_index, gate_input_index),),
+                    )
+                )
+            states[gate_offset][probe_offset] = min(
+                choices,
+                key=lambda state: (-state[0], state[1], state[2]),
+            )
+    return list(states[-1][-1][2])
+
+
+@dataclass(frozen=True)
+class _GateAssociationPlan:
+    gate_assignment: dict[int, int]
+    passed_probe_rows: frozenset[int]
+    passed_probe_positions: dict[int, float]
+    passed_track_ids: dict[int, int]
+    verified_gate_index: dict[tuple[str, str, str], int]
+    gate_rows_by_direction: dict[
+        tuple[str, str, str], list[tuple[int, object]]
+    ]
+    departed_gate_inputs: frozenset[int]
+    undeparted_probe_inputs: frozenset[int]
+    passed_gate_inputs: frozenset[int]
+
+
+def _plan_gate_associations(
+    probe_inputs: list[object],
+    authoritative_inputs: list[object],
+    route_keys: set[tuple[str, str, str]],
+) -> _GateAssociationPlan:
+    """Build the shared source-identity plan used by estimator and auditor."""
+    probe_rows_by_occurrence: dict[
+        tuple[str, str, str], dict[int, list[tuple[int, object]]]
+    ] = {}
+    gate_rows_by_direction: dict[
+        tuple[str, str, str], list[tuple[int, object]]
+    ] = {}
+    for input_index, eta in enumerate(probe_inputs):
+        key = (str(eta.operator), str(eta.route), str(eta.bound))
+        if (
+            key in route_keys
+            and eta.minutes is not None
+            and eta.kind is not EtaKind.UNAVAILABLE
+        ):
+            probe_rows_by_occurrence.setdefault(key, {}).setdefault(
+                int(eta.index), []
+            ).append((input_index, eta))
+    for input_index, eta in enumerate(authoritative_inputs):
+        key = (str(eta.operator), str(eta.route), str(eta.bound))
+        if (
+            key in route_keys
+            and eta.minutes is not None
+            and eta.kind is not EtaKind.UNAVAILABLE
+        ):
+            gate_rows_by_direction.setdefault(key, []).append((input_index, eta))
+
+    gate_assignment: dict[int, int] = {}
+    passed_probe_rows: set[int] = set()
+    passed_probe_positions: dict[int, float] = {}
+    passed_gate_inputs: set[int] = set()
+    verified_gate_index: dict[tuple[str, str, str], int] = {}
+    for key, gate_rows in gate_rows_by_direction.items():
+        gate_indices = {int(row.index) for _input_index, row in gate_rows}
+        if len(gate_indices) != 1:
+            continue
+        gate_index = next(iter(gate_indices))
+        verified_gate_index[key] = gate_index
+        for checkpoint, checkpoint_rows in probe_rows_by_occurrence.get(
+            key, {}
+        ).items():
+            pairs = _align_gate_arrivals(
+                gate_rows,
+                checkpoint_rows,
+                gate_index=gate_index,
+                checkpoint=checkpoint,
+            )
+            for probe_index, gate_input_index in pairs:
+                gate_assignment[probe_index] = gate_input_index
+
+            if checkpoint <= gate_index:
+                continue
+            ordered_probe_indices = [
+                input_index
+                for input_index, _row in sorted(
+                    checkpoint_rows,
+                    key=lambda item: (
+                        max(0.0, float(item[1].minutes)),
+                        item[0],
+                    ),
+                )
+            ]
+            matched_ranks = [
+                rank
+                for rank, input_index in enumerate(ordered_probe_indices)
+                if input_index in gate_assignment
+            ]
+            if matched_ranks:
+                first_matched_rank = min(matched_ranks)
+                matched_probe_input = ordered_probe_indices[first_matched_rank]
+                matched_gate_input = gate_assignment[matched_probe_input]
+                matched_probe = probe_inputs[matched_probe_input]
+                matched_gate = authoritative_inputs[matched_gate_input]
+                passed_probe_rows.update(
+                    input_index
+                    for input_index in ordered_probe_indices[: min(matched_ranks)]
+                    if input_index not in gate_assignment
+                )
+                for input_index in ordered_probe_indices[:first_matched_rank]:
+                    if input_index in gate_assignment:
+                        continue
+                    earlier = probe_inputs[input_index]
+                    passed_probe_positions[input_index] = (
+                        int(matched_gate.index)
+                        - float(matched_gate.minutes) / MINUTES_PER_STOP
+                        + (float(matched_probe.minutes) - float(earlier.minutes))
+                        / MINUTES_PER_STOP
+                    )
+
+        downstream_live_is_passed_gates = {
+            gate_input_index
+            for gate_input_index, gate_row in gate_rows
+            if (gate_index == 0 and float(gate_row.minutes) > 0)
+            or (
+                int(gate_row.index)
+                - float(gate_row.minutes) / MINUTES_PER_STOP
+                < 0
+                and gate_row.kind is EtaKind.SCHEDULED
+            )
+        }
+        for probe_input_index, gate_input_index in list(gate_assignment.items()):
+            if gate_input_index not in downstream_live_is_passed_gates:
+                continue
+            probe = probe_inputs[probe_input_index]
+            if (
+                (str(probe.operator), str(probe.route), str(probe.bound)) == key
+                and int(probe.index) > gate_index
+                and probe.kind is not EtaKind.SCHEDULED
+            ):
+                del gate_assignment[probe_input_index]
+                passed_probe_rows.add(probe_input_index)
+
+    # A live downstream row with a positive implied position and an ETA smaller
+    # than its assigned gate ETA proves that the gate vehicle has already
+    # passed HKUST. Keep this explicit so the estimator can prefer its
+    # freshest downstream rung over the stale direct gate position.
+    for probe_input_index, gate_input_index in gate_assignment.items():
+        probe = probe_inputs[probe_input_index]
+        gate = authoritative_inputs[gate_input_index]
+        key = (str(probe.operator), str(probe.route), str(probe.bound))
+        gate_index = verified_gate_index.get(key)
+        if (
+            gate_index is not None
+            and int(probe.index) > gate_index
+            and probe.kind is not EtaKind.SCHEDULED
+            and float(probe.minutes) < float(gate.minutes)
+            and int(probe.index) - float(probe.minutes) / MINUTES_PER_STOP
+            > gate_index
+        ):
+            passed_gate_inputs.add(gate_input_index)
+
+    # Rows whose coarse implied position is already beyond HKUST are explicit
+    # passed-vehicle evidence even when no gate match was possible.
+    for input_index, eta in enumerate(probe_inputs):
+        key = (str(eta.operator), str(eta.route), str(eta.bound))
+        gate_index = verified_gate_index.get(key)
+        if (
+            gate_index is not None
+            and eta.minutes is not None
+            and input_index not in gate_assignment
+        ):
+            raw_position = int(eta.index) - float(eta.minutes) / MINUTES_PER_STOP
+            if raw_position > gate_index:
+                passed_probe_rows.add(input_index)
+
+    departed_gate_inputs: set[int] = set()
+    undeparted_probe_inputs: set[int] = set()
+    for key, gate_rows in gate_rows_by_direction.items():
+        gate_index = verified_gate_index.get(key)
+        if gate_index is None:
+            continue
+        for gate_input, gate_row in gate_rows:
+            assigned_probe_inputs = [
+                probe_input
+                for probe_input, assigned_gate in gate_assignment.items()
+                if assigned_gate == gate_input
+            ]
+            future_at_origin = any(
+                int(probe_inputs[probe_input].index) == 0
+                and int(probe_inputs[probe_input].index)
+                - float(probe_inputs[probe_input].minutes) / MINUTES_PER_STOP
+                < 0
+                for probe_input in assigned_probe_inputs
+            )
+            has_departed_probe = any(
+                int(probe_inputs[probe_input].index)
+                - float(probe_inputs[probe_input].minutes) / MINUTES_PER_STOP
+                >= 0
+                and probe_inputs[probe_input].kind is not EtaKind.SCHEDULED
+                for probe_input in assigned_probe_inputs
+            )
+            gate_position = (
+                int(gate_row.index)
+                - float(gate_row.minutes) / MINUTES_PER_STOP
+            )
+            departed = gate_position >= 0 or (
+                gate_index > 0
+                and gate_row.kind is not EtaKind.SCHEDULED
+                and not future_at_origin
+                and has_departed_probe
+            )
+            if departed:
+                departed_gate_inputs.add(gate_input)
+            else:
+                undeparted_probe_inputs.update(assigned_probe_inputs)
+
+    # Corroborate passed rows across checkpoints using the same ordered ETA
+    # matcher used for gate arrivals.  A DSU preserves one-to-one identity
+    # without relying on the coarse spatial ladder drift.
+    parent = {input_index: input_index for input_index in passed_probe_rows}
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    for _key, checkpoints in probe_rows_by_occurrence.items():
+        passed_by_checkpoint = {
+            checkpoint: [
+                (input_index, row)
+                for input_index, row in rows
+                if input_index in passed_probe_rows
+            ]
+            for checkpoint, rows in checkpoints.items()
+        }
+        ordered_checkpoints = sorted(
+            checkpoint for checkpoint, rows in passed_by_checkpoint.items() if rows
+        )
+        for earlier, later in zip(ordered_checkpoints, ordered_checkpoints[1:], strict=False):
+            pairs = _align_gate_arrivals(
+                passed_by_checkpoint[earlier],
+                passed_by_checkpoint[later],
+                gate_index=earlier,
+                checkpoint=later,
+            )
+            for earlier_input, later_input in pairs:
+                union(earlier_input, later_input)
+    passed_track_ids = {input_index: find(input_index) for input_index in parent}
+
+    return _GateAssociationPlan(
+        gate_assignment,
+        frozenset(passed_probe_rows),
+        passed_probe_positions,
+        passed_track_ids,
+        verified_gate_index,
+        gate_rows_by_direction,
+        frozenset(departed_gate_inputs),
+        frozenset(undeparted_probe_inputs),
+        frozenset(passed_gate_inputs),
+    )
 
 
 def _path_segment_length(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -71,13 +430,133 @@ def _point_at_path_offset(
     return None
 
 
+def _separate_common_stop_departures(
+    records: list[tuple[tuple[str, str, str], float, bool, frozenset[tuple[str, int]]]],
+    evidence: dict[tuple[str, int], tuple[int, float]],
+    max_positions: dict[tuple[str, str, str], float],
+) -> dict[frozenset[tuple[str, int]], float]:
+    """Repair collapsed anchors using large, same-stop ETA headways.
+
+    The ladder model is deliberately coarse.  When two vehicles are both
+    reported at a stop, however, their ETA difference is direct evidence of
+    their ordering and separation.  Signed pair constraints are projected as
+    one acyclic component, so missing rows cannot make three or more vehicles
+    invert one another.  Conflicting cyclic evidence is left unchanged.
+    """
+    baseline = {sources: position for _key, position, _auth, sources in records}
+    record_by_sources = {sources: record for record in records for sources in [record[3]]}
+    edges: dict[frozenset[tuple[str, int]], set[frozenset[tuple[str, int]]]] = {
+        sources: set() for _key, _position, _auth, sources in records
+    }
+    directed: dict[frozenset[tuple[str, int]], dict[frozenset[tuple[str, int]], float]] = {
+        sources: {} for _key, _position, _auth, sources in records
+    }
+    for left_index, left in enumerate(records):
+        left_key, _left_position, left_authoritative, left_sources = left
+        if left_authoritative:
+            continue
+        for right in records[left_index + 1 :]:
+            right_key, _right_position, right_authoritative, right_sources = right
+            if right_authoritative or right_key != left_key:
+                continue
+            common: list[float] = []
+            signed_deltas: list[float] = []
+            for left_observation in sorted(left_sources):
+                left_evidence = evidence.get(left_observation)
+                if left_evidence is None:
+                    continue
+                left_stop, left_raw_position = left_evidence
+                for right_observation in sorted(right_sources):
+                    right_evidence = evidence.get(right_observation)
+                    if right_evidence is None or right_evidence[0] != left_stop:
+                        continue
+                    gap = abs(left_raw_position - right_evidence[1])
+                    if gap >= 5.0:  # ten minutes at the estimator's 2 min/stop
+                        common.append(gap)
+                        signed_deltas.append(left_raw_position - right_evidence[1])
+            if not common:
+                continue
+            separation = sorted(common)[len(common) // 2]
+            # A larger raw position means an earlier ETA at the same stop and
+            # therefore a vehicle farther along the route.  Do not infer this
+            # ordering from the already-collapsed anchors.
+            left_ahead = sorted(signed_deltas)[len(signed_deltas) // 2] > 0
+            edges[left_sources].add(right_sources)
+            edges[right_sources].add(left_sources)
+            if left_ahead:
+                directed[left_sources][right_sources] = separation
+            else:
+                directed[right_sources][left_sources] = separation
+    adjusted: dict[frozenset[tuple[str, int]], float] = {}
+    visited: set[frozenset[tuple[str, int]]] = set()
+    for root in sorted(edges, key=lambda sources: tuple(sorted(sources))):
+        if root in visited:
+            continue
+        component: list[frozenset[tuple[str, int]]] = []
+        stack = [root]
+        while stack:
+            sources = stack.pop()
+            if sources in visited:
+                continue
+            visited.add(sources)
+            component.append(sources)
+            stack.extend(edges[sources] - visited)
+        if len(component) == 1:
+            adjusted[root] = min(max(0.0, baseline[root]), max_positions.get(record_by_sources[root][0], float("inf")))
+            continue
+        # Kahn topological sort gives an order satisfying every signed ETA
+        # constraint.  Conflicting evidence is cyclic; leave that component
+        # at its baseline rather than inventing an ordering.
+        indegree = {sources: 0 for sources in component}
+        for ahead in component:
+            for behind in directed[ahead]:
+                indegree[behind] += 1
+        ready = sorted(
+            (sources for sources in component if indegree[sources] == 0),
+            key=lambda sources: tuple(sorted(sources)),
+        )
+        ordered: list[frozenset[tuple[str, int]]] = []
+        while ready:
+            sources = ready.pop(0)
+            ordered.append(sources)
+            for behind in sorted(directed[sources], key=lambda item: tuple(sorted(item))):
+                indegree[behind] -= 1
+                if indegree[behind] == 0:
+                    ready.append(behind)
+                    ready.sort(key=lambda item: tuple(sorted(item)))
+        if len(ordered) != len(component):
+            for sources in component:
+                adjusted[sources] = baseline[sources]
+            continue
+        distance = {sources: 0.0 for sources in component}
+        # Directed edges point ahead -> behind.  Walk them backwards so the
+        # longest-path coordinate increases toward the route's leading bus.
+        for ahead in reversed(ordered):
+            for behind, gap in directed[ahead].items():
+                distance[ahead] = max(distance[ahead], distance[behind] + gap)
+        maximum_distance = max(distance.values())
+        component = sorted(
+            component,
+            key=lambda sources: (-distance[sources], tuple(sorted(sources))),
+        )
+        route_key = record_by_sources[component[0]][0]
+        maximum = max_positions.get(route_key, float("inf"))
+        span = min(maximum_distance, maximum)
+        scale = span / maximum_distance if maximum_distance else 0.0
+        center = sum(baseline[sources] for sources in component) / len(component)
+        center = min(max(span / 2.0, center), maximum - span / 2.0)
+        for sources in component:
+            adjusted[sources] = center + distance[sources] * scale - span / 2.0
+    return adjusted
+
+
 def estimate_bus_positions(
     probe_etas,
     route_lines,
     destinations: dict[tuple[str, str, str], str] | None = None,
     authoritative_etas=None,
 ) -> list[BusEstimate]:
-    """Interpolate probe ETAs into per-section bus positions.
+    """Associate ETA rows into vehicles and interpolate them on route paths.
 
     ``probe_etas`` items need ``operator/route/bound/index/minutes/kind``;
     ``route_lines`` are geometry objects exposing ``route/operator/bound``,
@@ -119,18 +598,40 @@ def estimate_bus_positions(
     # containing ANY realtime row is a live vehicle and renders normally.
     LADDER_GAP_STOPS = 2.2
 
+    probe_inputs = list(probe_etas)
+    authoritative_inputs = list(authoritative_etas or [])
+    gate_plan = _plan_gate_associations(
+        probe_inputs,
+        authoritative_inputs,
+        set(lines_by_key),
+    )
+    gate_assignment = gate_plan.gate_assignment
+    passed_probe_rows = gate_plan.passed_probe_rows
+    passed_probe_positions = gate_plan.passed_probe_positions
+    passed_track_ids = gate_plan.passed_track_ids
+    verified_gate_index = gate_plan.verified_gate_index
+    gate_rows_by_direction = gate_plan.gate_rows_by_direction
+
     authoritative_keys = {
         (str(eta.operator), str(eta.route), str(eta.bound), int(eta.index))
-        for eta in (authoritative_etas or [])
+        for eta in authoritative_inputs
         if eta.minutes is not None
     }
+    observation_evidence: dict[tuple[str, int], tuple[int, float]] = {}
     by_direction: dict[
-        tuple[str, str, str], list[tuple[float, int, bool, bool]]
+        tuple[str, str, str],
+        list[tuple[float, int, bool, bool, tuple[str, int]]],
     ] = {}
-    for eta, is_authoritative in [
-        *((eta, False) for eta in probe_etas),
-        *((eta, True) for eta in (authoritative_etas or [])),
-    ]:
+    anchored_ladders: dict[
+        tuple[str, str, str],
+        dict[int, list[tuple[float, int, bool, bool, tuple[str, int]]]],
+    ] = {}
+    observations = [
+        *((eta, False, ("probe", index)) for index, eta in enumerate(probe_inputs)),
+        *((eta, True, ("gate", index))
+          for index, eta in enumerate(authoritative_inputs)),
+    ]
+    for eta, is_authoritative, observation in observations:
         if eta.minutes is None:
             continue
         if eta.kind is EtaKind.UNAVAILABLE:
@@ -148,22 +649,66 @@ def estimate_bus_positions(
             continue
         minutes = max(0.0, float(eta.minutes))
         raw_position = idx - minutes / MINUTES_PER_STOP
-        # The estimate must lie on the route. Undeparted buses never render:
-        # an ETA > 0 AT the terminus (implied position < 0) means the bus has
-        # not left yet. Only a matured 0-minute reading at the terminus puts
-        # the bus ON it (about to depart) — same rule as 0 minutes on top of
-        # HKUST.
-        if minutes > 0 and raw_position < 0:
-            continue
-        if not 0 <= raw_position <= stops_count - 1:
-            continue
-        by_direction.setdefault(key, []).append(
-            (raw_position, idx, eta.kind is EtaKind.SCHEDULED, is_authoritative)
+        row = (
+            raw_position,
+            idx,
+            eta.kind is EtaKind.SCHEDULED,
+            is_authoritative,
+            observation,
         )
+        if is_authoritative:
+            anchored_ladders.setdefault(key, {}).setdefault(
+                observation[1], []
+            ).append(row)
+            continue
+        probe_input_index = observation[1]
+        if probe_input_index in gate_assignment:
+            anchored_ladders.setdefault(key, {}).setdefault(
+                gate_assignment[probe_input_index], []
+            ).append(row)
+            continue
+        if key in gate_rows_by_direction and probe_input_index not in passed_probe_rows:
+            # A positive implied position beyond HKUST is explicit evidence
+            # that a live row has already passed the gate.  Other unmatched
+            # rows remain unresolved (in particular, do not snap beside it).
+            gate_index = verified_gate_index.get(key)
+            if gate_index is None or raw_position <= gate_index:
+                continue
+        elif key in gate_rows_by_direction and raw_position <= verified_gate_index.get(key, -1):
+            raw_position = passed_probe_positions.get(probe_input_index, raw_position)
+            gate_index = verified_gate_index.get(key)
+            if gate_index is None or raw_position <= gate_index:
+                continue
+        # Remaining probe-only evidence must imply a position on the route.
+        if not is_authoritative and minutes > 0 and raw_position < 0:
+            continue
+        if raw_position > stops_count - 1:
+            continue
+        # Gate-order proof may have replaced the coarse stop/ETA position.
+        # Rebuild the rung here; ``row`` was created before that correction
+        # for the authoritative/assigned fast paths above.
+        row = (
+            raw_position,
+            idx,
+            eta.kind is EtaKind.SCHEDULED,
+            False,
+            observation,
+        )
+        observation_evidence[observation] = (idx, raw_position)
+        by_direction.setdefault(key, []).append(row)
 
     candidates: dict[
         tuple[str, str, str, int],
-        list[tuple[float, int, bool, frozenset[int], bool]],
+        list[
+            tuple[
+                float,
+                int,
+                bool,
+                frozenset[int],
+                bool,
+                frozenset[tuple[str, int]],
+            ]
+        ],
     ] = {}
     for key, rows in sorted(by_direction.items()):
         operator_name, route, bound = key
@@ -173,15 +718,30 @@ def estimate_bus_positions(
         # same-stop ETAs can chain transitively through neighbouring rows and
         # collapse several actual departures into one vehicle.
         rows.sort(key=lambda row: (row[0], row[1], row[2]))
-        ladders: list[list[tuple[float, int, bool, bool]]] = []
+        ladders: list[
+            list[tuple[float, int, bool, bool, tuple[str, int]]]
+        ] = []
         for row in rows:
-            position, stop_index, _scheduled, _authoritative = row
-            compatible = [
-                (abs(position - ladder[-1][0]), ladder_index, ladder)
-                for ladder_index, ladder in enumerate(ladders)
-                if stop_index not in {rung[1] for rung in ladder}
-                and abs(position - ladder[-1][0]) <= LADDER_GAP_STOPS
-            ]
+            position, stop_index, _scheduled, _authoritative, _observation = row
+            passed_track_id = passed_track_ids.get(_observation[1])
+            compatible = []
+            for ladder_index, ladder in enumerate(ladders):
+                if stop_index in {rung[1] for rung in ladder}:
+                    continue
+                ladder_track_ids = {
+                    passed_track_ids.get(rung[4][1])
+                    for rung in ladder
+                    if passed_track_ids.get(rung[4][1]) is not None
+                }
+                if (
+                    passed_track_id is not None
+                    and ladder_track_ids == {passed_track_id}
+                ) or (
+                    passed_track_id is None
+                    and not ladder_track_ids
+                    and abs(position - ladder[-1][0]) <= LADDER_GAP_STOPS
+                ):
+                    compatible.append((abs(position - ladder[-1][0]), ladder_index, ladder))
             if compatible:
                 _distance, _ladder_index, ladder = min(
                     compatible, key=lambda item: (item[0], item[1])
@@ -213,8 +773,60 @@ def estimate_bus_positions(
                 (operator_name, route, bound, section), []
             )
             bucket.append(
-                (position, round(position * 1000), unreliable,
-                 frozenset(rung[1] for rung in ladder), bool(direct))
+                (
+                    position,
+                    round(position * 1000),
+                    unreliable,
+                    frozenset(rung[1] for rung in ladder),
+                    bool(direct),
+                    frozenset(rung[4] for rung in ladder),
+                )
+            )
+
+    # Build one track around every authoritative HKUST arrival. Probe rows
+    # were associated by ordered ETA above, so actual travel-time variation
+    # cannot split one journey merely because it violates the coarse
+    # two-minutes-per-stop position model.
+    for key, gate_ladders in sorted(anchored_ladders.items()):
+        operator_name, route, bound = key
+        stops_count = len(list(lines_by_key[key].stops))
+        for gate_input, ladder in gate_ladders.items():
+            direct = [rung for rung in ladder if rung[3]]
+            if (
+                len(direct) != 1
+                or gate_input not in gate_plan.departed_gate_inputs
+            ):
+                continue
+            direct_position = direct[0][0]
+            unreliable = all(rung[2] for rung in ladder)
+            if (
+                direct_position >= 0
+                and gate_input not in gate_plan.passed_gate_inputs
+            ):
+                position = direct_position
+            else:
+                departed_positions = [
+                    rung[0]
+                    for rung in ladder
+                    if not rung[3] and not rung[2] and rung[0] >= 0
+                ]
+                if not departed_positions:
+                    continue
+                position = max(departed_positions)
+            if position > stops_count - 1:
+                continue
+            section = min(math.floor(position), stops_count - 2)
+            candidates.setdefault(
+                (operator_name, route, bound, section), []
+            ).append(
+                (
+                    position,
+                    round(position * 1000),
+                    unreliable,
+                    frozenset(rung[1] for rung in ladder),
+                    True,
+                    frozenset(rung[4] for rung in ladder),
+                )
             )
 
     # A missing middle rung (probe fetch failure) can split one bus's ladder
@@ -223,21 +835,64 @@ def estimate_bus_positions(
     # in the same direction, preferring the reliable (realtime-evidenced)
     # anchor and then the earlier position.
     vehicles: dict[
-        tuple[str, str, str], list[tuple[float, bool, frozenset[int], bool]]
+        tuple[str, str, str],
+        list[
+            tuple[
+                float,
+                bool,
+                frozenset[int],
+                bool,
+                frozenset[tuple[str, int]],
+            ]
+        ],
     ] = {}
     for (operator_name, route, bound, _section), entries in sorted(candidates.items()):
-        for position, _scaled, unreliable, stop_indices, authoritative in entries:
+        for (
+            position,
+            _scaled,
+            unreliable,
+            stop_indices,
+            authoritative,
+            source_observations,
+        ) in entries:
             vehicles.setdefault((operator_name, route, bound), []).append(
-                (position, unreliable, stop_indices, authoritative)
+                (
+                    position,
+                    unreliable,
+                    stop_indices,
+                    authoritative,
+                    source_observations,
+                )
             )
 
-    candidates2: dict[tuple[str, str, str, int], list[tuple[float, bool]]] = {}
+    candidates2: dict[
+        tuple[str, str, str, int],
+        list[
+            tuple[
+                float,
+                int,
+                bool,
+                frozenset[int],
+                frozenset[tuple[str, int]],
+            ]
+        ],
+    ] = {}
     for key, anchors in sorted(vehicles.items()):
         # Keep spatial order while forming clusters.  Sorting by reliability
         # first can make a distant reliable anchor absorb an upstream
         # scheduled anchor, and makes the result depend on feed ordering.
         anchors.sort(key=lambda item: item[0])
-        clusters: list[list[tuple[float, bool, frozenset[int], bool]]] = [[anchors[0]]]
+        clusters: list[
+            list[
+                tuple[
+                    float,
+                    bool,
+                    frozenset[int],
+                    bool,
+                    frozenset[tuple[str, int]],
+                ]
+            ]
+        ] = [[anchors[0]]]
         for anchor in anchors[1:]:
             cluster_stops = set().union(*(item[2] for item in clusters[-1]))
             # Shared stop provenance means that one source snapshot exposed
@@ -245,8 +900,13 @@ def estimate_bus_positions(
             # their inferred positions are close: upstream stops stop listing
             # a bus after it passes, so far-away upstream ETAs do not refute a
             # close pair confirmed at downstream stops.
-            if (abs(anchor[0] - clusters[-1][-1][0]) <= 1.0
-                    and cluster_stops.isdisjoint(anchor[2])):
+            cluster_is_authoritative = any(item[3] for item in clusters[-1])
+            if (
+                abs(anchor[0] - clusters[-1][-1][0]) <= 1.0
+                and cluster_stops.isdisjoint(anchor[2])
+                and not anchor[3]
+                and not cluster_is_authoritative
+            ):
                 clusters[-1].append(anchor)
             else:
                 clusters.append([anchor])
@@ -264,18 +924,55 @@ def estimate_bus_positions(
             bucket = candidates2.setdefault(
                 (operator_name, route, bound, section), []
             )
-            bucket.append((0.0, round(position * 1000), unreliable))
+            provenance = frozenset().union(*(anchor[2] for anchor in cluster))
+            source_observations = frozenset().union(
+                *(anchor[4] for anchor in cluster)
+            )
+            bucket.append(
+                (
+                    0.0,
+                    round(position * 1000),
+                    unreliable,
+                    provenance,
+                    source_observations,
+                )
+            )
 
     estimates: list[BusEstimate] = []
-    for (operator_name, route, bound, section), entries in sorted(candidates2.items()):
+    records = [
+        (
+            (operator_name, route, bound),
+            scaled_position / 1000,
+            any(kind == "gate" for kind, _index in source_observations),
+            source_observations,
+        )
+        for (operator_name, route, bound, _section), entries in candidates2.items()
+        for _best_distance, scaled_position, _unreliable, _provenance, source_observations in entries
+    ]
+    records.sort(key=lambda item: (item[0], item[1], tuple(sorted(item[3]))))
+    max_positions = {
+        key: float(len(list(line.stops)) - 1) for key, line in lines_by_key.items()
+    }
+    adjusted_positions = _separate_common_stop_departures(
+        records, observation_evidence, max_positions
+    )
+    for (operator_name, route, bound, _section), entries in sorted(candidates2.items()):
         line = lines_by_key[(operator_name, route, bound)]
         stops = list(line.stops)
+        stops_count = len(stops)
         path = list(line.path)
         offsets = list(line.stop_offsets)
-        for _best_distance, scaled_position, unreliable in entries:
-            position = scaled_position / 1000
-            fraction = position - section
-            target_offset = offsets[section] + (offsets[section + 1] - offsets[section]) * fraction
+        for (
+            _best_distance,
+            scaled_position,
+            unreliable,
+            provenance,
+            source_observations,
+        ) in entries:
+            position = adjusted_positions.get(source_observations, scaled_position / 1000)
+            render_section = min(math.floor(position), stops_count - 2)
+            fraction = position - render_section
+            target_offset = offsets[render_section] + (offsets[render_section + 1] - offsets[render_section]) * fraction
             located = _point_at_path_offset(path, target_offset)
             if located is None:
                 continue
@@ -297,6 +994,8 @@ def estimate_bus_positions(
                     route=route,
                     bound=bound,
                     position=position,
+                    source_indices=provenance,
+                    source_observations=source_observations,
                 )
             )
     return estimates

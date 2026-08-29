@@ -249,13 +249,21 @@ async def fetch_traffic_map(
             marker_pairs = audit.get("gmb_marker_pairs", ())
             log.info(
                 "marker audit frame=%d checks=%d inconclusive=%d issues=%d "
-                "marker_pairs=%d markers=%d status=%s",
+                "marker_pairs=%d markers=%d observed_checkpoints=%d "
+                "audited_checkpoints=%d uncovered_checkpoints=%d "
+                "observed_rows=%d audited_rows=%d uncovered_rows=%d status=%s",
                 frame_id,
                 len(audit["checks"]),
                 audit["stats"].get("inconclusive", 0),
                 len(audit["issues"]),
                 len(marker_pairs),
                 audit["stats"]["markers"],
+                audit["stats"].get("observed_checkpoints", 0),
+                audit["stats"].get("audited_checkpoints", 0),
+                audit["stats"].get("uncovered_checkpoints", 0),
+                audit["stats"].get("observed_probe_rows", 0),
+                audit["stats"].get("audited_probe_rows", 0),
+                audit["stats"].get("uncovered_probe_rows", 0),
                 "pass" if audit["ok"] and not marker_pairs else "fail",
             )
             for issue in audit["issues"]:
@@ -288,12 +296,13 @@ async def fetch_traffic_map(
                 )
                 log.warning(
                     "marker audit context frame=%d route=%s gate_rows=%s "
-                    "checkpoint_rows=%s route_markers=%s",
+                    "checkpoint_rows=%s route_markers=%s association_rows=%s",
                     frame_id,
                     "/".join(issue["key"]),
                     detail.get("gate_rows", []),
                     detail.get("checkpoint_rows", []),
                     detail.get("route_markers", []),
+                    detail.get("association_rows", []),
                 )
             for pair in marker_pairs:
                 common = pair.get("common_stops", ())
@@ -307,12 +316,14 @@ async def fetch_traffic_map(
                     continue
                 log.warning(
                     "GMB marker pair frame=%d route=%s class=%s distance=%.2fpx "
-                    "markers=%s common=%s",
+                    "markers=%s route_positions=%s marker_sources=%s common=%s",
                     frame_id,
                     "/".join(pair.get("key", ())),
                     pair.get("classification", "nearby"),
                     pair.get("pixel_distance", 0.0),
                     pair.get("marker_ids", []),
+                    pair.get("route_positions", []),
+                    pair.get("marker_source_observations", []),
                     common[:2],
                 )
         except Exception as exc:  # audit must never prevent rendering

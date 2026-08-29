@@ -170,6 +170,12 @@ async def _run(
                     f"checks={len(audit['checks'])} "
                     f"kinds={','.join(kinds) or 'none'} "
                     f"inconclusive={inconclusive} markers={len(estimates)} "
+                    f"observed_checkpoints={audit['stats'].get('observed_checkpoints', 0)} "
+                    f"audited_checkpoints={audit['stats'].get('audited_checkpoints', 0)} "
+                    f"uncovered_checkpoints={audit['stats'].get('uncovered_checkpoints', 0)} "
+                    f"observed_rows={audit['stats'].get('observed_probe_rows', 0)} "
+                    f"audited_rows={audit['stats'].get('audited_probe_rows', 0)} "
+                    f"uncovered_rows={audit['stats'].get('uncovered_probe_rows', 0)} "
                     f"issues={len(audit['issues'])} "
                     f"status={'PASS' if audit['ok'] else 'FAIL'}"
                 )

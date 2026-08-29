@@ -1,9 +1,13 @@
 """Estimated bus position tests: ladder-collapsed vehicle reconstruction."""
 
+from dashboard.maps.marker_audit import audit_marker_positions
 from dashboard.maps.positions import (
     BusEstimate,
     _align_gate_arrivals,
+    _passed_row_position,
     _path_segment_length,
+    _plan_gate_associations,
+    _quantize_position,
     _separate_common_stop_departures,
     estimate_bus_positions,
 )
@@ -14,7 +18,16 @@ from dashboard.providers.route_geometry import RouteLine, Stop
 class Probe:
     """Minimal probe-ETA stand-in (duck-typed like the provider's ProbeEta)."""
 
-    def __init__(self, operator, route, bound, index, minutes, kind=None):
+    def __init__(
+        self,
+        operator,
+        route,
+        bound,
+        index,
+        minutes,
+        kind=None,
+        cache_age_seconds=None,
+    ):
         self.operator = operator
         self.route = route
         self.bound = bound
@@ -22,6 +35,7 @@ class Probe:
         self.minutes = minutes
         self.stop_id = "S"
         self.kind = kind or EtaKind.REALTIME
+        self.cache_age_seconds = cache_age_seconds
 
 
 class AuthoritativeProbe(Probe):
@@ -61,6 +75,158 @@ def test_timetable_ladder_collapses_to_one_vehicle():
     assert isinstance(estimate, BusEstimate)
     # Anchored at the maximum implied position (2.0).
     assert abs(estimate.lon - line.stops[2].lon) < 1e-6
+
+
+def test_long_upstream_hop_rejects_impossible_gate_match():
+    gate_rows = [
+        (0, AuthoritativeProbe("GMB", "11", "seq-1", 6, 10)),
+        (1, AuthoritativeProbe("GMB", "11", "seq-1", 6, 7)),
+    ]
+    probe_rows = [
+        (0, Probe("GMB", "11", "seq-1", 0, 10.1128)),
+        (1, Probe("GMB", "11", "seq-1", 0, 0.1128)),
+    ]
+    pairs = _align_gate_arrivals(
+        gate_rows, probe_rows, gate_index=6, checkpoint=0
+    )
+    assert pairs == [(1, 0)]
+
+
+def test_impossible_upstream_probe_does_not_move_gate_markers():
+    line = _line("GMB", "11", "seq-1", stop_count=20)
+    probes = [
+        Probe("GMB", "11", "seq-1", 0, 10.1128),
+        Probe("GMB", "11", "seq-1", 0, 0.1128),
+    ]
+    gates = [
+        AuthoritativeProbe("GMB", "11", "seq-1", 6, 10),
+        AuthoritativeProbe("GMB", "11", "seq-1", 6, 7),
+    ]
+    estimates = estimate_bus_positions(probes, [line], authoritative_etas=gates)
+    assert [round(estimate.position, 3) for estimate in estimates] == [1.0, 2.5]
+    assert any(("probe", 1) in estimate.source_observations for estimate in estimates)
+    assert not any(("probe", 0) in estimate.source_observations for estimate in estimates)
+
+
+def test_partial_downstream_frame_keeps_future_gate_journey_separate():
+    line = _line("CTB", "792M", "inbound", stop_count=30)
+    line.stops[16] = Stop("003130", "HKUST", 22.333360, 114.276)
+    values = {
+        22: [6.561, 29.461, 54.461],
+        24: [10.559, 33.776, 58.776],
+        26: [16.411, 39.644],
+        28: [18.546, 41.530],
+    }
+    probes = [
+        Probe("CTB", "792M", "inbound", stop, minutes)
+        for stop, etas in values.items()
+        for minutes in etas
+    ]
+    gates = [
+        AuthoritativeProbe("CTB", "792M", "inbound", 16, 21),
+        AuthoritativeProbe("CTB", "792M", "inbound", 16, 46),
+    ]
+    estimates = estimate_bus_positions(probes, [line], authoritative_etas=gates)
+    assert len(estimates) == 2
+    positions = sorted(estimate.position for estimate in estimates)
+    assert positions[0] < 16.0
+    assert positions[1] > 16.0
+    assert positions[1] - positions[0] >= 5.0
+    audit = audit_marker_positions(probes, gates, estimates, [line])
+    assert audit["ok"]
+    assert audit["stats"]["uncovered_checkpoints"] == 0
+    assert audit["stats"]["uncovered_probe_rows"] == 0
+    assert audit["stats"]["observed_checkpoints"] == audit["stats"]["audited_checkpoints"]
+    assert audit["stats"]["observed_probe_rows"] == audit["stats"]["audited_probe_rows"]
+    assert abs(positions[0] - 5.5) < 1.0
+    assert abs(positions[1] - 18.7) < 1.0
+
+
+def test_fresh_gate_coverage_beats_two_row_stale_frontier():
+    line = _line("GMB", "11", "seq-1", stop_count=20)
+    probes = [
+        Probe("GMB", "11", "seq-1", 9, eta, cache_age_seconds=80.75)
+        for eta in (10.277698866, 16.1717822, 31.1717822)
+    ] + [
+        Probe("GMB", "11", "seq-1", 10, eta, cache_age_seconds=1.11)
+        for eta in (6.661798167, 10.759448167, 17.2438315)
+    ]
+    gates = [
+        AuthoritativeProbe("GMB", "11", "seq-1", 6, eta)
+        for eta in (2, 7, 12)
+    ]
+    plan = _plan_gate_associations(probes, gates, {("GMB", "11", "seq-1")})
+    assert {3: 0, 4: 1, 5: 2}.items() <= plan.gate_assignment.items()
+    assert not ({3, 4, 5} & plan.passed_probe_rows)
+    estimates = estimate_bus_positions(probes, [line], authoritative_etas=gates)
+    assert len(estimates) == 3
+    assert {
+        frozenset(estimate.source_observations)
+        for estimate in estimates
+    } == {
+        frozenset({("gate", 0), ("probe", 0), ("probe", 3)}),
+        frozenset({("gate", 1), ("probe", 1), ("probe", 4)}),
+        frozenset({("gate", 2), ("probe", 2), ("probe", 5)}),
+    }
+    audit = audit_marker_positions(probes, gates, estimates, [line])
+    assert audit["ok"]
+    assert not audit["issues"]
+    assert audit["stats"]["uncovered_checkpoints"] == 0
+    assert audit["stats"]["uncovered_probe_rows"] == 0
+    assert audit["stats"]["observed_checkpoints"] == audit["stats"]["audited_checkpoints"]
+    assert audit["stats"]["observed_probe_rows"] == audit["stats"]["audited_probe_rows"]
+
+
+def test_stale_intermediate_checkpoint_does_not_create_extra_passed_track():
+    line = _line("GMB", "11", "seq-1", stop_count=25)
+    values = {
+        15: (9.3791491, 15.3028991),
+        16: (7.5386931, 11.499176433),
+        17: (3.285067883, 14.239217883, 19.93273455),
+    }
+    probes = [
+        Probe(
+            "GMB",
+            "11",
+            "seq-1",
+            stop,
+            eta,
+            cache_age_seconds=0.828 if stop == 15 else 152.047 if stop == 16 else 41.203,
+        )
+        for stop, etas in values.items()
+        for eta in etas
+    ]
+    gates = [AuthoritativeProbe("GMB", "11", "seq-1", 6, eta) for eta in (4, 19)]
+    estimates = estimate_bus_positions(probes, [line], authoritative_etas=gates)
+    assert len(estimates) == 3
+    assert {
+        frozenset(estimate.source_observations)
+        for estimate in estimates
+    } == {
+        frozenset({("gate", 0), ("probe", 0), ("probe", 3), ("probe", 6)}),
+        frozenset({("probe", 1), ("probe", 2), ("probe", 5)}),
+        frozenset({("probe", 4)}),
+    }
+    cp17_inputs = {
+        input_index
+        for input_index, row in enumerate(probes)
+        if row.index == 17
+    }
+    owners = {
+        input_index: estimate
+        for estimate in estimates
+        for _kind, input_index in estimate.source_observations
+        if _kind == "probe" and input_index in cp17_inputs
+    }
+    assert set(owners) == cp17_inputs
+    assert len({id(estimate) for estimate in owners.values()}) == 3
+    audit = audit_marker_positions(probes, gates, estimates, [line])
+    assert audit["ok"]
+    assert not audit["issues"]
+    assert audit["stats"]["uncovered_checkpoints"] == 0
+    assert audit["stats"]["uncovered_probe_rows"] == 0
+    assert audit["stats"]["observed_checkpoints"] == audit["stats"]["audited_checkpoints"]
+    assert audit["stats"]["observed_probe_rows"] == audit["stats"]["audited_probe_rows"]
 
 
 def test_zero_minutes_at_terminus_renders_at_terminus():
@@ -280,6 +446,104 @@ def test_three_vehicle_signed_order_does_not_invert_after_projection():
     assert corrected[sources[0]] > corrected[sources[1]] > corrected[sources[2]]
 
 
+def test_uneven_three_track_component_keeps_independent_source_anchors():
+    key = ("CTB", "792M", "inbound")
+    gate = frozenset({("gate", 0)})
+    trailing = frozenset({("probe", 0), ("probe", 4), ("probe", 8), ("probe", 12)})
+    middle = frozenset({("probe", 1), ("probe", 5), ("probe", 9), ("probe", 13)})
+    leading = frozenset({("probe", 2), ("probe", 6), ("probe", 10), ("probe", 14)})
+    records = [
+        (key, 13.0, True, gate),
+        (key, 17.842, False, trailing),
+        (key, 19.239, False, middle),
+        (key, 27.856, False, leading),
+    ]
+    checkpoints = (22, 24, 26, 28)
+    evidence = {
+        ("probe", offset): (checkpoint, 6.7)
+        for offset, checkpoint in zip((0, 4, 8, 12), checkpoints, strict=True)
+    }
+    evidence.update(
+        {
+            ("probe", offset): (checkpoint, raw)
+            for offsets, raw in (((1, 5, 9, 13), 19.2), ((2, 6, 10, 14), 27.856))
+            for offset, checkpoint in zip(offsets, checkpoints, strict=True)
+        }
+    )
+    corrected = _separate_common_stop_departures(records, evidence, {key: 40.0})
+    assert abs(corrected[trailing] - 6.7) < 0.25
+    assert abs(corrected[middle] - 19.2) < 0.25
+    assert abs(corrected[leading] - 27.856) < 0.25
+    assert corrected[trailing] < corrected[middle] < corrected[leading]
+
+
+def test_two_track_residual_median_balances_source_anchor_error():
+    key = ("KMB", "91M", "outbound")
+    trailing = frozenset({("probe", 0), ("probe", 2)})
+    leading = frozenset({("probe", 1), ("probe", 3)})
+    records = [
+        (key, 18.465, False, trailing),
+        (key, 25.2068, False, leading),
+    ]
+    evidence = {
+        ("probe", 0): (27, 18.0),
+        ("probe", 1): (27, 26.025),
+        ("probe", 2): (28, 18.2),
+        ("probe", 3): (28, 25.992),
+    }
+    corrected = _separate_common_stop_departures(records, evidence, {key: 40.0})
+    assert abs(corrected[trailing] - 18.465) < 1.0
+    assert abs(corrected[leading] - 25.2068) < 1.0
+    assert corrected[leading] > corrected[trailing]
+    assert corrected[leading] - corrected[trailing] >= 5.0
+
+
+def test_passed_component_respects_verified_gate_lower_bound():
+    key = ("CTB", "792M", "inbound")
+    trailing = frozenset({("probe", 0), ("probe", 2)})
+    leading = frozenset({("probe", 1), ("probe", 3)})
+    corrected = _separate_common_stop_departures(
+        [(key, 19.77, False, trailing), (key, 20.0, False, leading)],
+        {
+            ("probe", 0): (22, 19.7),
+            ("probe", 1): (22, 8.8),
+            ("probe", 2): (28, 19.7),
+            ("probe", 3): (28, 8.8),
+        },
+        {key: 29.0},
+        {key: 16.001},
+    )
+    assert corrected[trailing] > 16.0
+    assert corrected[leading] > 16.0
+    assert corrected[trailing] > corrected[leading]
+    assert corrected[trailing] - corrected[leading] >= 5.0
+
+
+def test_gate_lower_bound_does_not_move_authoritative_singleton():
+    key = ("CTB", "792M", "inbound")
+    gate = frozenset({("gate", 0)})
+    passed_a = frozenset({("probe", 0), ("probe", 2)})
+    passed_b = frozenset({("probe", 1), ("probe", 3)})
+    corrected = _separate_common_stop_departures(
+        [
+            (key, 7.5, True, gate),
+            (key, 19.77, False, passed_a),
+            (key, 20.0, False, passed_b),
+        ],
+        {
+            ("probe", 0): (22, 19.7),
+            ("probe", 1): (22, 8.8),
+            ("probe", 2): (28, 19.7),
+            ("probe", 3): (28, 8.8),
+        },
+        {key: 29.0},
+        {key: 16.001},
+    )
+    assert corrected[gate] == 7.5
+    assert corrected[passed_a] > 16.0
+    assert corrected[passed_b] > 16.0
+
+
 def test_chain_constraints_use_directed_topological_order():
     key = ("GMB", "11", "seq-1")
     sources = [
@@ -422,6 +686,289 @@ def test_gate_anchor_reconciles_variable_downstream_travel_times():
     )
 
 
+def test_monotone_downstream_frontier_preserves_four_exact_tracks():
+    line = _line("GMB", "12", "seq-2", stop_count=23)
+    minutes_by_stop = {
+        18: [1.29, 13.8],
+        19: [1.9, 3.9, 15.94],
+        20: [2.97, 5.09],
+        21: [0.53, 3.64, 5.76],
+        22: [5.51, 8.12, 10.92],
+    }
+    probes = [
+        Probe("GMB", "12", "seq-2", stop, minutes)
+        for stop, values in minutes_by_stop.items()
+        for minutes in values
+    ]
+    estimates = estimate_bus_positions(
+        probes,
+        [line],
+        authoritative_etas=[
+            AuthoritativeProbe("GMB", "12", "seq-2", 16, 6)
+        ],
+    )
+    groups = {
+        frozenset(index for kind, index in estimate.source_observations if kind == "probe")
+        for estimate in estimates
+    }
+    assert groups == {
+        frozenset({1, 4}),
+        frozenset({0, 3, 6, 9, 12}),
+        frozenset({2, 5, 8, 11}),
+        frozenset({7, 10}),
+    }
+    assert len(estimates) == 4
+    leading = sorted(
+        estimate.position
+        for estimate in estimates
+        if {0, 2} & {
+            index
+            for kind, index in estimate.source_observations
+            if kind == "probe"
+        }
+    )
+    assert len(leading) == 2
+    assert leading[1] - leading[0] <= 2.0
+    incoming = next(
+        estimate for estimate in estimates
+        if {1, 4} <= {index for kind, index in estimate.source_observations if kind == "probe"}
+    )
+    assert incoming.source_observations & {("gate", 0)}
+    assert incoming.position == 13.0
+
+
+def test_frontier_carries_gate_tracks_before_new_downstream_matching():
+    line = _line("GMB", "12", "seq-2", stop_count=23)
+    values = {
+        13: [11.948, 12],
+        14: [0.27, 12.46, 12.51],
+        15: [1.27, 12.73, 13.37],
+    }
+    probes = [
+        Probe("GMB", "12", "seq-2", stop, minutes)
+        for stop, etas in values.items()
+        for minutes in etas
+    ]
+    estimates = estimate_bus_positions(
+        probes,
+        [line],
+        authoritative_etas=[
+            AuthoritativeProbe("GMB", "12", "seq-2", 7, 1),
+            AuthoritativeProbe("GMB", "12", "seq-2", 7, 1),
+            AuthoritativeProbe("GMB", "12", "seq-2", 7, 21),
+        ],
+    )
+    groups = {
+        frozenset(index for kind, index in estimate.source_observations if kind == "probe")
+        for estimate in estimates
+    }
+    assert groups == {
+        frozenset({0, 3, 6}),
+        frozenset({1, 4, 7}),
+        frozenset({2, 5}),
+    }
+    assert len(estimates) == 3
+    assert not any(
+        estimate.source_observations == frozenset({("probe", 4)})
+        for estimate in estimates
+    )
+
+
+def test_newer_downstream_track_supersedes_stale_realtime_singleton():
+    line = _line("GMB", "11M", "seq-2", stop_count=12)
+    probes = [
+        Probe("GMB", "11M", "seq-2", 3, 2.21, EtaKind.SCHEDULED, 0),
+        Probe("GMB", "11M", "seq-2", 4, 4.21, EtaKind.SCHEDULED, 0),
+        Probe("GMB", "11M", "seq-2", 5, 6.21, EtaKind.SCHEDULED, 0),
+        Probe("GMB", "11M", "seq-2", 4, 3.906, EtaKind.REALTIME, 30),
+    ]
+    gates = [
+        AuthoritativeProbe(
+            "GMB", "11M", "seq-2", 0, 100, EtaKind.SCHEDULED
+        )
+    ]
+
+    plan = _plan_gate_associations(
+        probes, gates, {("GMB", "11M", "seq-2")}
+    )
+    estimates = estimate_bus_positions(
+        probes, [line], authoritative_etas=gates
+    )
+
+    assert plan.superseded_probe_inputs == {3}
+    assert len(estimates) == 1
+    assert estimates[0].source_observations == {
+        ("probe", 0),
+        ("probe", 1),
+        ("probe", 2),
+    }
+
+
+def test_newer_upstream_track_supersedes_stale_realtime_singleton():
+    line = _line("GMB", "11", "seq-1", stop_count=20)
+    probes = [
+        Probe("GMB", "11", "seq-1", 11, 0.661, cache_age_seconds=0),
+        Probe("GMB", "11", "seq-1", 12, 1.009, cache_age_seconds=0),
+        Probe("GMB", "11", "seq-1", 13, 2.110, cache_age_seconds=0),
+        Probe("GMB", "11", "seq-1", 13, 5.457, cache_age_seconds=30),
+    ]
+    gates = [
+        AuthoritativeProbe(
+            "GMB", "11", "seq-1", 6, 100, EtaKind.SCHEDULED
+        )
+    ]
+
+    plan = _plan_gate_associations(
+        probes, gates, {("GMB", "11", "seq-1")}
+    )
+    estimates = estimate_bus_positions(
+        probes, [line], authoritative_etas=gates
+    )
+
+    assert plan.superseded_probe_inputs == {3}
+    assert len(estimates) == 1
+    assert estimates[0].source_observations == {
+        ("probe", 0),
+        ("probe", 1),
+        ("probe", 2),
+    }
+
+
+def test_newer_upstream_track_does_not_refute_vehicle_that_passed_stop():
+    line = _line("GMB", "11", "seq-1", stop_count=20)
+    probes = [
+        Probe("GMB", "11", "seq-1", 11, 0.661, cache_age_seconds=0),
+        Probe("GMB", "11", "seq-1", 12, 1.009, cache_age_seconds=0),
+        Probe("GMB", "11", "seq-1", 13, 2.110, cache_age_seconds=0),
+        Probe("GMB", "11", "seq-1", 13, 1.0, cache_age_seconds=30),
+    ]
+    gates = [
+        AuthoritativeProbe(
+            "GMB", "11", "seq-1", 6, 100, EtaKind.SCHEDULED
+        )
+    ]
+
+    plan = _plan_gate_associations(
+        probes, gates, {("GMB", "11", "seq-1")}
+    )
+    estimates = estimate_bus_positions(
+        probes, [line], authoritative_etas=gates
+    )
+
+    assert not plan.superseded_probe_inputs
+    assert len(estimates) == 2
+
+
+def test_newer_realtime_singleton_cannot_refute_another_singleton():
+    probes = [
+        Probe("GMB", "11M", "seq-2", 11, 2, cache_age_seconds=0),
+        # This intervening passed row prevents the two timing-compatible
+        # singletons from being assumed to be one monotone track.
+        Probe("GMB", "11M", "seq-2", 12, 22, cache_age_seconds=0),
+        Probe("GMB", "11M", "seq-2", 13, 6, cache_age_seconds=30),
+    ]
+    gates = [
+        AuthoritativeProbe(
+            "GMB", "11M", "seq-2", 0, 100, EtaKind.SCHEDULED
+        )
+    ]
+
+    plan = _plan_gate_associations(
+        probes, gates, {("GMB", "11M", "seq-2")}
+    )
+
+    assert len(set(plan.passed_track_ids.values())) == 3
+    assert not plan.superseded_probe_inputs
+
+
+def test_equally_fresh_realtime_singleton_remains_a_distinct_vehicle():
+    line = _line("GMB", "11M", "seq-2", stop_count=12)
+    probes = [
+        Probe("GMB", "11M", "seq-2", 3, 2.21, EtaKind.SCHEDULED, 0),
+        Probe("GMB", "11M", "seq-2", 4, 4.21, EtaKind.SCHEDULED, 0),
+        Probe("GMB", "11M", "seq-2", 5, 6.21, EtaKind.SCHEDULED, 0),
+        Probe("GMB", "11M", "seq-2", 4, 3.906, EtaKind.REALTIME, 2),
+    ]
+    gates = [
+        AuthoritativeProbe(
+            "GMB", "11M", "seq-2", 0, 100, EtaKind.SCHEDULED
+        )
+    ]
+
+    plan = _plan_gate_associations(
+        probes, gates, {("GMB", "11M", "seq-2")}
+    )
+    estimates = estimate_bus_positions(
+        probes, [line], authoritative_etas=gates
+    )
+
+    assert not plan.superseded_probe_inputs
+    assert len(estimates) == 2
+
+
+def test_stale_realtime_singleton_at_last_stop_is_not_superseded():
+    line = _line("KMB", "91", "outbound", stop_count=31)
+    probe = Probe(
+        "KMB", "91", "outbound", 30, 1.414, EtaKind.REALTIME, 30
+    )
+    gates = [
+        AuthoritativeProbe(
+            "KMB", "91", "outbound", 15, 55, EtaKind.SCHEDULED
+        )
+    ]
+
+    plan = _plan_gate_associations(
+        [probe], gates, {("KMB", "91", "outbound")}
+    )
+    estimates = estimate_bus_positions(
+        [probe], [line], authoritative_etas=gates
+    )
+
+    assert not plan.superseded_probe_inputs
+    assert len(estimates) == 1
+    assert estimates[0].source_observations == {("probe", 0)}
+
+
+def test_headway_projection_keeps_leading_vehicle_at_exact_terminus():
+    line = _line("CTB", "792M", "inbound", stop_count=30)
+    # Official stop snapping and path arclength accumulation can differ by a
+    # few floating-point ulps at the final stop.
+    line.stop_offsets[-1] += 1e-8
+    probes = [
+        Probe("CTB", "792M", "inbound", 23, 1.858936050000342),
+        Probe("CTB", "792M", "inbound", 28, 13.155646866667006),
+        Probe("CTB", "792M", "inbound", 29, 0.5305527166668642),
+        Probe("CTB", "792M", "inbound", 29, 15.197219383333529),
+    ]
+
+    estimates = estimate_bus_positions(probes, [line])
+
+    assert [estimate.position for estimate in estimates] == [
+        21.666666666666664,
+        29.0,
+    ]
+    assert estimates[1].source_observations == {("probe", 2)}
+
+
+def test_failed_frontier_propagation_leaves_gate_available_for_fresh_match():
+    line = _line("GMB", "12", "seq-2", stop_count=20)
+    probes = [
+        Probe("GMB", "12", "seq-2", 13, 13),
+        Probe("GMB", "12", "seq-2", 14, 25),
+    ]
+    gates = [AuthoritativeProbe("GMB", "12", "seq-2", 7, 1)]
+    plan = _plan_gate_associations(
+        probes, gates, {("GMB", "12", "seq-2")}
+    )
+    assert plan.gate_assignment[1] == 0
+    estimates = estimate_bus_positions(probes, [line], authoritative_etas=gates)
+    assert any(
+        ("probe", 1) in estimate.source_observations
+        and ("gate", 0) in estimate.source_observations
+        for estimate in estimates
+    )
+
+
 def test_passed_downstream_vehicle_stays_separate_from_gate_journey():
     line = _line("GMB", "11", "seq-1", stop_count=20)
     estimates = estimate_bus_positions(
@@ -437,6 +984,23 @@ def test_passed_downstream_vehicle_stays_separate_from_gate_journey():
         ],
     )
     assert [estimate.position for estimate in estimates] == [5.0, 9.92]
+
+
+def test_raw_passed_position_wins_over_behind_gate_order_correction():
+    """A coarse row already past HKUST must not be hidden by stale order data."""
+    assert _passed_row_position(
+        7.0,
+        gate_index=6,
+        probe_input_index=0,
+        passed_probe_rows={0},
+        passed_probe_positions={0: 4.0},
+    ) == 7.0
+
+
+def test_position_quantization_preserves_strict_gate_side():
+    assert _quantize_position(6.0004, 6) == 6001
+    assert _quantize_position(5.9996, 6) == 5999
+    assert _quantize_position(6.0014, 6) == 6001
 
 
 def test_unmatched_downstream_row_is_not_synthetic_passed_vehicle():

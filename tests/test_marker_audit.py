@@ -46,6 +46,7 @@ def _row(
     route: str = "91",
     bound: str = "outbound",
     kind: EtaKind = EtaKind.REALTIME,
+    cache_age_seconds: float | None = None,
 ):
     return Obj(
         operator=operator,
@@ -54,6 +55,7 @@ def _row(
         index=index,
         minutes=minutes,
         kind=kind,
+        cache_age_seconds=cache_age_seconds,
     )
 
 
@@ -278,6 +280,25 @@ def test_post_hkust_marker_is_proved_at_a_later_stop():
     assert not _issues(result, "downstream")
 
 
+def test_raw_passed_probe_is_owned_at_checkpoint_and_proves_downstream():
+    """A passed probe remains visible even if its order correction lags."""
+    line = _line()
+    gate = _row(2, 2)
+    probe = _row(6, 4)
+    markers = [
+        _marker(1, observations=frozenset({("gate", 0)})),
+        _marker(4, observations=frozenset({("probe", 0)})),
+    ]
+    result = audit_marker_positions([probe], [gate], markers, [line])
+    checkpoint = next(
+        check for check in _checks(result, "checkpoint") if check["checkpoint"] == 6
+    )
+    assert _checks(result, "authoritative")[0]["ok"]
+    assert checkpoint["ok"]
+    assert checkpoint["matched_marker_ids"] == [1]
+    assert _checks(result, "downstream")[0]["ok"]
+
+
 def test_post_hkust_marker_without_matching_later_eta_fails():
     result = audit_marker_positions([_row(6, 1)], [], [_marker(4)], [_line()])
     assert not _checks(result, "downstream")[0]["ok"]
@@ -301,10 +322,10 @@ def test_one_later_eta_cannot_support_two_post_hkust_markers():
     assert _issues(result, "downstream")
 
 
-def test_future_probe_row_is_excluded_and_sample_is_inconclusive():
+def test_future_probe_row_is_excluded_and_checkpoint_is_inconclusive():
     result = audit_marker_positions([_row(1, 4)], [], [], [_line()])
     assert result["stats"]["excluded_probe_rows"] == 1
-    assert _checks(result, "sample")[0]["inconclusive"]
+    assert _checks(result, "checkpoint")[0]["inconclusive"]
     assert result["ok"]
 
 
@@ -342,40 +363,185 @@ def test_realtime_row_corroborates_nearby_scheduled_occurrence():
     assert result["ok"]
 
 
-def test_random_observed_checkpoint_passes_same_one_to_one_rule():
+def test_observed_checkpoint_passes_same_one_to_one_rule():
     result = audit_marker_positions(
         [_row(6, 4)], [], [_marker(4)], [_line()], frame_id=3
     )
-    sample = _checks(result, "sample")[0]
-    assert sample["checkpoint"] == 6 and sample["ok"]
+    check = _checks(result, "checkpoint")[0]
+    assert check["checkpoint"] == 6 and check["ok"]
 
 
-def test_random_observed_checkpoint_reports_a_mismatch():
+def test_observed_checkpoint_reports_a_mismatch():
     result = audit_marker_positions(
         [_row(6, 4)], [], [_marker(1)], [_line()], frame_id=3
     )
-    assert not _checks(result, "sample")[0]["ok"]
-    assert _issues(result, "sample")
+    assert not _checks(result, "checkpoint")[0]["ok"]
+    assert _issues(result, "checkpoint")
 
 
-def test_random_checkpoint_choice_is_stable_and_rotates_across_frames():
+def test_eligible_upstream_marker_without_source_journey_is_rejected():
+    probes = [_row(6, 4)]
+    markers = [
+        _marker(4, observations=frozenset({("probe", 0)})),
+        _marker(3, observations=frozenset({("probe", 99)})),
+    ]
+    result = audit_marker_positions(probes, [], markers, [_line()])
+    check = _checks(result, "checkpoint")[0]
+    assert not check["ok"]
+    assert check["match"]["unowned_markers"] == [1]
+
+
+def _evidence(index, minutes, checkpoint):
+    row = _row(checkpoint, minutes)
+    return _Evidence(
+        row=row,
+        row_index=index,
+        checkpoint=checkpoint,
+        minutes=float(minutes),
+        raw_position=float(checkpoint) - float(minutes) / 2.0,
+        scheduled=False,
+    )
+
+
+def test_validated_gate_boundary_marker_is_not_unowned_at_any_offset():
+    expected = [_evidence(0, 2, 8)]
+    exact = _checkpoint_check(
+        key=("KMB", "91", "outbound"), checkpoint=8,
+        expected=expected, excluded=[],
+        markers=[
+            (0, _marker(7, observations=frozenset({("probe", 0)}))),
+            (1, _marker(8, observations=frozenset({("gate", 0)}))),
+        ],
+        kind="checkpoint", tolerance=2, all_probe_rows=expected,
+        valid_gate_tokens={0},
+    )[0]
+    offset = _checkpoint_check(
+        key=("KMB", "91", "outbound"), checkpoint=8,
+        expected=expected, excluded=[],
+        markers=[
+            (0, _marker(7, observations=frozenset({("probe", 0)}))),
+            (1, _marker(7.9, observations=frozenset({("gate", 0)}))),
+        ],
+        kind="checkpoint", tolerance=2, all_probe_rows=expected,
+        valid_gate_tokens={0},
+    )[0]
+    assert exact["ok"]
+    assert exact["match"]["boundary_markers"] == [1]
+    assert offset["ok"]
+    assert offset["match"]["boundary_markers"] == [1]
+
+
+def test_later_probe_boundary_is_narrow_and_gate_token_disqualifies_it():
+    current = _evidence(1, 4, 8)
+    later = _evidence(0, 2, 9)
+    latest = _evidence(2, 2, 10)
+    base_markers = [
+        _marker(6, observations=frozenset({("probe", 1)})),
+        _marker(7.9628875, observations=frozenset({("probe", 0)})),
+    ]
+    boundary = _checkpoint_check(
+        key=("KMB", "91", "outbound"), checkpoint=8,
+        expected=[current], excluded=[], markers=list(enumerate(base_markers)),
+        kind="checkpoint", tolerance=2,
+            all_probe_rows=[current, later, latest],
+        valid_gate_tokens={2},
+    )[0]
+    offset = _checkpoint_check(
+        key=("KMB", "91", "outbound"), checkpoint=8,
+        expected=[current], excluded=[],
+        markers=[(0, base_markers[0]), (1, _marker(6.9, observations=frozenset({("probe", 0)})))],
+        kind="checkpoint", tolerance=2,
+            all_probe_rows=[current, later, latest],
+        valid_gate_tokens={2},
+    )[0]
+    with_gate = _checkpoint_check(
+        key=("KMB", "91", "outbound"), checkpoint=8,
+        expected=[current], excluded=[],
+        markers=[(0, base_markers[0]), (1, _marker(7.9628875, observations=frozenset({("probe", 0), ("gate", 99)})))],
+        kind="checkpoint", tolerance=2,
+            all_probe_rows=[current, later, latest],
+        valid_gate_tokens={2},
+    )[0]
+    assert boundary["ok"] and boundary["match"]["boundary_markers"] == [1]
+    assert not offset["ok"]
+    assert not with_gate["ok"]
+
+
+def test_validated_gate_proven_marker_is_source_backed_at_other_checkpoints():
+    current = _evidence(1, 4, 8)
+    result = _checkpoint_check(
+        key=("KMB", "91", "outbound"), checkpoint=8,
+        expected=[current], excluded=[],
+        markers=[
+            (0, _marker(6, observations=frozenset({("probe", 1)}))),
+            (1, _marker(5, observations=frozenset({("gate", 0)}))),
+        ],
+        kind="checkpoint", tolerance=2,
+        all_probe_rows=[current], valid_gate_tokens={0},
+    )[0]
+    assert result["ok"]
+    assert result["match"]["boundary_markers"] == [1]
+
+
+def test_terminal_probe_singleton_is_allowed_at_refresh_frontier():
+    terminal = _evidence(0, 20, 10)
+    current = _evidence(1, 20, 10)
+    result = _checkpoint_check(
+        key=("KMB", "91", "outbound"), checkpoint=10,
+        expected=[current], excluded=[],
+        markers=[
+            (0, _marker(0, observations=frozenset({("probe", 1)}))),
+            (1, _marker(2, observations=frozenset({("probe", 0)}))),
+        ],
+        kind="checkpoint", tolerance=2,
+        all_probe_rows=[terminal, current],
+    )[0]
+    assert result["ok"]
+    assert result["match"]["boundary_markers"] == [1]
+
+
+def test_interior_probe_singleton_is_not_refresh_frontier_evidence():
+    interior = _evidence(0, 20, 10)
+    current = _evidence(1, 20, 8)
+    later = _evidence(2, 4, 11)
+    result = _checkpoint_check(
+        key=("KMB", "91", "outbound"), checkpoint=8,
+        expected=[current], excluded=[],
+        markers=[
+            (0, _marker(-2, observations=frozenset({("probe", 1)}))),
+            (1, _marker(2, observations=frozenset({("probe", 0)}))),
+        ],
+        kind="checkpoint", tolerance=2,
+        all_probe_rows=[interior, current, later],
+    )[0]
+    assert not result["ok"]
+
+
+def test_distinct_source_journey_tokens_allow_same_stop_multiplicity():
+    probes = [_row(6, 4), _row(6, 6)]
+    markers = [
+        _marker(4, observations=frozenset({("probe", 0)})),
+        _marker(3, observations=frozenset({("probe", 1)})),
+    ]
+    result = audit_marker_positions(probes, [], markers, [_line()])
+    check = _checks(result, "checkpoint")[0]
+    assert check["ok"]
+    assert check["match"]["cardinality"] == 2
+
+
+def test_all_observed_checkpoints_are_audited_deterministically():
     probes = [_row(4, 2), _row(5, 4), _row(6, 6)]
     first = audit_marker_positions(probes, [], [_marker(3)], [_line()], frame_id=7)
     again = audit_marker_positions(probes, [], [_marker(3)], [_line()], frame_id=7)
-    assert _checks(first, "sample")[0]["checkpoint"] == _checks(again, "sample")[0]["checkpoint"]
-    chosen = {
-        _checks(
-            audit_marker_positions(
-                probes, [], [_marker(3)], [_line()], frame_id=frame
-            ),
-            "sample",
-        )[0]["checkpoint"]
-        for frame in range(12)
-    }
-    assert len(chosen) > 1
+    assert [c["checkpoint"] for c in _checks(first, "checkpoint")] == [4, 5, 6]
+    assert [c["checkpoint"] for c in _checks(again, "checkpoint")] == [4, 5, 6]
+    assert first["stats"]["observed_checkpoints"] == 3
+    assert first["stats"]["audited_checkpoints"] == 3
+    assert first["stats"]["uncovered_checkpoints"] == 0
+    assert first["stats"]["uncovered_probe_rows"] == 0
 
 
-def test_route_without_current_gate_geometry_is_random_only():
+def test_route_without_current_gate_geometry_audits_all_checkpoints():
     line = _line(route="91P", gate_index=None)
     result = audit_marker_positions(
         [_row(6, 4, route="91P")],
@@ -384,7 +550,7 @@ def test_route_without_current_gate_geometry_is_random_only():
         [line],
     )
     assert _checks(result, "authoritative")[0]["inconclusive"]
-    assert _checks(result, "sample")[0]["ok"]
+    assert _checks(result, "checkpoint")[0]["ok"]
     assert not _checks(result, "downstream")
 
 
@@ -420,7 +586,7 @@ def test_circular_104_first_gate_and_later_repeat_is_downstream():
     assert _checks(result, "checkpoint")[0]["checkpoint"] == 7
 
 
-def test_random_sampling_never_uses_another_route_stop_index():
+def test_checkpoint_audit_never_uses_another_route_stop_index():
     first = _line()
     second = _line(route="91M", bound="inbound", gate_index=2)
     result = audit_marker_positions(
@@ -430,11 +596,13 @@ def test_random_sampling_never_uses_another_route_stop_index():
         [first, second],
         frame_id=4,
     )
-    samples = {
-        check["key"]: check["checkpoint"] for check in _checks(result, "sample")
+    checkpoints = {
+        check["key"]: check["checkpoint"]
+        for check in _checks(result, "checkpoint")
     }
-    assert samples[("KMB", "91", "outbound")] == 6
-    assert samples[("KMB", "91M", "inbound")] == 4
+    assert checkpoints[("KMB", "91", "outbound")] == 6
+    assert checkpoints[("KMB", "91M", "inbound")] == 4
+    assert result["stats"]["uncovered_checkpoints"] == 0
 
 
 def test_exact_probe_provenance_preserves_two_rows_as_two_vehicles():
@@ -637,3 +805,79 @@ def test_expected_probe_row_missing_from_all_marker_provenance_fails():
     checkpoint = _checks(result, "checkpoint")[0]
     assert not checkpoint["ok"]
     assert checkpoint["match"]["unmatched_source_values"] == [4.0]
+
+
+def test_audit_excludes_realtime_singleton_superseded_by_newer_track():
+    line = _line(
+        operator="GMB",
+        route="11M",
+        bound="seq-2",
+        gate_index=0,
+        count=12,
+        gate_stop="20012474",
+    )
+    probes = [
+        _row(
+            3,
+            2.21,
+            operator="GMB",
+            route="11M",
+            bound="seq-2",
+            kind=EtaKind.SCHEDULED,
+            cache_age_seconds=0,
+        ),
+        _row(
+            4,
+            4.21,
+            operator="GMB",
+            route="11M",
+            bound="seq-2",
+            kind=EtaKind.SCHEDULED,
+            cache_age_seconds=0,
+        ),
+        _row(
+            5,
+            6.21,
+            operator="GMB",
+            route="11M",
+            bound="seq-2",
+            kind=EtaKind.SCHEDULED,
+            cache_age_seconds=0,
+        ),
+        _row(
+            4,
+            3.906,
+            operator="GMB",
+            route="11M",
+            bound="seq-2",
+            cache_age_seconds=30,
+        ),
+    ]
+    gate = _row(
+        0,
+        100,
+        operator="GMB",
+        route="11M",
+        bound="seq-2",
+        kind=EtaKind.SCHEDULED,
+    )
+    marker = _marker(
+        1.895,
+        operator=Operator.GMB,
+        route="11M",
+        bound="seq-2",
+        observations=frozenset(
+            {("probe", 0), ("probe", 1), ("probe", 2)}
+        ),
+    )
+
+    result = audit_marker_positions(probes, [gate], [marker], [line])
+
+    assert result["ok"]
+    checkpoint = next(
+        check
+        for check in _checks(result, "checkpoint")
+        if check["checkpoint"] == 4
+    )
+    assert checkpoint["excluded_rows"] == 1
+    assert checkpoint["ok"]

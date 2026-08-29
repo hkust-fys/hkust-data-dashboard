@@ -7,7 +7,6 @@ no I/O and adds no traffic to the operator APIs.
 from __future__ import annotations
 
 import math
-import random
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -16,6 +15,7 @@ from typing import Any
 from dashboard.maps.positions import (
     GATE_DOWNSTREAM_DRIFT_MINUTES,
     GATE_UPSTREAM_DRIFT_MINUTES,
+    _passed_row_position,
     _plan_gate_associations,
 )
 from dashboard.providers.transit import CTB_STOPS, GMB_STOPS, KMB_STOPS
@@ -103,9 +103,9 @@ def audit_gmb_marker_pairs(
             ] if any(len(items) > 1 for items in left_rows.values()) else []
             for right_id, right, right_anchor in candidates:
                 right_rows = observations_by_stop(right, key)
-                yield_pair = (right_id, right_anchor, right_rows)
+                yield_pair = (right_id, right, right_anchor, right_rows)
                 for candidate in (yield_pair,):
-                    candidate_id, candidate_anchor, candidate_rows = candidate
+                    candidate_id, candidate_marker, candidate_anchor, candidate_rows = candidate
                     is_self = False
                     distance = math.hypot(left_anchor[0] - candidate_anchor[0], left_anchor[1] - candidate_anchor[1])
                     if distance > max_distance:
@@ -140,9 +140,23 @@ def audit_gmb_marker_pairs(
                     findings.append({
                         "key": key,
                         "marker_ids": [left_id, candidate_id],
+                        "route_positions": [
+                            float(getattr(left, "position", 0.0)),
+                            float(getattr(candidate_marker, "position", 0.0)),
+                        ],
                         "positions": [left_anchor, candidate_anchor],
                         "pixel_distance": distance,
                         "classification": classification,
+                        "marker_source_observations": [
+                            sorted(getattr(left, "source_observations", ())),
+                            sorted(
+                                getattr(
+                                    candidate_marker,
+                                    "source_observations",
+                                    (),
+                                )
+                            ),
+                        ],
                         "common_stops": common,
                         "common_stop_indices": [item["index"] for item in common],
                         "common_stop_index": primary["index"],
@@ -173,9 +187,17 @@ def audit_gmb_marker_pairs(
                     findings.append({
                         "key": key,
                         "marker_ids": [left_id, candidate_id],
+                        "route_positions": [
+                            float(getattr(left, "position", 0.0)),
+                            float(getattr(_candidate_marker, "position", 0.0)),
+                        ],
                         "positions": [left_anchor, candidate_anchor],
                         "pixel_distance": distance,
                         "classification": "stacked",
+                        "marker_source_observations": [
+                            sorted(getattr(left, "source_observations", ())),
+                            sorted(getattr(_candidate_marker, "source_observations", ())),
+                        ],
                         "common_stops": common,
                         "common_stop_indices": [item["index"] for item in common],
                         "common_stop_index": primary["index"],
@@ -360,6 +382,8 @@ def _checkpoint_check(
     kind: str,
     tolerance: float,
     timing_probe_tokens: Mapping[int, set[tuple[str, int]]] | None = None,
+    all_probe_rows: Sequence[_Evidence] = (),
+    valid_gate_tokens: set[int] | None = None,
 ) -> tuple[dict[str, Any], set[int]]:
     """Compare one exact official stop occurrence with in-horizon markers."""
     source_rows = [row for row in expected if row.checkpoint == checkpoint]
@@ -396,6 +420,9 @@ def _checkpoint_check(
         timing_outliers: list[int] = []
         superseded_position_observations: list[tuple[str, int]] = []
         passed_checkpoint = 0
+        source_tokens = {
+            ("probe", row.row_index) for row in source_rows
+        }
         for source_index, row in enumerate(source_rows):
             token = ("probe", row.row_index)
             owners = [
@@ -442,16 +469,97 @@ def _checkpoint_check(
             for marker_id, count in marker_source_counts.items()
             if count > 1
         )
+        # A marker inside this stop's ETA horizon must be backed by one of the
+        # distinct source journeys observed at the stop.  Previously the
+        # provenance path only iterated source rows, allowing an extra marker
+        # with unrelated (or stale) provenance to evade the one-to-one check.
+        eligible_marker_ids = {
+            marker_id
+            for marker_id, marker in markers
+            if float(marker.position) <= checkpoint + 1e-9
+            and -1e-9
+            <= (checkpoint - float(marker.position)) * 2.0
+            <= max(row.minutes for row in source_rows) + tolerance
+        }
+        owned_marker_ids = {
+            marker_id
+            for marker_id, marker in markers
+            if source_tokens.intersection(
+                {
+                    tuple(token)
+                    for token in getattr(marker, "source_observations", ())
+                    if len(token) == 2
+                }
+            )
+        }
+        unowned_markers = sorted(eligible_marker_ids - owned_marker_ids)
+        boundary_markers: set[int] = set()
+        known_rows = {row.row_index: row for row in all_probe_rows}
+        valid_gate_tokens = valid_gate_tokens or set()
+        for marker_id, marker in markers:
+            if marker_id not in unowned_markers:
+                continue
+            observations = [
+                tuple(token)
+                for token in getattr(marker, "source_observations", ())
+                if len(token) == 2
+            ]
+            resolved = True
+            probe_rows = []
+            gate_tokens = []
+            for token in observations:
+                if str(token[0]) == "probe" and str(token[1]).lstrip("-").isdigit():
+                    row = known_rows.get(int(token[1]))
+                    if row is None:
+                        resolved = False
+                    else:
+                        probe_rows.append(row)
+                elif str(token[0]) == "gate" and str(token[1]).lstrip("-").isdigit():
+                    if int(token[1]) not in valid_gate_tokens:
+                        resolved = False
+                    else:
+                        gate_tokens.append(int(token[1]))
+                else:
+                    resolved = False
+            if not resolved:
+                continue
+            gate_proven = bool(gate_tokens)
+            implied_minutes = (checkpoint - float(marker.position)) * 2.0
+            if gate_proven and abs(float(marker.position) - checkpoint) <= 1e-9:
+                boundary_markers.add(marker_id)
+                continue
+            if not observations:
+                continue
+            next_rows = [row for row in probe_rows if row.checkpoint == checkpoint + 1]
+            probe_only = not gate_proven and bool(probe_rows)
+            max_observed_checkpoint = max(
+                (row.checkpoint for row in all_probe_rows),
+                default=checkpoint,
+            )
+            qualifies = (
+                gate_proven
+                or probe_only and implied_minutes <= 0.25
+                or probe_only and len({row.checkpoint for row in probe_rows}) >= 2
+                or probe_only and len(probe_rows) == 1
+                and len(next_rows) == 1
+                and implied_minutes <= tolerance
+                or probe_only and len(probe_rows) == 1
+                and probe_rows[0].checkpoint == max_observed_checkpoint
+            )
+            if qualifies:
+                boundary_markers.add(marker_id)
+        unowned_markers = sorted(set(unowned_markers) - boundary_markers)
+        unmatched_marker_ids = sorted(set(duplicate_markers) | set(unowned_markers))
         ok = (
             not unmatched_source
-            and not duplicate_markers
+            and not unmatched_marker_ids
             and not timing_outliers
         )
         match = {
             "cardinality": len(matched_pairs),
             "pair_indices": matched_pairs,
             "unmatched_source": unmatched_source,
-            "unmatched_markers": duplicate_markers,
+            "unmatched_markers": unmatched_marker_ids,
             "unmatched_source_values": [
                 source_rows[index].minutes for index in unmatched_source
             ],
@@ -461,9 +569,12 @@ def _checkpoint_check(
             ],
             "unmatched_marker_values": [
                 float(dict(markers)[marker_id].position)
-                for marker_id in duplicate_markers
+                for marker_id in unmatched_marker_ids
             ],
             "duplicate_sources": duplicate_sources,
+            "unowned_markers": unowned_markers,
+            "boundary_markers": sorted(boundary_markers),
+            "boundary_marker_count": len(boundary_markers),
             "timing_outliers": timing_outliers,
             "timing_outlier_values": [
                 source_rows[index].minutes for index in timing_outliers
@@ -480,7 +591,8 @@ def _checkpoint_check(
                 "ok": ok,
                 "inconclusive": False,
                 "source_count": len(source_rows),
-                "marker_count": len(matched_marker_ids),
+                "marker_count": len(eligible_marker_ids),
+                "eligible_marker_ids": sorted(eligible_marker_ids),
                 "matched_marker_ids": sorted(matched_marker_ids),
                 "match": match,
                 "excluded_rows": len(excluded_rows),
@@ -594,7 +706,10 @@ def audit_marker_positions(
         effective_rows: list[_Evidence] = []
         gate_assigned_rows: set[int] = set()
         for row in rows:
-            if row.row_index in undeparted_probe_inputs:
+            if (
+                row.row_index in undeparted_probe_inputs
+                or row.row_index in gate_plan.superseded_probe_inputs
+            ):
                 excluded_by_key[key].append(row)
                 continue
             if row.row_index in gate_plan.gate_assignment:
@@ -612,13 +727,17 @@ def audit_marker_positions(
                 )
                 continue
             if has_gate_rows:
-                if row.row_index not in gate_plan.passed_probe_rows:
+                if gate_index is None:
                     excluded_by_key[key].append(row)
                     continue
-                effective_position = gate_plan.passed_probe_positions.get(
-                    row.row_index, row.raw_position
+                effective_position = _passed_row_position(
+                    row.raw_position,
+                    gate_index,
+                    row.row_index,
+                    gate_plan.passed_probe_rows,
+                    gate_plan.passed_probe_positions,
                 )
-                if gate_index is None or effective_position <= gate_index:
+                if effective_position is None:
                     excluded_by_key[key].append(row)
                     continue
                 timing_tolerance = (
@@ -727,6 +846,15 @@ def audit_marker_positions(
         "invalid_probe_rows": invalid_probe_rows,
         "sampled": 0,
         "inconclusive": 0,
+        "observed_probe_rows": sum(len(rows) for rows in probe_rows_by_key.values()),
+        "observed_checkpoints": sum(
+            len({row.checkpoint for row in rows})
+            for rows in probe_rows_by_key.values()
+        ),
+        "audited_probe_rows": 0,
+        "audited_checkpoints": 0,
+        "uncovered_probe_rows": 0,
+        "uncovered_checkpoints": 0,
     }
 
     def record(check: dict[str, Any]) -> None:
@@ -928,37 +1056,46 @@ def audit_marker_positions(
             stats["matched"] += match["cardinality"]
             record(gate_check)
 
-        # Every later observed occurrence is independently one-to-one. These
-        # checks include incoming and already-past-HKUST vehicles; matched
-        # identities then specifically prove each post-HKUST marker.
+        # Every observed occurrence is independently one-to-one. These checks
+        # include the gate (when present), incoming, and already-past-HKUST
+        # vehicles. Matched identities then specifically prove each
+        # post-HKUST marker downstream.
         covered_post_markers: set[int] = set()
-        if gate is not None:
-            later_checkpoints = sorted(
-                {
-                    row.checkpoint
-                    for row in probe_rows_by_key[key]
-                    if row.checkpoint > gate
-                }
+        observed_checkpoints = sorted(
+            {row.checkpoint for row in probe_rows_by_key[key]}
+        )
+        for checkpoint in observed_checkpoints:
+            check, matched_marker_ids = _checkpoint_check(
+                key=key,
+                checkpoint=checkpoint,
+                expected=evidence_by_key[key],
+                excluded=excluded_by_key[key],
+                markers=markers,
+                kind="checkpoint",
+                tolerance=tolerance,
+                timing_probe_tokens=timing_probe_tokens_by_key[key],
+                all_probe_rows=(
+                    evidence_by_key[key] + excluded_by_key[key]
+                ),
+                valid_gate_tokens={
+                    input_index
+                    for input_index, _row in indexed_authoritative_by_key[key]
+                },
             )
-            for checkpoint in later_checkpoints:
-                check, matched_marker_ids = _checkpoint_check(
-                    key=key,
-                    checkpoint=checkpoint,
-                    expected=evidence_by_key[key],
-                    excluded=excluded_by_key[key],
-                    markers=markers,
-                    kind="checkpoint",
-                    tolerance=tolerance,
-                    timing_probe_tokens=timing_probe_tokens_by_key[key],
-                )
-                stats["matched"] += check.get("match", {}).get("cardinality", 0)
-                record(check)
+            stats["audited_checkpoints"] += 1
+            stats["audited_probe_rows"] += check.get("source_count", 0) + check.get(
+                "excluded_rows", 0
+            )
+            stats["matched"] += check.get("match", {}).get("cardinality", 0)
+            record(check)
+            if gate is not None:
                 covered_post_markers.update(
                     marker_id
                     for marker_id in matched_marker_ids
                     if float(marker_lookup[marker_id].position) > gate
                 )
 
+        if gate is not None:
             for marker_id, marker in markers:
                 position = float(marker.position)
                 if position <= gate + 1e-9:
@@ -1004,41 +1141,24 @@ def audit_marker_positions(
                     }
                 )
 
-        # One reproducible random non-gate source occurrence per active route.
-        sample_candidates = sorted(
-            {
-                row.checkpoint
-                for row in probe_rows_by_key[key]
-                if gate is None or row.checkpoint != gate
-            }
-        )
-        if sample_candidates:
-            checkpoint = random.Random(
-                f"{seed!r}:{frame_id}:{key[0]}:{key[1]}:{key[2]}"
-            ).choice(sample_candidates)
-            sample, _matched_marker_ids = _checkpoint_check(
-                key=key,
-                checkpoint=checkpoint,
-                expected=evidence_by_key[key],
-                excluded=excluded_by_key[key],
-                markers=markers,
-                kind="sample",
-                tolerance=tolerance,
-                timing_probe_tokens=timing_probe_tokens_by_key[key],
+        if observed_checkpoints:
+            stats["uncovered_checkpoints"] += max(
+                0, len(observed_checkpoints)
+                - sum(
+                    check.get("checkpoint") in observed_checkpoints
+                    and check.get("kind") == "checkpoint"
+                    for check in checks
+                    if check.get("key") == key
+                )
             )
-            stats["sampled"] += 1
-            stats["matched"] += sample.get("match", {}).get("cardinality", 0)
-            record(sample)
         elif probe_rows_by_key[key]:
-            record(
-                {
-                    "key": key,
-                    "kind": "sample",
-                    "ok": True,
-                    "inconclusive": True,
-                    "reason": "no observed non-gate occurrence",
-                }
-            )
+            # This can only happen when all rows were malformed/excluded prior
+            # to checkpoint construction; retain an explicit inconclusive row.
+            stats["uncovered_checkpoints"] += 1
+
+    stats["uncovered_probe_rows"] = max(
+        0, stats["observed_probe_rows"] - stats["audited_probe_rows"]
+    )
 
     for issue in issues:
         key = issue["key"]
@@ -1072,6 +1192,38 @@ def audit_marker_positions(
                 ),
             )
             for marker_id, marker in markers_by_key[key]
+        ]
+        marker_probe_inputs = {
+            int(token[1])
+            for _marker_id, marker in markers_by_key[key]
+            for token in getattr(marker, "source_observations", ())
+            if len(token) == 2
+            and str(token[0]) == "probe"
+            and str(token[1]).lstrip("-").isdigit()
+        }
+        diagnostic_probe_inputs = {
+            row.row_index
+            for row in probe_rows_by_key[key]
+            if checkpoint is not None and row.checkpoint == checkpoint
+        } | marker_probe_inputs
+        detail["association_rows"] = [
+            (
+                ("probe", row.row_index),
+                row.checkpoint,
+                row.minutes,
+                "scheduled" if row.scheduled else _kind(row.row),
+                row.raw_position,
+                getattr(row.row, "cache_age_seconds", None),
+                gate_plan.gate_assignment.get(row.row_index),
+                row.row_index in gate_plan.passed_probe_rows,
+                gate_plan.passed_probe_positions.get(row.row_index),
+                gate_plan.passed_track_ids.get(row.row_index),
+                row.row_index in gate_plan.undeparted_probe_inputs,
+                row.row_index in marker_probe_inputs,
+                row.row_index in gate_plan.superseded_probe_inputs,
+            )
+            for row in probe_rows_by_key[key]
+            if row.row_index in diagnostic_probe_inputs
         ]
 
     gmb_marker_pairs = audit_gmb_marker_pairs(

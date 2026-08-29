@@ -12,9 +12,34 @@ arclength-interpolated on the matching official direction.
 from __future__ import annotations
 
 import math
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
+from statistics import median
 
 from dashboard.models import EtaKind, Operator
+
+
+def _passed_row_position(
+    raw_position: float,
+    gate_index: int,
+    probe_input_index: int,
+    passed_probe_rows: Collection[int],
+    passed_probe_positions: Mapping[int, float],
+) -> float | None:
+    """Return the corrected position for a probe row known to be past HKUST.
+
+    A row whose coarse ETA already places it beyond the gate is authoritative
+    for that fact and keeps its raw position.  Otherwise only rows explicitly
+    classified as passed may use the gate-order correction.  Positions that do
+    not end up strictly beyond the gate are not eligible for rendering or
+    downstream audit proof.
+    """
+    if raw_position > gate_index:
+        return raw_position
+    if probe_input_index not in passed_probe_rows:
+        return None
+    corrected = passed_probe_positions.get(probe_input_index, raw_position)
+    return corrected if corrected > gate_index else None
 
 
 @dataclass(frozen=True)
@@ -49,6 +74,8 @@ MINUTES_PER_STOP = 2.0
 GATE_DOWNSTREAM_DRIFT_MINUTES = 15.0
 GATE_UPSTREAM_DRIFT_MINUTES = 25.0
 GATE_PASSAGE_SKEW_MINUTES = 3.0
+PROBE_FRESHNESS_MARGIN_SECONDS = 5.0
+STALE_SINGLETON_MATCH_TOLERANCE_MINUTES = 2.0
 
 # Route-geometry operator codes -> dashboard Operator enum values.
 _OPERATOR_BY_CODE = {
@@ -58,12 +85,25 @@ _OPERATOR_BY_CODE = {
 }
 
 
+def _quantize_position(position: float, gate_index: int | None = None) -> int:
+    """Quantize a position while preserving its strict side of HKUST."""
+    scaled = round(position * 1000)
+    if gate_index is not None:
+        gate_scaled = gate_index * 1000
+        if position > gate_index and scaled <= gate_scaled:
+            return gate_scaled + 1
+        if position < gate_index and scaled >= gate_scaled:
+            return gate_scaled - 1
+    return scaled
+
+
 def _align_gate_arrivals(
     gate_rows: list[tuple[int, object]],
     probe_rows: list[tuple[int, object]],
     *,
     gate_index: int,
     checkpoint: int,
+    rank_first: bool = False,
 ) -> list[tuple[int, int]]:
     """Associate one stop's ordered arrivals with ordered HKUST arrivals.
 
@@ -101,9 +141,9 @@ def _align_gate_arrivals(
     clock_skew_minutes = 1.25
     passage_skew_minutes = GATE_PASSAGE_SKEW_MINUTES
 
-    # State: match count, travel-time error, original input-index pairs.
-    states: list[list[tuple[int, float, tuple[tuple[int, int], ...]]]] = [
-        [(0, 0.0, ()) for _ in range(len(probes) + 1)]
+    # State: match count, rank displacement, travel-time error, original pairs.
+    states: list[list[tuple[int, int, float, tuple[tuple[int, int], ...]]]] = [
+        [(0, 0, 0.0, ()) for _ in range(len(probes) + 1)]
         for _ in range(len(gates) + 1)
     ]
     for gate_offset in range(1, len(gates) + 1):
@@ -125,29 +165,37 @@ def _align_gate_arrivals(
                     <= expected_delta + GATE_DOWNSTREAM_DRIFT_MINUTES
                 )
             else:
+                # Adjacent stops retain the 1.25-minute cache skew; each
+                # additional hop requires another 0.25 minutes of physical
+                # travel, preventing impossible long-hop near-zero matches.
+                upstream_upper = min(
+                    clock_skew_minutes,
+                    expected_delta + GATE_UPSTREAM_DRIFT_MINUTES,
+                ) - max(0, gate_index - checkpoint - 1) * 0.25
                 compatible = (
                     expected_delta - GATE_UPSTREAM_DRIFT_MINUTES
-                    <= delta
-                    <= min(
-                        clock_skew_minutes,
-                        expected_delta + GATE_UPSTREAM_DRIFT_MINUTES,
-                    )
+                    <= delta <= upstream_upper
                 )
             if compatible:
                 previous = states[gate_offset - 1][probe_offset - 1]
                 choices.append(
                     (
                         previous[0] + 1,
-                        previous[1] + abs(delta - expected_delta),
-                        previous[2]
+                        previous[1] + abs((gate_offset - 1) - (probe_offset - 1)),
+                        previous[2] + abs(delta - expected_delta),
+                        previous[3]
                         + ((probe_input_index, gate_input_index),),
                     )
                 )
             states[gate_offset][probe_offset] = min(
                 choices,
-                key=lambda state: (-state[0], state[1], state[2]),
+                key=(
+                    (lambda state: (-state[0], state[1], state[2], state[3]))
+                    if rank_first and len(gates) > 1
+                    else (lambda state: (-state[0], state[2], state[3]))
+                ),
             )
-    return list(states[-1][-1][2])
+    return list(states[-1][-1][3])
 
 
 @dataclass(frozen=True)
@@ -156,6 +204,7 @@ class _GateAssociationPlan:
     passed_probe_rows: frozenset[int]
     passed_probe_positions: dict[int, float]
     passed_track_ids: dict[int, int]
+    superseded_probe_inputs: frozenset[int]
     verified_gate_index: dict[tuple[str, str, str], int]
     gate_rows_by_direction: dict[
         tuple[str, str, str], list[tuple[int, object]]
@@ -207,56 +256,228 @@ def _plan_gate_associations(
             continue
         gate_index = next(iter(gate_indices))
         verified_gate_index[key] = gate_index
-        for checkpoint, checkpoint_rows in probe_rows_by_occurrence.get(
-            key, {}
-        ).items():
-            pairs = _align_gate_arrivals(
+        gate_rows_by_input = dict(gate_rows)
+        frontier: list[tuple[int, object]] = []
+        frontier_gate_assignments: dict[int, int] = {}
+        frontier_checkpoint = gate_index
+        for checkpoint in sorted(probe_rows_by_occurrence.get(key, {})):
+            checkpoint_rows = probe_rows_by_occurrence[key][checkpoint]
+            if checkpoint < gate_index:
+                for probe_index, gate_input_index in _align_gate_arrivals(
+                    gate_rows,
+                    checkpoint_rows,
+                    gate_index=gate_index,
+                    checkpoint=checkpoint,
+                ):
+                    gate_assignment[probe_index] = gate_input_index
+                    frontier_gate_assignments[probe_index] = gate_input_index
+                if frontier_gate_assignments:
+                    frontier = [
+                        (input_index, row)
+                        for input_index, row in checkpoint_rows
+                        if input_index in frontier_gate_assignments
+                    ]
+                    frontier_checkpoint = checkpoint
+                continue
+            if checkpoint == gate_index:
+                continue
+
+            reserved: set[int] = set()
+            propagated_gate_inputs: set[int] = set()
+            fresh_gate_inputs: set[int] = set()
+            fresh_pairs = _align_gate_arrivals(
                 gate_rows,
                 checkpoint_rows,
                 gate_index=gate_index,
                 checkpoint=checkpoint,
+                rank_first=True,
+            )
+            frontier_pairs = (
+                _align_gate_arrivals(
+                    frontier,
+                    checkpoint_rows,
+                    gate_index=frontier_checkpoint,
+                    checkpoint=checkpoint,
+                )
+                if frontier
+                else []
+            )
+            valid_frontier_gate_pairs = 0
+            for current_input, previous_input in frontier_pairs:
+                previous_gate = frontier_gate_assignments.get(previous_input)
+                if previous_gate is None:
+                    continue
+                if _align_gate_arrivals(
+                    [(previous_gate, gate_rows_by_input[previous_gate])],
+                    [(current_input, dict(checkpoint_rows)[current_input])],
+                    gate_index=gate_index,
+                    checkpoint=checkpoint,
+                ):
+                    valid_frontier_gate_pairs += 1
+            frontier_age = max(
+                (
+                    float(getattr(row, "cache_age_seconds", 0) or 0)
+                    for _input_index, row in frontier
+                ),
+                default=0.0,
+            )
+            fresh_age = min(
+                (
+                    float(getattr(row, "cache_age_seconds", 0) or 0)
+                    for _input_index, row in checkpoint_rows
+                ),
+                default=0.0,
+            )
+            # A fresh snapshot may repair stale frontier overmatching; on
+            # equally fresh ladders retain frontier continuity exactly.
+            if (
+                fresh_age + PROBE_FRESHNESS_MARGIN_SECONDS < frontier_age
+                and len(fresh_pairs) > valid_frontier_gate_pairs
+            ):
+                for current_input, fresh_gate in fresh_pairs:
+                    gate_assignment[current_input] = fresh_gate
+                    reserved.add(current_input)
+                    fresh_gate_inputs.add(fresh_gate)
+            # Carry the combined gate-backed/passed identity frontier forward
+            # in ETA order. Treating
+            # the prior rows as a synthetic checkpoint keeps the same
+            # monotone alignment and tolerance rules as gate matching.
+            if frontier:
+                propagated = _align_gate_arrivals(
+                    frontier,
+                    checkpoint_rows,
+                    gate_index=frontier_checkpoint,
+                    checkpoint=checkpoint,
+                )
+                for current_input, previous_input in propagated:
+                    if current_input in reserved:
+                        continue
+                    previous_gate = frontier_gate_assignments.get(previous_input)
+                    current_row = dict(checkpoint_rows)[current_input]
+                    if previous_gate is not None and not _align_gate_arrivals(
+                        [
+                            (previous_gate, gate_rows_by_input[previous_gate])
+                        ],
+                        [(current_input, current_row)],
+                        gate_index=gate_index,
+                        checkpoint=checkpoint,
+                    ):
+                        # Frontier continuity cannot override a fresh check
+                        # against the original gate ETA; let normal matching
+                        # reconsider this row when a cache refresh jumps.
+                        continue
+                    if previous_gate is not None and previous_gate in fresh_gate_inputs:
+                        continue
+                    reserved.add(current_input)
+                    if previous_gate is not None:
+                        gate_assignment[current_input] = previous_gate
+                        propagated_gate_inputs.add(previous_gate)
+                    else:
+                        passed_probe_rows.add(current_input)
+                    previous_row = dict(frontier)[previous_input]
+                    previous_position = passed_probe_positions.get(
+                        previous_input,
+                        int(previous_row.index)
+                        - float(previous_row.minutes) / MINUTES_PER_STOP,
+                    )
+                    projected = previous_position + (
+                        int(current_row.index) - int(previous_row.index)
+                    ) - (
+                        float(current_row.minutes) - float(previous_row.minutes)
+                    ) / MINUTES_PER_STOP
+                    # Preserve the passed identity even when rounded ETA
+                    # clocks briefly imply a position at/before HKUST.
+                    if previous_gate is None:
+                        passed_probe_positions[current_input] = max(
+                            projected, gate_index + 1e-6
+                        )
+
+            # A gate is reserved only after its prior identity actually
+            # propagated. If propagation failed due to a transient ETA gap,
+            # leave that gate available for a fresh compatible match here.
+            available_gate_rows = [
+                pair
+                for pair in gate_rows
+                if pair[0] not in propagated_gate_inputs
+                and pair[0] not in fresh_gate_inputs
+            ]
+
+            # A raw-past row is seeded as an independent passed vehicle only
+            # when it cannot plausibly belong to any stale gate arrival.  Keep
+            # gate-compatible raw-past rows available for the gate match.
+            for input_index, row in checkpoint_rows:
+                if input_index in reserved:
+                    continue
+                raw_position = int(row.index) - float(row.minutes) / MINUTES_PER_STOP
+                compatible = bool(
+                    _align_gate_arrivals(
+                        available_gate_rows,
+                        [(input_index, row)],
+                        gate_index=gate_index,
+                        checkpoint=checkpoint,
+                    )
+                )
+                if raw_position > gate_index and not compatible:
+                    passed_probe_rows.add(input_index)
+                    reserved.add(input_index)
+
+            remaining_rows = [
+                pair for pair in checkpoint_rows if pair[0] not in reserved
+            ]
+            pairs = _align_gate_arrivals(
+                available_gate_rows,
+                remaining_rows,
+                gate_index=gate_index,
+                checkpoint=checkpoint,
+                rank_first=True,
             )
             for probe_index, gate_input_index in pairs:
                 gate_assignment[probe_index] = gate_input_index
 
-            if checkpoint <= gate_index:
-                continue
-            ordered_probe_indices = [
-                input_index
-                for input_index, _row in sorted(
-                    checkpoint_rows,
-                    key=lambda item: (
-                        max(0.0, float(item[1].minutes)),
-                        item[0],
-                    ),
-                )
-            ]
+            # Include propagated gate-backed rows when finding the first gate
+            # match: an earlier unreserved row must still be eligible for the
+            # existing passed-row inference.
+            ordered_probe_rows = sorted(
+                checkpoint_rows,
+                key=lambda item: (max(0.0, float(item[1].minutes)), item[0]),
+            )
             matched_ranks = [
-                rank
-                for rank, input_index in enumerate(ordered_probe_indices)
+                rank for rank, (input_index, _row) in enumerate(ordered_probe_rows)
                 if input_index in gate_assignment
             ]
             if matched_ranks:
                 first_matched_rank = min(matched_ranks)
-                matched_probe_input = ordered_probe_indices[first_matched_rank]
+                matched_probe_input = ordered_probe_rows[first_matched_rank][0]
                 matched_gate_input = gate_assignment[matched_probe_input]
                 matched_probe = probe_inputs[matched_probe_input]
                 matched_gate = authoritative_inputs[matched_gate_input]
-                passed_probe_rows.update(
-                    input_index
-                    for input_index in ordered_probe_indices[: min(matched_ranks)]
-                    if input_index not in gate_assignment
-                )
-                for input_index in ordered_probe_indices[:first_matched_rank]:
-                    if input_index in gate_assignment:
+                for input_index, earlier in ordered_probe_rows[:first_matched_rank]:
+                    if input_index in gate_assignment or input_index in reserved:
                         continue
-                    earlier = probe_inputs[input_index]
-                    passed_probe_positions[input_index] = (
+                    projected = (
                         int(matched_gate.index)
                         - float(matched_gate.minutes) / MINUTES_PER_STOP
                         + (float(matched_probe.minutes) - float(earlier.minutes))
                         / MINUTES_PER_STOP
                     )
+                    if projected > gate_index:
+                        passed_probe_rows.add(input_index)
+                        reserved.add(input_index)
+                        passed_probe_positions[input_index] = projected
+
+            next_frontier = [
+                (input_index, row)
+                for input_index, row in checkpoint_rows
+                if input_index in passed_probe_rows or input_index in gate_assignment
+            ]
+            if next_frontier:
+                frontier = next_frontier
+                frontier_gate_assignments = {
+                    input_index: gate_assignment[input_index]
+                    for input_index, _row in next_frontier
+                    if input_index in gate_assignment
+                }
+                frontier_checkpoint = checkpoint
 
         downstream_live_is_passed_gates = {
             gate_input_index
@@ -383,22 +604,162 @@ def _plan_gate_associations(
         ordered_checkpoints = sorted(
             checkpoint for checkpoint, rows in passed_by_checkpoint.items() if rows
         )
-        for earlier, later in zip(ordered_checkpoints, ordered_checkpoints[1:], strict=False):
-            pairs = _align_gate_arrivals(
-                passed_by_checkpoint[earlier],
-                passed_by_checkpoint[later],
-                gate_index=earlier,
-                checkpoint=later,
-            )
-            for earlier_input, later_input in pairs:
-                union(earlier_input, later_input)
+        if not ordered_checkpoints:
+            continue
+        pivot = max(
+            ordered_checkpoints,
+            key=lambda checkpoint: (
+                len(passed_by_checkpoint[checkpoint]),
+                -min(
+                    float(getattr(row, "cache_age_seconds", 0) or 0)
+                    for _input_index, row in passed_by_checkpoint[checkpoint]
+                ),
+                checkpoint,
+            ),
+        )
+        # Use a pivot for high-multiplicity cache-boundary frames, where stale
+        # intermediate rows can divert identities. Smaller/uncached ladders
+        # retain the established adjacent matching semantics.
+        has_stale_cache = any(
+            float(getattr(row, "cache_age_seconds", 0) or 0) >= 60
+            for rows in passed_by_checkpoint.values()
+            for _input_index, row in rows
+        )
+        # A stale intermediate checkpoint can be the most complete view even
+        # with only two rows.  Pivoting such frames prevents an old adjacent
+        # row from stealing an identity transitively; multiplicity and
+        # freshness choose the pivot deterministically above.
+        if len(passed_by_checkpoint[pivot]) >= 2 and has_stale_cache:
+            pivot_rows = passed_by_checkpoint[pivot]
+            for checkpoint in ordered_checkpoints:
+                if checkpoint == pivot:
+                    continue
+                if checkpoint < pivot:
+                    pairs = _align_gate_arrivals(
+                        passed_by_checkpoint[checkpoint],
+                        pivot_rows,
+                        gate_index=checkpoint,
+                        checkpoint=pivot,
+                    )
+                    for earlier_input, pivot_input in pairs:
+                        union(earlier_input, pivot_input)
+                else:
+                    pairs = _align_gate_arrivals(
+                        pivot_rows,
+                        passed_by_checkpoint[checkpoint],
+                        gate_index=pivot,
+                        checkpoint=checkpoint,
+                    )
+                    for pivot_input, later_input in pairs:
+                        union(pivot_input, later_input)
+        else:
+            for earlier, later in zip(ordered_checkpoints, ordered_checkpoints[1:], strict=False):
+                pairs = _align_gate_arrivals(
+                    passed_by_checkpoint[earlier],
+                    passed_by_checkpoint[later],
+                    gate_index=earlier,
+                    checkpoint=later,
+                )
+                for earlier_input, later_input in pairs:
+                    union(earlier_input, later_input)
     passed_track_ids = {input_index: find(input_index) for input_index in parent}
+
+    # A staggered cache can briefly retain one old realtime row after another
+    # stop has replaced it with an established journey.  Such a singleton can
+    # otherwise become a second marker beside the established track.  Retire
+    # it only when the other row is materially newer, independently
+    # timing-compatible, and still ahead of the marker; multi-stop,
+    # gate-backed, and equally fresh tracks remain untouched.
+    identity_by_input: dict[int, tuple[str, int]] = {
+        input_index: ("gate", gate_input)
+        for input_index, gate_input in gate_assignment.items()
+    }
+    identity_by_input.update(
+        {
+            input_index: ("passed", track_id)
+            for input_index, track_id in passed_track_ids.items()
+            if input_index not in identity_by_input
+        }
+    )
+    members_by_identity: dict[tuple[str, int], list[int]] = {}
+    for input_index, identity in identity_by_input.items():
+        members_by_identity.setdefault(identity, []).append(input_index)
+
+    def cache_age(input_index: int) -> float | None:
+        value = getattr(probe_inputs[input_index], "cache_age_seconds", None)
+        try:
+            return max(0.0, float(value)) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def established(identity: tuple[str, int]) -> bool:
+        members = members_by_identity.get(identity, [])
+        if identity[0] == "gate":
+            return identity[1] in departed_gate_inputs
+        return len({int(probe_inputs[index].index) for index in members}) >= 2
+
+    superseded_probe_inputs: set[int] = set()
+    for identity, members in members_by_identity.items():
+        if identity[0] != "passed" or len(members) != 1:
+            continue
+        input_index = members[0]
+        row = probe_inputs[input_index]
+        if row.kind is EtaKind.SCHEDULED:
+            continue
+        source_age = cache_age(input_index)
+        if source_age is None:
+            continue
+        key = (str(row.operator), str(row.route), str(row.bound))
+        gate_index = verified_gate_index.get(key)
+        if gate_index is None:
+            continue
+        raw_position = int(row.index) - float(row.minutes) / MINUTES_PER_STOP
+        position = _passed_row_position(
+            raw_position,
+            gate_index,
+            input_index,
+            passed_probe_rows,
+            passed_probe_positions,
+        )
+        if position is None:
+            continue
+        for checkpoint, checkpoint_rows in probe_rows_by_occurrence.get(key, {}).items():
+            # Route order is not refresh order.  Either an upstream or a
+            # downstream stop can carry the newer snapshot; it can refute this
+            # singleton only while the marker is still before that stop.
+            if checkpoint == int(row.index) or position > checkpoint:
+                continue
+            implied_minutes = (checkpoint - position) * MINUTES_PER_STOP
+            compatible_newer_row = False
+            for checkpoint_input, checkpoint_row in checkpoint_rows:
+                checkpoint_identity = identity_by_input.get(checkpoint_input)
+                checkpoint_age = cache_age(checkpoint_input)
+                if (
+                    checkpoint_identity is None
+                    or checkpoint_identity == identity
+                    or not established(checkpoint_identity)
+                    or checkpoint_input in undeparted_probe_inputs
+                    or checkpoint_age is None
+                    or source_age - checkpoint_age
+                    < PROBE_FRESHNESS_MARGIN_SECONDS
+                ):
+                    continue
+                if (
+                    abs(float(checkpoint_row.minutes) - implied_minutes)
+                    <= STALE_SINGLETON_MATCH_TOLERANCE_MINUTES
+                ):
+                    compatible_newer_row = True
+                    break
+            if compatible_newer_row:
+                superseded_probe_inputs.add(input_index)
+                break
 
     return _GateAssociationPlan(
         gate_assignment,
         frozenset(passed_probe_rows),
         passed_probe_positions,
         passed_track_ids,
+        frozenset(superseded_probe_inputs),
         verified_gate_index,
         gate_rows_by_direction,
         frozenset(departed_gate_inputs),
@@ -427,6 +788,14 @@ def _point_at_path_offset(
             lon = a[1] + (b[1] - a[1]) * fraction
             return lat, lon, math.atan2(b[0] - a[0], b[1] - a[1])
         travelled += length
+    # Stop offsets and path arclengths are accumulated through separate loops.
+    # Their endpoint can differ by a few floating-point ulps; an exact terminus
+    # marker must land on the final path point instead of disappearing.
+    if len(path) >= 2 and math.isclose(
+        target, travelled, rel_tol=1e-12, abs_tol=1e-6
+    ):
+        a, b = path[-2], path[-1]
+        return b[0], b[1], math.atan2(b[0] - a[0], b[1] - a[1])
     return None
 
 
@@ -434,6 +803,7 @@ def _separate_common_stop_departures(
     records: list[tuple[tuple[str, str, str], float, bool, frozenset[tuple[str, int]]]],
     evidence: dict[tuple[str, int], tuple[int, float]],
     max_positions: dict[tuple[str, str, str], float],
+    min_positions: dict[tuple[str, str, str], float] | None = None,
 ) -> dict[frozenset[tuple[str, int]], float]:
     """Repair collapsed anchors using large, same-stop ETA headways.
 
@@ -441,9 +811,13 @@ def _separate_common_stop_departures(
     reported at a stop, however, their ETA difference is direct evidence of
     their ordering and separation.  Signed pair constraints are projected as
     one acyclic component, so missing rows cannot make three or more vehicles
-    invert one another.  Conflicting cyclic evidence is left unchanged.
+    invert one another.  Optional route minima keep non-authoritative passed
+    components strictly beyond a verified gate; authoritative gate markers
+    retain their own incoming positions.  Conflicting cyclic evidence is left
+    unchanged.
     """
     baseline = {sources: position for _key, position, _auth, sources in records}
+    min_positions = min_positions or {}
     record_by_sources = {sources: record for record in records for sources in [record[3]]}
     edges: dict[frozenset[tuple[str, int]], set[frozenset[tuple[str, int]]]] = {
         sources: set() for _key, _position, _auth, sources in records
@@ -502,7 +876,16 @@ def _separate_common_stop_departures(
             component.append(sources)
             stack.extend(edges[sources] - visited)
         if len(component) == 1:
-            adjusted[root] = min(max(0.0, baseline[root]), max_positions.get(record_by_sources[root][0], float("inf")))
+            route_key = record_by_sources[root][0]
+            minimum = (
+                min_positions.get(route_key, 0.0)
+                if not record_by_sources[root][2]
+                else 0.0
+            )
+            adjusted[root] = min(
+                max(minimum, baseline[root]),
+                max_positions.get(route_key, float("inf")),
+            )
             continue
         # Kahn topological sort gives an order satisfying every signed ETA
         # constraint.  Conflicting evidence is cyclic; leave that component
@@ -540,13 +923,41 @@ def _separate_common_stop_departures(
             key=lambda sources: (-distance[sources], tuple(sorted(sources))),
         )
         route_key = record_by_sources[component[0]][0]
+        minimum = min_positions.get(route_key, 0.0)
         maximum = max_positions.get(route_key, float("inf"))
-        span = min(maximum_distance, maximum)
+        span = min(maximum_distance, max(0.0, maximum - minimum))
         scale = span / maximum_distance if maximum_distance else 0.0
-        center = sum(baseline[sources] for sources in component) / len(component)
-        center = min(max(span / 2.0, center), maximum - span / 2.0)
+        scaled_distance = {
+            sources: distance[sources] * scale for sources in component
+        }
+        residuals = sorted(
+            baseline[sources] - scaled_distance[sources]
+            for sources in component
+        )
+        # A singleton rung at the leading edge is an independent current
+        # position, not merely a collapsed ladder anchor.  Prefer its
+        # baseline when available so the projection does not move that
+        # source-backed ETA across the audit timing tolerance merely to
+        # balance a headway against a multi-rung ladder.  Components with no
+        # singleton retain the symmetric residual median (important for the
+        # two-track and uneven-three-track headway repairs).
+        singleton_anchors = [
+            sources for sources in component if len(sources) == 1
+        ]
+        if singleton_anchors and max(
+            baseline[sources] for sources in singleton_anchors
+        ) < maximum - 1.0:
+            anchor = max(singleton_anchors, key=lambda sources: baseline[sources])
+            origin = baseline[anchor] - scaled_distance[anchor]
+        else:
+            origin = median(residuals)
+        origin = min(max(minimum, origin), maximum - span)
         for sources in component:
-            adjusted[sources] = center + distance[sources] * scale - span / 2.0
+            position = origin + scaled_distance[sources]
+            # The algebra is bounded to [0, maximum], but the leading vehicle
+            # can exceed the exact terminus by a few ulps after projection.
+            position = max(position, min_positions.get(route_key, 0.0))
+            adjusted[sources] = min(max(0.0, position), maximum)
     return adjusted
 
 
@@ -649,6 +1060,12 @@ def estimate_bus_positions(
             continue
         minutes = max(0.0, float(eta.minutes))
         raw_position = idx - minutes / MINUTES_PER_STOP
+        original_raw_position = raw_position
+        if not is_authoritative:
+            # Retain the source-implied position even when this probe is
+            # later attached to a gate-backed ladder; headway separation must
+            # compare raw ETA evidence, not the corrected render position.
+            observation_evidence[observation] = (idx, original_raw_position)
         row = (
             raw_position,
             idx,
@@ -662,23 +1079,30 @@ def estimate_bus_positions(
             ).append(row)
             continue
         probe_input_index = observation[1]
+        if probe_input_index in gate_plan.superseded_probe_inputs:
+            continue
         if probe_input_index in gate_assignment:
             anchored_ladders.setdefault(key, {}).setdefault(
                 gate_assignment[probe_input_index], []
             ).append(row)
             continue
-        if key in gate_rows_by_direction and probe_input_index not in passed_probe_rows:
-            # A positive implied position beyond HKUST is explicit evidence
-            # that a live row has already passed the gate.  Other unmatched
-            # rows remain unresolved (in particular, do not snap beside it).
+        if key in gate_rows_by_direction:
+            # Keep the exact passed-row rule shared with the frame auditor:
+            # coarse positions already beyond the gate win; corrected order
+            # positions are accepted only when they remain beyond the gate.
             gate_index = verified_gate_index.get(key)
-            if gate_index is None or raw_position <= gate_index:
+            if gate_index is None:
                 continue
-        elif key in gate_rows_by_direction and raw_position <= verified_gate_index.get(key, -1):
-            raw_position = passed_probe_positions.get(probe_input_index, raw_position)
-            gate_index = verified_gate_index.get(key)
-            if gate_index is None or raw_position <= gate_index:
+            passed_position = _passed_row_position(
+                raw_position,
+                gate_index,
+                probe_input_index,
+                passed_probe_rows,
+                passed_probe_positions,
+            )
+            if passed_position is None:
                 continue
+            raw_position = passed_position
         # Remaining probe-only evidence must imply a position on the route.
         if not is_authoritative and minutes > 0 and raw_position < 0:
             continue
@@ -694,7 +1118,8 @@ def estimate_bus_positions(
             False,
             observation,
         )
-        observation_evidence[observation] = (idx, raw_position)
+        # Keep the source ETA-implied position for same-stop headway
+        # constraints; rendering may use a corrected passed-track position.
         by_direction.setdefault(key, []).append(row)
 
     candidates: dict[
@@ -775,7 +1200,7 @@ def estimate_bus_positions(
             bucket.append(
                 (
                     position,
-                    round(position * 1000),
+                    _quantize_position(position, verified_gate_index.get(key)),
                     unreliable,
                     frozenset(rung[1] for rung in ladder),
                     bool(direct),
@@ -821,7 +1246,7 @@ def estimate_bus_positions(
             ).append(
                 (
                     position,
-                    round(position * 1000),
+                    _quantize_position(position, verified_gate_index.get(key)),
                     unreliable,
                     frozenset(rung[1] for rung in ladder),
                     True,
@@ -931,7 +1356,7 @@ def estimate_bus_positions(
             bucket.append(
                 (
                     0.0,
-                    round(position * 1000),
+                    _quantize_position(position, verified_gate_index.get(key)),
                     unreliable,
                     provenance,
                     source_observations,
@@ -953,8 +1378,12 @@ def estimate_bus_positions(
     max_positions = {
         key: float(len(list(line.stops)) - 1) for key, line in lines_by_key.items()
     }
+    min_positions = {
+        key: float(gate_index) + 0.001
+        for key, gate_index in verified_gate_index.items()
+    }
     adjusted_positions = _separate_common_stop_departures(
-        records, observation_evidence, max_positions
+        records, observation_evidence, max_positions, min_positions
     )
     for (operator_name, route, bound, _section), entries in sorted(candidates2.items()):
         line = lines_by_key[(operator_name, route, bound)]

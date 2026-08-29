@@ -47,7 +47,9 @@ def test_probe_cache_ages_cached_countdowns_between_rotated_probes(operator):
     cache.set("probe", [eta])
 
     now[0] += 65
-    assert cache.get("probe")[0].minutes == pytest.approx(2.9166667)
+    aged = cache.get("probe")[0]
+    assert aged.minutes == pytest.approx(2.9166667)
+    assert aged.cache_age_seconds == 65
     assert cache._store["probe"][1] == [eta]  # noqa: SLF001
 
 

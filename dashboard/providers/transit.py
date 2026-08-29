@@ -551,6 +551,10 @@ class ProbeEta:
     index: int  # official stop-sequence index of the probe stop
     minutes: float | None
     kind: EtaKind = EtaKind.REALTIME
+    # Age of this stop's last successful response at collection time.  ETA
+    # minutes are already aged to the same clock; this metadata only resolves
+    # contradictory vehicle lists across staggered stop refreshes.
+    cache_age_seconds: float = 0.0
 
 
 def _probe_cache_key(probe) -> str:
@@ -609,11 +613,17 @@ class ProbeEtaCache:
         aged: list[ProbeEta] = []
         for eta in entry[1]:
             if eta.minutes is None:
-                aged.append(eta)
+                aged.append(replace(eta, cache_age_seconds=age_seconds))
                 continue
             remaining = eta.minutes - elapsed_minutes
             if remaining >= 0:
-                aged.append(replace(eta, minutes=remaining))
+                aged.append(
+                    replace(
+                        eta,
+                        minutes=remaining,
+                        cache_age_seconds=age_seconds,
+                    )
+                )
         return aged
 
     def set(self, key: str, value: list[ProbeEta]) -> None:

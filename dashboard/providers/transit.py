@@ -13,7 +13,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from dashboard.http import FetchError, HttpClient
@@ -533,11 +533,17 @@ async def _refresh_gate_etas(
 
 # Probe cache holds the last value per fetch group. The ceiling is deliberately
 # longer than a complete sweep so early and late groups coexist, while still
-# removing departed vehicles during a prolonged provider outage. Twenty GMB
-# groups per 30-second network refresh cover the current 91-group set in about
-# 150 seconds until any 403 response steps the live limit down.
-# The 15-minute ceiling therefore still bounds prolonged outage staleness.
+# removing departed vehicles during a prolonged provider outage.
 PROBE_TTL_SECONDS = 900.0
+PROBE_GENERATION_TTL_SECONDS = 900.0
+MAX_PROBE_ROUTE_GENERATIONS = 128
+MAX_PROBE_CACHE_ENTRIES = 1024
+def _wall_clock_now() -> datetime:
+    return datetime.now(UTC)
+
+
+_probe_wall_clock: Callable[[], datetime] = _wall_clock_now
+_probe_mono_clock: Callable[[], float] = time.monotonic
 
 
 @dataclass(frozen=True)
@@ -555,17 +561,64 @@ class ProbeEta:
     # minutes are already aged to the same clock; this metadata only resolves
     # contradictory vehicle lists across staggered stop refreshes.
     cache_age_seconds: float = 0.0
+    arrival_at: datetime | None = None
+    observed_at: datetime | None = None
+    refresh_generation: int = 0
+
+
+@dataclass(frozen=True)
+class ProbeRouteGeneration:
+    """One atomically published, complete route observation."""
+
+    route_key: tuple[str, str, str]
+    rows: tuple[ProbeEta, ...]
+    generation: int
+    collected_at: datetime
+
+
+@dataclass(frozen=True)
+class _StoredProbeGeneration:
+    """Private publication record, including validation and expiry metadata."""
+
+    public: ProbeRouteGeneration
+    topology_keys: frozenset[tuple[Any, ...]]
+    group_keys: frozenset[str]
+    published_monotonic: float
+
+
+@dataclass(frozen=True)
+class ProbeEtaSnapshot:
+    """Complete route generations visible at one collection time."""
+
+    routes: tuple[ProbeRouteGeneration, ...]
+    collected_at: datetime
+
+    @property
+    def rows(self) -> tuple[ProbeEta, ...]:
+        return tuple(row for route in self.routes for row in route.rows)
+
+    @property
+    def complete_routes(self) -> tuple[ProbeRouteGeneration, ...]:
+        return self.routes
 
 
 def _probe_cache_key(probe) -> str:
-    key = f"{probe.operator}:{probe.route}:{probe.bound}:{probe.stop_id}"
-    # GMB circular routes can visit the same physical stop more than once in
-    # one route sequence.  The response distinguishes those visits by
-    # stop_seq, so retain one cache entry per official occurrence while the
-    # fetch-group key below still performs only one HTTP request per stop.
-    if probe.operator == "GMB":
-        key += f":{probe.index}"
+    key = ":".join(str(value) for value in _probe_topology_key(probe)[:-1])
     return key
+
+
+def _probe_topology_key(probe) -> tuple[Any, ...]:
+    """Canonical, order-independent identity of one request-shaped probe."""
+    return (
+        str(getattr(probe, "operator", "")),
+        str(getattr(probe, "route", "")),
+        str(getattr(probe, "bound", "")),
+        str(getattr(probe, "stop_id", "")),
+        int(getattr(probe, "index", 0)),
+        str(getattr(probe, "route_id", "")),
+        str(getattr(probe, "sequence", "")),
+        _fetch_group_key(probe),
+    )
 
 
 def _fetch_group_key(probe) -> str:
@@ -582,8 +635,8 @@ def _fetch_group_key(probe) -> str:
 class ProbeEtaCache:
     """Last-value cache so the map can render between staggered sweeps.
 
-    The TTL spans several normal sweeps, preventing mid-sweep ladder splits,
-    but bounds staleness when repeated failures leave an entry untouched.
+    The TTL spans normal anchor sweeps, preventing mid-generation splits, but
+    bounds staleness when repeated failures leave an entry untouched.
     """
 
     def __init__(
@@ -591,32 +644,53 @@ class ProbeEtaCache:
         ttl_seconds: float = PROBE_TTL_SECONDS,
         *,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] | None = None,
+        max_entries: int = MAX_PROBE_CACHE_ENTRIES,
     ) -> None:
         self._ttl = ttl_seconds
         self._clock = clock
+        self._wall_clock = wall_clock or _probe_wall_clock
+        self._max_entries = max(1, int(max_entries))
         self._store: dict[str, tuple[float, list[ProbeEta]]] = {}
 
+    def _sweep(self, now: float) -> None:
+        expired = [
+            key for key, (stored, _rows) in self._store.items()
+            if self._ttl > 0 and now - stored >= self._ttl
+        ]
+        for key in expired:
+            self._store.pop(key, None)
+        while len(self._store) > self._max_entries:
+            oldest = min(self._store, key=lambda key: (self._store[key][0], key))
+            self._store.pop(oldest, None)
+
     def get(self, key: str) -> list[ProbeEta] | None:
+        now_mono = self._clock()
+        self._sweep(now_mono)
         entry = self._store.get(key)
         if entry is None:
             return None
-        age_seconds = max(0.0, self._clock() - entry[0])
-        if self._ttl > 0 and age_seconds > self._ttl:
-            self._store.pop(key, None)
-            return None
+        age_seconds = max(0.0, now_mono - entry[0])
         # Requests rotate across stops, so cached ETAs must count down
         # continuously between probes; otherwise a bus marker freezes and
         # then jumps a full minute.
         elapsed_minutes = age_seconds / 60.0
-        if elapsed_minutes <= 0:
+        if elapsed_minutes <= 0 and not any(eta.arrival_at is not None for eta in entry[1]):
             return entry[1]
         aged: list[ProbeEta] = []
         for eta in entry[1]:
             if eta.minutes is None:
                 aged.append(replace(eta, cache_age_seconds=age_seconds))
                 continue
-            remaining = eta.minutes - elapsed_minutes
-            if remaining >= 0:
+            if eta.arrival_at is not None:
+                # Absolute arrivals are always evaluated against the current
+                # injected wall clock. Monotonic time is used only for cache
+                # age and expiry, so clock injection remains testable.
+                now = self._wall_clock()
+                remaining = max(0.0, (eta.arrival_at - now).total_seconds() / 60.0)
+            else:
+                remaining = eta.minutes - elapsed_minutes
+            if remaining > 0:
                 aged.append(
                     replace(
                         eta,
@@ -627,14 +701,18 @@ class ProbeEtaCache:
         return aged
 
     def set(self, key: str, value: list[ProbeEta]) -> None:
-        self._store[key] = (self._clock(), value)
+        now = self._clock()
+        self._sweep(now)
+        self._store[key] = (now, value)
+        self._sweep(now)
 
 
 _probe_cache = ProbeEtaCache()
 
 
 _probe_cursor = 0
-_gmb_cursor = 0
+_probe_generation = 0
+_probe_route_generations: dict[tuple[str, str, str], _StoredProbeGeneration] = {}
 
 # data.etagmb.gov.hk rate-limits bursts with 403s. GMB groups are capped per
 # cycle and the whole GMB sweep backs off for a cooldown when a 403 appears;
@@ -707,6 +785,9 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
                     index=probe.index,
                     minutes=minutes,
                     kind=_kmb_kind(entry.get("rmk_en") or ""),
+                    arrival_at=_parse_iso(entry.get("eta"))
+                    or now + timedelta(minutes=minutes),
+                    observed_at=_parse_iso(entry.get("data_timestamp")) or now,
                 )
             )
         return out
@@ -732,6 +813,9 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
                     index=probe.index,
                     minutes=minutes,
                     kind=_ctb_kind(entry.get("rmk_en") or ""),
+                    arrival_at=_parse_iso(eta_iso)
+                    or now + timedelta(minutes=minutes),
+                    observed_at=_parse_iso(entry.get("data_timestamp")) or now,
                 )
             )
         return out
@@ -776,6 +860,8 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
                     index=probe.index,
                     minutes=minutes,
                     kind=_gmb_kind(eta.get("remarks_en") or ""),
+                    arrival_at=_parse_iso(eta.get("timestamp")),
+                    observed_at=_parse_iso((raw or {}).get("generated_timestamp")) or now,
                 )
             )
     return out
@@ -851,7 +937,7 @@ async def _refresh_probe_etas(
     per cycle and the GMB sweep backs off for a cooldown when the host
     rate-limits (HTTP 403), serving last-good cache meanwhile.
     """
-    global _probe_cursor, _gmb_cursor
+    global _probe_cursor, _probe_generation
     if not probes:
         return []
     unique: dict[str, Any] = {}
@@ -865,6 +951,14 @@ async def _refresh_probe_etas(
         groups.setdefault(_fetch_group_key(probe), []).append(probe)
 
     group_keys = sorted(groups)
+    routes: dict[tuple[str, str, str], list[str]] = {}
+    for key, route_probes in groups.items():
+        for probe in route_probes:
+            route_key = (probe.operator, probe.route, probe.bound)
+            route_list = routes.setdefault(route_key, [])
+            if key not in route_list:
+                route_list.append(key)
+    route_keys = sorted(routes)
     gmb_paused = time.monotonic() < _gmb_cooldown_until
 
     def selectable(group_key: str) -> bool:
@@ -880,22 +974,37 @@ async def _refresh_probe_etas(
             "serving last-good cache",
             _gmb_cooldown_until - time.monotonic(),
         )
-    # Cap GMB groups per cycle, but rotate the cap across the complete sorted
-    # set.  Slicing before round-robin would permanently starve groups after
-    # the first 30. Non-GMB groups retain their independent round-robin.
-    other = [key for key in selectable_keys if not key.startswith("GMB:")]
-    gmb = [key for key in selectable_keys if key.startswith("GMB:")]
     cycle_budget = max(0, max_per_cycle)
-    gmb_window = min(GMB_GROUPS_PER_CYCLE, cycle_budget, len(gmb))
-    selected_gmb: list[str] = []
-    if gmb_window:
-        # Store an absolute offset rather than a cycle number.  Otherwise a
-        # 403-driven window change (for example 20 -> 17) would move the next
-        # start backwards and immediately repeat three just-polled groups.
-        gmb_start = _gmb_cursor % len(gmb)
-        selected_gmb = [gmb[(gmb_start + i) % len(gmb)] for i in range(gmb_window)]
-        _gmb_cursor = (gmb_start + gmb_window) % len(gmb)
-    if not other and not selected_gmb:
+    # Select whole routes in deterministic round-robin order. A route is
+    # publishable only when every one of its anchor groups is refreshed.
+    selected_routes: list[tuple[str, str, str]] = []
+    selected_groups: list[str] = []
+    used_groups: set[str] = set()
+    used_gmb = 0
+    start = _probe_cursor % len(route_keys) if route_keys else 0
+    last_considered = 0
+    last_selected = -1
+    for offset in range(len(route_keys)):
+        last_considered = offset + 1
+        route_key = route_keys[(start + offset) % len(route_keys)]
+        route_groups = [key for key in routes[route_key] if key in selectable_keys]
+        if len(route_groups) != len(routes[route_key]):
+            continue
+        extra = [key for key in route_groups if key not in used_groups]
+        extra_gmb = sum(key.startswith("GMB:") for key in extra)
+        if len(selected_groups) + len(extra) > cycle_budget:
+            continue
+        if used_gmb + extra_gmb > GMB_GROUPS_PER_CYCLE:
+            continue
+        selected_routes.append(route_key)
+        last_selected = offset
+        selected_groups.extend(extra)
+        used_groups.update(extra)
+        used_gmb += extra_gmb
+    if route_keys:
+        advance = (last_selected + 1) if last_selected >= 0 else last_considered
+        _probe_cursor = (start + max(1, advance)) % len(route_keys)
+    if not selected_groups:
         return [
             eta
             for key in unique
@@ -903,19 +1012,19 @@ async def _refresh_probe_etas(
             for eta in cached
         ]
 
-    remaining = cycle_budget - len(selected_gmb)
-    other_window = min(remaining, len(other))
-    selected_other = []
-    if other_window:
-        other_start = (_probe_cursor * other_window) % len(other)
-        selected_other = [other[(other_start + i) % len(other)] for i in range(other_window)]
-        _probe_cursor += 1
+    selected_other = [key for key in selected_groups if not key.startswith("GMB:")]
+    selected_gmb = [key for key in selected_groups if key.startswith("GMB:")]
+    successful: dict[str, bool] = {}
+    refreshed_rows: dict[str, tuple[ProbeEta, ...]] = {}
+    _probe_generation += 1
+    generation = _probe_generation
     async def refresh_group(group_key: str) -> bool:
         global _gmb_cooldown_until
         if group_key.startswith("GMB:") and time.monotonic() < _gmb_cooldown_until:
+            successful[group_key] = False
             return True
         probes_in_group = groups[group_key]
-        now = datetime.now(UTC)
+        now = _probe_wall_clock()
         if group_key.startswith("GMB:") and time.monotonic() < _gmb_cooldown_until:
             return True
         try:
@@ -923,21 +1032,30 @@ async def _refresh_probe_etas(
         except FetchError as exc:
             if exc.status_code == 403 and group_key.startswith("GMB:"):
                 _record_gmb_403()
+                successful[group_key] = False
                 return True
             else:
                 log.warning(
                     "probe ETA fetch failed for %s: %s",
                     group_key, type(exc).__name__,
                 )
+                successful[group_key] = False
             return False
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "probe ETA fetch failed for %s: %s", group_key, type(exc).__name__
             )
+            successful[group_key] = False
             return False
         for probe in probes_in_group:
             key = _probe_cache_key(probe)
-            _probe_cache.set(key, _parse_probe_etas(probe, raw, now))
+            parsed = [
+                replace(row, refresh_generation=generation)
+                for row in _parse_probe_etas(probe, raw, now)
+            ]
+            _probe_cache.set(key, parsed)
+            refreshed_rows[key] = tuple(parsed)
+        successful[group_key] = True
         return False
 
     # Non-GMB origins can overlap. GMB requests are deliberately sequential:
@@ -948,9 +1066,113 @@ async def _refresh_probe_etas(
         if await refresh_group(group_key):
             break
 
+    # Publish complete route generations atomically. Empty successful entries
+    # are valid observations; failed or rate-limited groups retain the prior
+    # complete generation.
+    collected_at = _probe_wall_clock()
+    published_monotonic = _probe_mono_clock()
+    for route_key in selected_routes:
+        route_groups = routes[route_key]
+        if not all(successful.get(key, False) for key in route_groups):
+            continue
+        route_probes = tuple(
+            probe for probe in unique.values()
+            if (probe.operator, probe.route, probe.bound) == route_key
+        )
+        rows = tuple(
+            eta for probe in route_probes
+            for eta in refreshed_rows.get(_probe_cache_key(probe), ())
+        )
+        public = ProbeRouteGeneration(
+            route_key=route_key,
+            rows=rows,
+            generation=generation,
+            collected_at=collected_at,
+        )
+        _probe_route_generations[route_key] = _StoredProbeGeneration(
+            public=public,
+            topology_keys=frozenset(_probe_topology_key(probe) for probe in route_probes),
+            group_keys=frozenset(route_groups),
+            published_monotonic=published_monotonic,
+        )
+    while len(_probe_route_generations) > MAX_PROBE_ROUTE_GENERATIONS:
+        oldest = min(
+            _probe_route_generations,
+            key=lambda key: _probe_route_generations[key].published_monotonic,
+        )
+        _probe_route_generations.pop(oldest, None)
+
     collected: list[ProbeEta] = []
     for key in unique:
         cached = _probe_cache.get(key)
         if cached is not None:
             collected.extend(cached)
     return collected
+
+
+async def fetch_probe_snapshot(
+    client: HttpClient,
+    probes: Sequence[Any],
+    max_per_cycle: int = 36,
+) -> ProbeEtaSnapshot:
+    """Fetch probes and expose only atomically complete route generations."""
+    await fetch_probe_etas(client, probes, max_per_cycle=max_per_cycle)
+    collected_at = _probe_wall_clock()
+    monotonic_at = _probe_mono_clock()
+    for stale_key, stale_generation in tuple(_probe_route_generations.items()):
+        if (
+            PROBE_GENERATION_TTL_SECONDS > 0
+            and monotonic_at - stale_generation.published_monotonic
+            >= PROBE_GENERATION_TTL_SECONDS
+        ):
+            _probe_route_generations.pop(stale_key, None)
+    requested = {(p.operator, p.route, p.bound) for p in probes}
+    requested_topology: dict[
+        tuple[str, str, str], tuple[frozenset[tuple[Any, ...]], frozenset[str]]
+    ] = {}
+    for route_key in requested:
+        route_probes = [p for p in probes if (p.operator, p.route, p.bound) == route_key]
+        requested_topology[route_key] = (
+            frozenset(_probe_topology_key(p) for p in route_probes),
+            frozenset(_fetch_group_key(p) for p in route_probes),
+        )
+    routes: list[ProbeRouteGeneration] = []
+    for key in sorted(requested):
+        generation = _probe_route_generations.get(key)
+        if generation is None:
+            continue
+        topology_keys, group_keys = requested_topology[key]
+        if generation.topology_keys != topology_keys or generation.group_keys != group_keys:
+            continue
+        if (
+            PROBE_GENERATION_TTL_SECONDS > 0
+            and monotonic_at - generation.published_monotonic
+            >= PROBE_GENERATION_TTL_SECONDS
+        ):
+            _probe_route_generations.pop(key, None)
+            continue
+        elapsed_minutes = max(
+            0.0, (collected_at - generation.public.collected_at).total_seconds() / 60.0
+        )
+        aged_rows = tuple(
+            replace(
+                row,
+                minutes=(
+                    max(0.0, (row.arrival_at - collected_at).total_seconds() / 60.0)
+                    if row.arrival_at is not None
+                    else row.minutes - elapsed_minutes
+                ),
+            )
+            for row in generation.public.rows
+            if (
+                row.arrival_at is not None and row.arrival_at > collected_at
+            ) or (
+                row.arrival_at is None
+                and row.minutes is not None
+                and row.minutes - elapsed_minutes > 0
+            )
+        )
+        routes.append(replace(generation.public, rows=aged_rows))
+    return ProbeEtaSnapshot(
+        routes=tuple(routes), collected_at=collected_at
+    )

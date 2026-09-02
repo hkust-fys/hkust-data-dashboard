@@ -2,6 +2,7 @@
 verified GMB directional-variant IDs."""
 
 import asyncio
+from dataclasses import fields
 from datetime import UTC, timedelta
 from types import SimpleNamespace
 
@@ -28,6 +29,9 @@ def _reset_gmb_state(monkeypatch):
     transit._gmb_gate_cache._stored = None  # noqa: SLF001
     transit._gate_eta_cache.stored = None  # noqa: SLF001
     transit._probe_cache._store.clear()  # noqa: SLF001
+    transit._probe_route_generations.clear()  # noqa: SLF001
+    monkeypatch.setattr(transit, "_probe_generation", 0)
+    monkeypatch.setattr(transit, "_probe_cursor", 0)
     monkeypatch.setattr(transit, "_gate_network_refresh_at", None)
     monkeypatch.setattr(transit, "_probe_network_refresh_at", None)
     monkeypatch.setattr(transit, "_gate_refresh_task", None)
@@ -76,6 +80,39 @@ def test_probe_cache_expires_only_after_multi_sweep_ceiling():
     assert "probe" not in cache._store  # noqa: SLF001
 
 
+def test_probe_cache_uses_injected_wall_clock_for_absolute_age_and_expiry():
+    mono = [0.0]
+    wall = [s.utc()]
+    cache = transit.ProbeEtaCache(clock=lambda: mono[0], wall_clock=lambda: wall[0])
+    arrival = wall[0] + timedelta(seconds=90)
+    eta = transit.ProbeEta("KMB", "X", "outbound", "stop", 1, 1.5, arrival_at=arrival)
+    cache.set("probe", [eta])
+    wall[0] += timedelta(seconds=30)
+    assert cache.get("probe")[0].minutes == pytest.approx(1.0)
+    wall[0] += timedelta(seconds=61)
+    assert cache.get("probe") == []
+
+
+def test_probe_generation_public_shape_is_small_and_topology_is_canonical():
+    assert {field.name for field in fields(transit.ProbeRouteGeneration)} == {
+        "route_key", "rows", "generation", "collected_at",
+    }
+    first = SimpleNamespace(
+        operator="GMB", route="11", bound="seq-1", stop_id="stop-a", index=2,
+        route_id=7, sequence=3,
+    )
+    reordered = SimpleNamespace(
+        operator="GMB", route="11", bound="seq-1", stop_id="stop-a", index=2,
+        route_id=7, sequence=3,
+    )
+    changed = SimpleNamespace(
+        operator="GMB", route="11", bound="seq-1", stop_id="stop-a", index=2,
+        route_id=8, sequence=3,
+    )
+    assert transit._probe_topology_key(first) == transit._probe_topology_key(reordered)
+    assert transit._probe_topology_key(first) != transit._probe_topology_key(changed)
+
+
 def test_gmb_probe_parser_uses_matching_stop_sequence_and_precise_timestamp():
     now = s.utc()
     probe = SimpleNamespace(
@@ -105,6 +142,51 @@ def test_gmb_probe_parser_uses_matching_stop_sequence_and_precise_timestamp():
     rows = transit._parse_probe_etas(probe, raw, now)  # noqa: SLF001
     assert [row.minutes for row in rows] == pytest.approx([1.5, 4.0])
     assert {row.index for row in rows} == {0}
+    assert rows[1].arrival_at is None
+
+
+@pytest.mark.asyncio
+async def test_probe_snapshot_ages_timestamp_less_rows_from_generation_collection(monkeypatch):
+    mono = [10.0]
+    wall = [s.utc()]
+    monkeypatch.setattr(transit.time, "monotonic", lambda: mono[0])
+    monkeypatch.setattr(transit, "_probe_mono_clock", lambda: mono[0])
+    monkeypatch.setattr(transit, "_probe_wall_clock", lambda: wall[0])
+    monkeypatch.setattr(transit, "TRANSIT_NETWORK_REFRESH_SECONDS", 1000.0)
+    probe = SimpleNamespace(operator="GMB", route="R", bound="b", stop_id="s",
+                            route_id=1, sequence=1, index=0)
+
+    async def fetch(_client, _probe):
+        return {"data": [{"enabled": True, "route_id": 1, "route_seq": 1,
+                           "eta": [{"diff": 2}]}]}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit.fetch_probe_snapshot(object(), [probe], max_per_cycle=1)
+    mono[0] += 30
+    wall[0] += timedelta(seconds=30)
+    second = await transit.fetch_probe_snapshot(object(), [probe], max_per_cycle=1)
+    assert second.rows[0].minutes == pytest.approx(1.5)
+    mono[0] += 90
+    wall[0] += timedelta(seconds=90)
+    assert (await transit.fetch_probe_snapshot(object(), [probe], max_per_cycle=1)).rows == ()
+
+
+def test_probe_parser_preserves_absolute_eta_and_observation_times():
+    now = s.utc()
+    probe = SimpleNamespace(
+        operator="KMB", route="91", bound="outbound", stop_id="stop", index=2,
+    )
+    arrival = now + timedelta(minutes=4)
+    observed = now - timedelta(seconds=3)
+    rows = transit._parse_probe_etas(
+        probe,
+        {"data": [{"route": "91", "dir": "O", "eta": arrival.isoformat(),
+                   "data_timestamp": observed.isoformat()}]},
+        now,
+    )
+    assert len(rows) == 1
+    assert rows[0].arrival_at == arrival
+    assert rows[0].observed_at == observed
 
 
 def test_gmb_repeated_physical_stop_occurrences_have_distinct_cache_keys():
@@ -134,7 +216,6 @@ async def test_gmb_probe_cap_rotates_across_all_groups(monkeypatch):
         return {"data": [{"enabled": True, "route_id": 1, "route_seq": 1, "eta": [{"diff": 1}]}]}
 
     monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
-    monkeypatch.setattr(transit, "_gmb_cursor", 0)
     monkeypatch.setattr(transit, "_probe_cursor", 0)
     monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
     # Twenty GMB groups per cycle require three cycles to cover all 35.
@@ -181,7 +262,6 @@ async def test_gmb_probe_rotation_continues_after_batch_reduction(monkeypatch):
         return {"data": []}
 
     monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
-    monkeypatch.setattr(transit, "_gmb_cursor", 0)
     monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
 
     await transit.fetch_probe_etas(object(), probes)
@@ -211,7 +291,6 @@ async def test_gmb_probe_cap_respects_smaller_cycle_budget(monkeypatch):
         return {"data": []}
 
     monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
-    monkeypatch.setattr(transit, "_gmb_cursor", 0)
     monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
 
     await transit.fetch_probe_etas(object(), probes, max_per_cycle=5)
@@ -237,7 +316,6 @@ async def test_gmb_probe_sweep_stops_after_first_403(monkeypatch):
         raise FetchError("HTTP 403 for GMB", status_code=403)
 
     monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
-    monkeypatch.setattr(transit, "_gmb_cursor", 0)
     monkeypatch.setattr(transit, "_gmb_cooldown_until", 0)
     monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
 
@@ -335,6 +413,51 @@ async def test_probe_refresh_interval_serves_aged_cache(monkeypatch):
     assert calls == 1
     assert first[0].minutes == pytest.approx(4)
     assert second[0].minutes <= first[0].minutes
+
+
+@pytest.mark.asyncio
+async def test_probe_snapshot_publishes_whole_route_with_shared_generation(monkeypatch):
+    mono = [100.0]
+    wall = [s.utc()]
+    monkeypatch.setattr(transit.time, "monotonic", lambda: mono[0])
+    monkeypatch.setattr(transit, "_probe_mono_clock", lambda: mono[0])
+    monkeypatch.setattr(transit, "_probe_wall_clock", lambda: wall[0])
+    probes = [
+        SimpleNamespace(
+            operator="GMB", route="11", bound="seq-1", stop_id=stop,
+            route_id=1, sequence=1, index=index,
+        )
+        for index, stop in enumerate(("first", "second"))
+    ]
+
+    async def fetch(_client, probe):
+        return {
+            "data": [{
+                "enabled": True, "route_id": 1, "route_seq": 1,
+                "stop_seq": probe.index + 1,
+                "eta": [{"diff": 4}],
+            }],
+        }
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    snapshot = await transit.fetch_probe_snapshot(object(), probes, max_per_cycle=2)
+    assert len(snapshot.routes) == 1
+    route = snapshot.routes[0]
+    assert route.generation > 0
+    assert route.rows and {row.refresh_generation for row in route.rows} == {route.generation}
+
+    async def fail(_client, _probe):
+        fail.calls += 1
+        raise RuntimeError("temporary outage")
+    fail.calls = 0
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fail)
+    mono[0] += transit.TRANSIT_NETWORK_REFRESH_SECONDS + 1
+    wall[0] += timedelta(seconds=1)
+    retained = await transit.fetch_probe_snapshot(object(), probes, max_per_cycle=2)
+    assert fail.calls == 2
+    assert retained.routes[0].generation == route.generation
+    assert [row.stop_id for row in retained.routes[0].rows] == [row.stop_id for row in route.rows]
 
 
 @pytest.mark.asyncio

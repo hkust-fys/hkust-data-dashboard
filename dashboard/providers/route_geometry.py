@@ -151,22 +151,46 @@ def _spec_for_line(line: RouteLine) -> RouteSpec | None:
     return None
 
 
-def select_probe_stops(lines: Iterable[RouteLine]) -> list[ProbeStop]:
-    """Probe EVERY stop of each tracked direction, termini included.
+def select_probe_stops(
+    lines: Iterable[RouteLine],
+    mandatory_stop_ids: Iterable[str] = (),
+    *,
+    max_anchors: int = 5,
+) -> list[ProbeStop]:
+    """Select deterministic official occurrences for each route.
 
-    There is no interior/exterior distinction any more: the route is just a
-    sequence of stops with ETAs, and every ETA refines where a bus is. The
-    termini are polled too — a departure board there is exactly the evidence
-    that a bus has left the terminus. Fetches are deduplicated per physical
-    stop by the transit layer.
+    Both termini and every matching mandatory occurrence are protected; spare
+    capacity is filled with evenly spaced interior occurrences. Terminus
+    boards are useful evidence that a bus has left; fetches are deduplicated
+    per physical stop by the transit layer.
     """
+    required = {str(stop_id) for stop_id in mandatory_stop_ids}
     probes: list[ProbeStop] = []
     for line in lines:
         stops = line.stops
-        if len(stops) < 2:
+        if not stops:
             continue
         spec = _spec_for_line(line)
-        for index in range(len(stops)):
+        limit = max(1, int(max_anchors))
+        chosen: list[int] = []
+        def add(index: int, stops=stops, chosen=chosen) -> None:
+            if 0 <= index < len(stops) and index not in chosen:
+                chosen.append(index)
+        add(0)
+        add(len(stops) - 1)
+        for index, stop in enumerate(stops):
+            if stop.stop_id in required:
+                add(index)
+        available = [i for i in range(1, len(stops) - 1) if i not in chosen]
+        remaining = max(0, limit - len(chosen))
+        for rank in range(remaining):
+            target = (rank + 1) * (len(stops) - 1) / (remaining + 1)
+            candidates = sorted(available, key=lambda value: (abs(value - target), value))
+            if not candidates:
+                break
+            add(candidates[0])
+            available.remove(candidates[0])
+        for index in sorted(chosen):
             probes.append(
                 ProbeStop(
                     operator=line.operator,
@@ -746,7 +770,9 @@ async def fetch_route_geometry(client: HttpClient, cache_dir: str = ".cache") ->
         ):
             task = asyncio.create_task(_refresh_route_geometry(client, cache_dir, cached))
             _refresh_tasks[cache_dir] = task
-            task.add_done_callback(lambda done: _finish_refresh(done, cache_dir))
+            task.add_done_callback(
+                lambda done, cache_dir=cache_dir: _finish_refresh(done, cache_dir)
+            )
         return cached
     if time.monotonic() < _refresh_retry_after.get(cache_dir, 0):
         return RouteGeometry()

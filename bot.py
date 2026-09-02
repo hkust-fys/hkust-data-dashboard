@@ -66,6 +66,7 @@ async def collect_all(
     client: HttpClient,
     settings: Settings,
     on_result: Callable[[str, object], None] | None = None,
+    tracker=None,
 ) -> dict[str, object]:
     """Fetch all provider groups concurrently; return raw results keyed by name.
 
@@ -183,6 +184,7 @@ async def collect_all(
             groups=groups,
             cache_dir=settings.cache_dir,
             affected_road_paths=affected_paths,
+            tracker=tracker,
         )
 
     for name, coro in (
@@ -798,6 +800,7 @@ class DashboardUpdater:
         self.live_snapshot_message = None
         self.live_snapshot_generation = 0
         self.live_view = LiveViewSnapshotView(self)
+        self.marker_tracker = maps.MarkerTracker()
         self.live_frames = LiveFrameCache()
         from dashboard.alerts import AlertMonitor
 
@@ -910,8 +913,12 @@ class DashboardUpdater:
         # Keeping this small compatibility branch makes injected test/dev
         # collectors from before snapshots continue to work; production's
         # ``collect_all`` always has the incremental callback.
-        if "on_result" in inspect.signature(collect_all).parameters:
-            collection = collect_all(self.client, self.settings, on_result=publish)
+        parameters = inspect.signature(collect_all).parameters
+        kwargs = {"on_result": publish} if "on_result" in parameters else {}
+        if "tracker" in parameters:
+            kwargs["tracker"] = self.marker_tracker
+        if kwargs:
+            collection = collect_all(self.client, self.settings, **kwargs)
         else:
             collection = collect_all(self.client, self.settings)
         task = asyncio.create_task(collection)
@@ -1071,6 +1078,7 @@ class DashboardUpdater:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await collection_task
         self._collection_task = None
+        self.marker_tracker.clear()
         await maps.shutdown_gmaps_browser()
         await route_geometry_provider.shutdown_background_refreshes()
         await tracked_roads_provider.shutdown_background_refreshes()

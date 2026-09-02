@@ -1360,23 +1360,45 @@ def test_heading_follows_travel_direction():
     assert abs(estimates[0].heading) < 0.5
 
 
-def test_probe_selection_covers_every_stop_including_termini():
+def test_probe_selection_uses_bounded_evenly_spaced_anchors():
     from dashboard.providers.route_geometry import select_probe_stops
 
     line = _line()
     probes = select_probe_stops([line])
     # Every stop of the direction is probed, termini included: the route is
     # just a stop sequence with ETAs — there is no interior/exterior split.
-    assert sorted(probe.index for probe in probes) == [0, 1, 2, 3, 4, 5]
+    assert len(probes) == 5
+    assert probes[0].index == 0 and probes[-1].index == 5
 
 
-def test_probe_selection_does_not_downsample_long_routes():
+def test_probe_selection_downsamples_long_routes_and_keeps_mandatory_stop():
     from dashboard.providers.route_geometry import select_probe_stops
 
     stops = [Stop(str(index), f"Stop {index}", 22.33, 114.26 + index * 0.001) for index in range(31)]
     line = RouteLine("X", "KMB", "outbound", stops)
-    probes = select_probe_stops([line])
-    assert [probe.index for probe in probes] == list(range(31))
+    probes = select_probe_stops([line], mandatory_stop_ids={"17"})
+    assert len(probes) == 5
+    assert [probe.index for probe in probes] == [0, 10, 17, 20, 30]
+
+
+def test_probe_selection_mandatory_overflow_keeps_all_occurrences():
+    from dashboard.providers.route_geometry import select_probe_stops
+
+    stops = [Stop(str(index), f"Stop {index}", 22.33, 114.26) for index in range(8)]
+    probes = select_probe_stops(
+        [RouteLine("arbitrary", "KMB", "outbound", stops)],
+        mandatory_stop_ids={"1", "3", "5", "6"},
+        max_anchors=3,
+    )
+    assert [probe.index for probe in probes] == [0, 1, 3, 5, 6, 7]
+
+
+def test_probe_selection_preserves_circular_occurrence_order():
+    from dashboard.providers.route_geometry import select_probe_stops
+
+    stops = [Stop("same", "Loop", 22.33, 114.26) for _ in range(6)]
+    probes = select_probe_stops([RouteLine("loop", "GMB", "seq-1", stops)], max_anchors=4)
+    assert [probe.index for probe in probes] == [0, 2, 3, 5]
 
 
 def test_fetch_groups_dedupe_shared_physical_stops():

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import median
 
 from dashboard.models import EtaKind, Operator
@@ -68,6 +68,9 @@ class BusEstimate:
     # Exact rows in the estimator inputs (kind, zero-based input offset).  Stop
     # indices alone cannot distinguish two vehicles reported at one stop.
     source_observations: frozenset[tuple[str, int]] = frozenset()
+    # Stable route vocabulary and temporal identity, populated by MarkerTracker.
+    operator_code: str = ""
+    track_id: int | None = None
 
 
 MINUTES_PER_STOP = 2.0
@@ -1423,11 +1426,35 @@ def estimate_bus_positions(
                     route=route,
                     bound=bound,
                     position=position,
+                    operator_code=operator_name,
                     source_indices=provenance,
                     source_observations=source_observations,
                 )
             )
     return estimates
+
+
+def reproject_estimate(estimate: BusEstimate, position: float, route_lines) -> BusEstimate:
+    """Return ``estimate`` projected at a new scalar position on its official line."""
+    key = (estimate.operator_code or str(estimate.operator), estimate.route, estimate.bound)
+    line = next((item for item in route_lines if (str(getattr(item, "operator", "")),
+                 str(getattr(item, "route", "")), str(getattr(item, "bound", ""))) == key), None)
+    if line is None:
+        return replace(estimate, position=position)
+    stops = list(getattr(line, "stops", ()))
+    offsets = list(getattr(line, "stop_offsets", ()))
+    path = list(getattr(line, "path", ()))
+    if len(offsets) < 2 or not path:
+        return replace(estimate, position=position)
+    position = max(0.0, min(float(position), max(0.0, len(stops) - 1)))
+    section = min(int(math.floor(position)), len(offsets) - 2)
+    target = offsets[section] + (offsets[section + 1] - offsets[section]) * (position - section)
+    located = _point_at_path_offset(path, target)
+    if located is None:
+        return replace(estimate, position=position)
+    lat, lon, heading = located
+    return replace(estimate, lat=lat, lon=lon, heading=heading, position=position,
+                   operator_code=estimate.operator_code or str(getattr(line, "operator", "")))
 
 
 def _label_for(

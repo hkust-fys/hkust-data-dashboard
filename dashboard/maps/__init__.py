@@ -15,9 +15,10 @@ from dashboard.maps.renderer import (
     render_map,
 )
 from dashboard.maps.tiles import capture_gmaps_base, shutdown_gmaps_browser
+from dashboard.maps.tracker import MarkerTracker
 from dashboard.models import EtaKind, RouteEtaGroup
 from dashboard.providers.route_geometry import Stop, fetch_route_geometry, select_probe_stops
-from dashboard.providers.transit import CTB_STOPS, GMB_STOPS, KMB_STOPS, fetch_probe_etas
+from dashboard.providers.transit import CTB_STOPS, GMB_STOPS, KMB_STOPS, fetch_probe_snapshot
 
 log = logging.getLogger(__name__)
 _frame_counter = 0
@@ -174,6 +175,7 @@ async def fetch_traffic_map(
     groups: list[RouteEtaGroup] | None = None,
     cache_dir: str = ".cache",
     affected_road_paths: list[list[tuple[float, float]]] | None = None,
+    tracker: MarkerTracker | None = None,
 ) -> tuple[bytes | None, list[object]]:
     """Capture the Google base map and render estimated bus/stop markers.
 
@@ -206,8 +208,13 @@ async def fetch_traffic_map(
         else:
             public_stops = geometry.stops
             route_lines = list(geometry.routes)
-            probes = select_probe_stops(route_lines) if route_lines else []
-            probe_task = asyncio.create_task(fetch_probe_etas(client, probes))
+            mandatory = {
+                str(spec["stop"]) for spec in KMB_STOPS
+            } | {str(spec["stop"]) for spec in CTB_STOPS}
+            mandatory |= {str(stop_id) for stop_id in GMB_STOPS}
+            probes = (select_probe_stops(route_lines, mandatory_stop_ids=mandatory)
+                      if route_lines else [])
+            probe_task = asyncio.create_task(fetch_probe_snapshot(client, probes))
             operation_tasks.append(probe_task)
 
         # Collect independent work together.  return_exceptions keeps a
@@ -224,13 +231,15 @@ async def fetch_traffic_map(
             base_image = capture_result
 
         estimates: list[BusEstimate] = []
+        audit_estimates: list[BusEstimate] = []
         authoritative = _authoritative_etas(groups or [], route_lines)
         probe_etas = []
         if probe_task is not None:
             if isinstance(probe_result, BaseException):
                 log.warning("probe ETA estimation failed: %s", type(probe_result).__name__)
             else:
-                probe_etas = probe_result or []
+                snapshot = probe_result
+                probe_etas = list(getattr(snapshot, "rows", ()) or ())
                 try:
                     estimates = estimate_bus_positions(
                         probe_etas,
@@ -238,12 +247,18 @@ async def fetch_traffic_map(
                         _destination_map(groups or [], route_lines),
                         authoritative,
                     )
+                    audit_estimates = list(estimates)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("probe ETA estimation failed: %s", type(exc).__name__)
                     estimates = []
+                if tracker is not None:
+                    try:
+                        estimates = await tracker.update(snapshot, estimates, route_lines)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("marker tracker unavailable: %s", type(exc).__name__)
         try:
             audit = audit_marker_positions(
-                probe_etas, authoritative, estimates, route_lines,
+                probe_etas, authoritative, audit_estimates, route_lines,
                 frame_id=frame_id, seed=frame_id,
             )
             marker_pairs = audit.get("gmb_marker_pairs", ())
@@ -375,6 +390,7 @@ __all__ = [
     "MAP_HEIGHT",
     "MAP_WIDTH",
     "BusEstimate",
+    "MarkerTracker",
     "estimate_bus_positions",
     "audit_marker_positions",
     "audit_gmb_marker_pairs",

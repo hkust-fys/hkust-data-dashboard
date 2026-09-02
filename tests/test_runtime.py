@@ -380,6 +380,29 @@ async def test_map_gate_uses_snapshot_paired_with_payload_during_message_resolut
 
 
 @pytest.mark.asyncio
+async def test_updaters_own_distinct_trackers_and_collection_receives_its_tracker(monkeypatch):
+    import bot as bot_module
+
+    first = DashboardUpdater(_fake_settings())
+    second = DashboardUpdater(_fake_settings())
+    assert first.marker_tracker is not second.marker_tracker
+    seen = []
+
+    async def collect(client, settings, *, tracker=None):
+        seen.append(tracker)
+        return {}
+
+    monkeypatch.setattr(bot_module, "collect_all", collect)
+    first._running = True  # noqa: SLF001
+    first.client = object()
+    first._start_collection_if_idle()  # noqa: SLF001
+    await asyncio.sleep(0)
+    assert seen == [first.marker_tracker]
+    await first.stop()
+    await second.stop()
+
+
+@pytest.mark.asyncio
 async def test_cold_start_initializing_payload_is_not_suppressed(monkeypatch):
     import discord
 

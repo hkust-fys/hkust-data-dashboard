@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from dashboard.providers.route_geometry import RouteGeometry, RouteLine, Stop
+
+
+def _probe_snapshot(rows=()):
+    return SimpleNamespace(
+        rows=tuple(rows), complete_routes=(), routes=(), collected_at=None
+    )
 
 
 def _line() -> RouteLine:
@@ -37,11 +44,11 @@ async def test_capture_and_probe_run_at_the_same_time(monkeypatch):
     async def probes(*_args, **_kwargs):
         probe_started.set()
         await release.wait()
-        return []
+        return _probe_snapshot()
 
     monkeypatch.setattr(maps, "capture_gmaps_base", capture)
     monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
-    monkeypatch.setattr(maps, "fetch_probe_etas", probes)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", probes)
     monkeypatch.setattr(maps, "render_map", lambda *args, **kwargs: b"rendered")
 
     operation = asyncio.create_task(maps.fetch_traffic_map(object()))
@@ -79,7 +86,7 @@ async def test_cancellation_cleans_capture_and_probe_tasks(monkeypatch):
 
     monkeypatch.setattr(maps, "capture_gmaps_base", capture)
     monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
-    monkeypatch.setattr(maps, "fetch_probe_etas", probes)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", probes)
 
     operation = asyncio.create_task(maps.fetch_traffic_map(object()))
     await asyncio.wait_for(probe_started.wait(), timeout=1)
@@ -137,7 +144,7 @@ async def test_probe_failure_does_not_cancel_or_hide_google_base(monkeypatch):
 
     monkeypatch.setattr(maps, "capture_gmaps_base", capture)
     monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
-    monkeypatch.setattr(maps, "fetch_probe_etas", probes)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", probes)
     monkeypatch.setattr(maps, "render_map", render)
 
     assert await maps.fetch_traffic_map(object()) == (b"rendered", [])
@@ -155,7 +162,7 @@ async def test_estimator_failure_does_not_cancel_or_hide_google_base(monkeypatch
         return RouteGeometry(routes=[_line()])
 
     async def probes(*_args, **_kwargs):
-        return [object()]
+        return _probe_snapshot([object()])
 
     captured: dict[str, object] = {}
 
@@ -169,7 +176,7 @@ async def test_estimator_failure_does_not_cancel_or_hide_google_base(monkeypatch
 
     monkeypatch.setattr(maps, "capture_gmaps_base", capture)
     monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
-    monkeypatch.setattr(maps, "fetch_probe_etas", probes)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", probes)
     monkeypatch.setattr(maps, "estimate_bus_positions", failed_estimate)
     monkeypatch.setattr(maps, "render_map", render)
 

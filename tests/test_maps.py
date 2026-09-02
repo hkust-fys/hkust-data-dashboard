@@ -8,13 +8,27 @@ import io
 import math
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image, ImageChops
 
 from dashboard.maps import renderer, tiles
+from dashboard.maps.positions import BusEstimate
 from dashboard.models import EtaRow, Operator, RouteEtaGroup
 from dashboard.providers.route_geometry import RouteLine, Stop
+
+
+def _probe_snapshot(rows=()):
+    return SimpleNamespace(
+        rows=tuple(rows), complete_routes=(), routes=(), collected_at=None
+    )
+
+
+def _candidate(position):
+    return BusEstimate("R destination", 22.3, 114.2, Operator.KMB, 0.0,
+                       route="R", bound="out", position=position,
+                       operator_code="KMB")
 
 
 def test_map_capture_and_projection_contract_stays_synchronized():
@@ -97,7 +111,7 @@ async def test_probe_failure_still_renders_google_base(monkeypatch):
 
     monkeypatch.setattr(maps, "capture_gmaps_base", capture)
     monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
-    monkeypatch.setattr(maps, "fetch_probe_etas", failed_probes)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", failed_probes)
     monkeypatch.setattr(maps, "render_map", render)
 
     png, _ = await maps.fetch_traffic_map(object())
@@ -123,7 +137,7 @@ async def test_marker_audit_failure_never_blocks_a_rendered_frame(monkeypatch, c
         return RouteGeometry(routes=[line])
 
     async def probes(*_args, **_kwargs):
-        return []
+        return _probe_snapshot()
 
     def broken_audit(*_args, **_kwargs):
         nonlocal audit_calls
@@ -132,7 +146,7 @@ async def test_marker_audit_failure_never_blocks_a_rendered_frame(monkeypatch, c
 
     monkeypatch.setattr(maps, "capture_gmaps_base", capture)
     monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
-    monkeypatch.setattr(maps, "fetch_probe_etas", probes)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", probes)
     monkeypatch.setattr(maps, "audit_marker_positions", broken_audit)
     monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
 
@@ -141,6 +155,83 @@ async def test_marker_audit_failure_never_blocks_a_rendered_frame(monkeypatch, c
     assert image == b"rendered"
     assert audit_calls == 1
     assert "marker audit unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_probe_selection_receives_verified_gate_ids_as_mandatory_anchors(monkeypatch):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+
+    line = RouteLine("91", "KMB", "outbound", [Stop("gate", "gate", 22.33, 114.26)])
+    seen = {}
+
+    async def geometry(*_args, **_kwargs):
+        return RouteGeometry(routes=[line])
+
+    def select(lines, *, mandatory_stop_ids):
+        seen["ids"] = set(mandatory_stop_ids)
+        return []
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
+    monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
+    monkeypatch.setattr(maps, "select_probe_stops", select)
+    monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
+    await maps.fetch_traffic_map(object())
+    assert {"B002CEF0DBC568F5", "003130", "20013011"} <= seen["ids"]
+
+
+@pytest.mark.asyncio
+async def test_tracker_failure_renders_stateless_candidates(monkeypatch):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+
+    candidate = _candidate(1.0)
+    async def geometry(*_args, **_kwargs):
+        return RouteGeometry(routes=[RouteLine("91", "KMB", "outbound", [])])
+    async def snapshot(*_args, **_kwargs):
+        return _probe_snapshot()
+    class BrokenTracker:
+        async def update(self, *_args, **_kwargs):
+            raise RuntimeError("tracker unavailable")
+    seen = {}
+    monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
+    monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", snapshot)
+    monkeypatch.setattr(maps, "estimate_bus_positions", lambda *_args, **_kwargs: [candidate])
+    def render(estimates, *_args):
+        seen["estimates"] = estimates
+        return b"rendered"
+    monkeypatch.setattr(maps, "render_map", render)
+    await maps.fetch_traffic_map(object(), tracker=BrokenTracker())
+    assert seen["estimates"] == [candidate]
+
+
+@pytest.mark.asyncio
+async def test_marker_audit_receives_stateless_candidates_when_tracker_changes_output(monkeypatch):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+    candidate = _candidate(1.0)
+    changed = _candidate(2.0)
+    audited = {}
+    async def geometry(*_args, **_kwargs):
+        return RouteGeometry(routes=[RouteLine("91", "KMB", "outbound", [])])
+    async def snapshot(*_args, **_kwargs):
+        return _probe_snapshot()
+    class Tracker:
+        async def update(self, *_args, **_kwargs):
+            return [changed]
+    def audit(*args, **kwargs):
+        audited["estimates"] = args[2]
+        return {"checks": [], "issues": [], "stats": {"markers": 0}, "ok": True,
+                "gmb_marker_pairs": ()}
+    monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
+    monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", snapshot)
+    monkeypatch.setattr(maps, "estimate_bus_positions", lambda *_args, **_kwargs: [candidate])
+    monkeypatch.setattr(maps, "audit_marker_positions", audit)
+    monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
+    await maps.fetch_traffic_map(object(), tracker=Tracker())
+    assert audited["estimates"] == [candidate]
 
 
 def test_marker_issue_warning_key_is_deduplicated_and_bounded():

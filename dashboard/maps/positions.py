@@ -71,6 +71,19 @@ class BusEstimate:
     # Stable route vocabulary and temporal identity, populated by MarkerTracker.
     operator_code: str = ""
     track_id: int | None = None
+    bracket: tuple[float, float] | None = None
+    eta_minutes: float | None = None
+    eta_arrival_at: object | None = None
+    bracket_initial_eta: float | None = None
+    boundary_age_seconds: float | None = None
+
+    @property
+    def bracket_lower(self):
+        return self.bracket[0] if self.bracket else None
+
+    @property
+    def bracket_upper(self):
+        return self.bracket[1] if self.bracket else None
 
 
 MINUTES_PER_STOP = 2.0
@@ -969,6 +982,8 @@ def estimate_bus_positions(
     route_lines,
     destinations: dict[tuple[str, str, str], str] | None = None,
     authoritative_etas=None,
+    *,
+    observed_checkpoint_indices=None,
 ) -> list[BusEstimate]:
     """Associate ETA rows into vehicles and interpolate them on route paths.
 
@@ -1013,6 +1028,35 @@ def estimate_bus_positions(
     LADDER_GAP_STOPS = 2.2
 
     probe_inputs = list(probe_etas)
+
+    def identity_position(row) -> float:
+        """Compare staggered cache rows on one common observation clock.
+
+        Source minutes remain immutable.  Cache age is used only to associate
+        observations that can describe the same vehicle; it never becomes a
+        displayed countdown or a marker-motion input.
+        """
+        raw_position, _stop, _scheduled, _authoritative, observation = row
+        kind, input_index = observation
+        if str(kind).lower() != "probe" or not 0 <= input_index < len(probe_inputs):
+            return raw_position
+        try:
+            age = float(
+                getattr(probe_inputs[input_index], "cache_age_seconds", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            age = 0.0
+        if not math.isfinite(age) or age < 0.0:
+            age = 0.0
+        return raw_position + age / (MINUTES_PER_STOP * 60.0)
+    observed_by_route = {}
+    if observed_checkpoint_indices is not None:
+        if isinstance(observed_checkpoint_indices, dict):
+            observed_by_route = {tuple(k): frozenset(v)
+                                 for k, v in observed_checkpoint_indices.items()}
+        else:
+            observed_by_route = {key: frozenset(observed_checkpoint_indices)
+                                 for key in lines_by_key}
     authoritative_inputs = list(authoritative_etas or [])
     gate_plan = _plan_gate_associations(
         probe_inputs,
@@ -1106,14 +1150,8 @@ def estimate_bus_positions(
             if passed_position is None:
                 continue
             raw_position = passed_position
-        # Remaining probe-only evidence must imply a position on the route.
-        if not is_authoritative and minutes > 0 and raw_position < 0:
-            continue
-        if raw_position > stops_count - 1:
-            continue
-        # Gate-order proof may have replaced the coarse stop/ETA position.
-        # Rebuild the rung here; ``row`` was created before that correction
-        # for the authoritative/assigned fast paths above.
+        # Gate-order proof may have replaced the coarse stop/ETA position;
+        # identity normalization must start from that corrected value.
         row = (
             raw_position,
             idx,
@@ -1121,6 +1159,11 @@ def estimate_bus_positions(
             False,
             observation,
         )
+        # Remaining probe-only evidence must imply a position on the route.
+        if not is_authoritative and minutes > 0 and identity_position(row) < 0:
+            continue
+        if raw_position > stops_count - 1:
+            continue
         # Keep the source ETA-implied position for same-stop headway
         # constraints; rendering may use a corrected passed-track position.
         by_direction.setdefault(key, []).append(row)
@@ -1145,12 +1188,13 @@ def estimate_bus_positions(
         # A ladder can contain at most one ETA for a given stop: otherwise
         # same-stop ETAs can chain transitively through neighbouring rows and
         # collapse several actual departures into one vehicle.
-        rows.sort(key=lambda row: (row[0], row[1], row[2]))
+        rows.sort(key=lambda row: (identity_position(row), row[1], row[2]))
         ladders: list[
             list[tuple[float, int, bool, bool, tuple[str, int]]]
         ] = []
         for row in rows:
             position, stop_index, _scheduled, _authoritative, _observation = row
+            comparable_position = identity_position(row)
             passed_track_id = passed_track_ids.get(_observation[1])
             compatible = []
             for ladder_index, ladder in enumerate(ladders):
@@ -1167,9 +1211,14 @@ def estimate_bus_positions(
                 ) or (
                     passed_track_id is None
                     and not ladder_track_ids
-                    and abs(position - ladder[-1][0]) <= LADDER_GAP_STOPS
+                    and abs(comparable_position - identity_position(ladder[-1]))
+                    <= LADDER_GAP_STOPS
                 ):
-                    compatible.append((abs(position - ladder[-1][0]), ladder_index, ladder))
+                    compatible.append((
+                        abs(comparable_position - identity_position(ladder[-1])),
+                        ladder_index,
+                        ladder,
+                    ))
             if compatible:
                 _distance, _ladder_index, ladder = min(
                     compatible, key=lambda item: (item[0], item[1])
@@ -1402,6 +1451,65 @@ def estimate_bus_positions(
             source_observations,
         ) in entries:
             position = adjusted_positions.get(source_observations, scaled_position / 1000)
+            bracket = None
+            eta_minutes = None
+            eta_arrival_at = None
+            boundary_age_seconds = None
+            observed = observed_by_route.get((operator_name, route, bound))
+            if observed is not None and provenance:
+                first_present = min(provenance)
+                if first_present == 0:
+                    bracket = (0.0, 0.0)
+                else:
+                    absent = [index for index in observed
+                              if index < first_present and index not in provenance]
+                    if absent:
+                        bracket = (float(max(absent)), float(first_present))
+                source_rows = [probe_inputs[index] for kind, index in source_observations
+                               if str(kind).lower() == "probe"
+                               and 0 <= index < len(probe_inputs)]
+                source_rows = [row for row in source_rows if getattr(row, "minutes", None) is not None]
+                present_rows = [row for row in source_rows
+                                if (str(getattr(row, "operator", "")),
+                                    str(getattr(row, "route", "")),
+                                    str(getattr(row, "bound", "")))
+                                == (operator_name, route, bound)
+                                and int(getattr(row, "index", -1)) == first_present]
+                if bracket is not None and present_rows:
+                    selected_eta = min(
+                        present_rows,
+                        key=lambda row: (
+                            float(getattr(row, "cache_age_seconds", 0.0) or 0.0),
+                            float(row.minutes),
+                        ),
+                    )
+                    eta_minutes = float(selected_eta.minutes)
+                    eta_arrival_at = getattr(selected_eta, "arrival_at", None)
+                    absent_index = int(bracket[0]) if bracket else first_present
+                    present_age = float(
+                        getattr(selected_eta, "cache_age_seconds", 0.0) or 0.0
+                    )
+                    absent_ages = [
+                        float(getattr(row, "cache_age_seconds", 0.0) or 0.0)
+                        for row in probe_inputs
+                        if (str(getattr(row, "operator", "")),
+                            str(getattr(row, "route", "")),
+                            str(getattr(row, "bound", "")))
+                        == (operator_name, route, bound)
+                        if int(getattr(row, "index", -1)) == absent_index
+                    ]
+                    if absent_index == first_present:
+                        absent_ages.append(present_age)
+                    if absent_ages:
+                        boundary_age_seconds = max(present_age, min(absent_ages))
+                    # The first stop which sees this ETA instance is the
+                    # physical upper boundary.  Its source ETA supplies the
+                    # requested proportion within the preceding stop span.
+                    position = first_present - min(
+                        1.0, max(0.0, eta_minutes / MINUTES_PER_STOP)
+                    )
+                if bracket is not None:
+                    position = min(max(position, bracket[0]), bracket[1])
             render_section = min(math.floor(position), stops_count - 2)
             fraction = position - render_section
             target_offset = offsets[render_section] + (offsets[render_section + 1] - offsets[render_section]) * fraction
@@ -1429,6 +1537,11 @@ def estimate_bus_positions(
                     operator_code=operator_name,
                     source_indices=provenance,
                     source_observations=source_observations,
+                    bracket=bracket,
+                    eta_minutes=eta_minutes,
+                    eta_arrival_at=eta_arrival_at,
+                    bracket_initial_eta=eta_minutes,
+                    boundary_age_seconds=boundary_age_seconds,
                 )
             )
     return estimates

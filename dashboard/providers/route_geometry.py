@@ -155,14 +155,14 @@ def select_probe_stops(
     lines: Iterable[RouteLine],
     mandatory_stop_ids: Iterable[str] = (),
     *,
-    max_anchors: int = 5,
+    max_anchors: int | None = None,
 ) -> list[ProbeStop]:
     """Select deterministic official occurrences for each route.
 
-    Both termini and every matching mandatory occurrence are protected; spare
-    capacity is filled with evenly spaced interior occurrences. Terminus
-    boards are useful evidence that a bus has left; fetches are deduplicated
-    per physical stop by the transit layer.
+    Production's default selects every stop so presence/absence brackets are
+    observable. An explicit ``max_anchors`` retains the legacy sparse mode,
+    protecting both termini and mandatory occurrences before filling evenly
+    spaced interior positions. The transit layer deduplicates fetch groups.
     """
     required = {str(stop_id) for stop_id in mandatory_stop_ids}
     probes: list[ProbeStop] = []
@@ -171,7 +171,9 @@ def select_probe_stops(
         if not stops:
             continue
         spec = _spec_for_line(line)
-        limit = max(1, int(max_anchors))
+        # Production needs absence evidence at every official occurrence.
+        # Keep an explicit limit for sparse/backwards-compatible callers.
+        limit = len(stops) if max_anchors is None else max(1, int(max_anchors))
         chosen: list[int] = []
         def add(index: int, stops=stops, chosen=chosen) -> None:
             if 0 <= index < len(stops) and index not in chosen:

@@ -1360,6 +1360,64 @@ def test_heading_follows_travel_direction():
     assert abs(estimates[0].heading) < 0.5
 
 
+def test_all_stop_boundary_controls_proportion_and_ignores_unrelated_cache_age():
+    line = _line(stop_count=7)
+    rows = [
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=1),
+        Probe("KMB", "X", "outbound", 3, 1, cache_age_seconds=1),
+        # A stale downstream rung may help identify the same ETA ladder, but
+        # it is not one of the two physical boundary observations.
+        Probe("KMB", "X", "outbound", 4, 3, cache_age_seconds=120),
+        # A coincident index on another route must not contaminate freshness.
+        Probe("KMB", "OTHER", "outbound", 2, None, cache_age_seconds=300),
+    ]
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={("KMB", "X", "outbound"): range(7)},
+    )
+    assert len(estimates) == 1
+    assert estimates[0].bracket == (2.0, 3.0)
+    assert estimates[0].position == 2.5
+    assert estimates[0].eta_minutes == 1
+    assert estimates[0].boundary_age_seconds == 1
+
+
+def test_staggered_immutable_minutes_are_normalized_only_for_identity_matching():
+    line = _line(stop_count=7)
+    rows = [
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0),
+        # As fetched six minutes ago this source implied position -1.  On the
+        # common identity clock it aligns with the fresh downstream rung at 2.
+        Probe("KMB", "X", "outbound", 3, 8, cache_age_seconds=360),
+        Probe("KMB", "X", "outbound", 4, 4, cache_age_seconds=0),
+    ]
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={("KMB", "X", "outbound"): range(7)},
+    )
+    assert len(estimates) == 1
+    assert estimates[0].source_indices == frozenset({3, 4})
+    assert estimates[0].bracket == (2.0, 3.0)
+    # The stale source value itself is unchanged; its age was not converted
+    # into displayed motion.
+    assert estimates[0].eta_minutes == 8
+    assert estimates[0].position == 2.0
+
+
+def test_partial_observation_without_upstream_absence_has_no_bracket():
+    line = _line(stop_count=7)
+    estimates = estimate_bus_positions(
+        [Probe("KMB", "X", "outbound", 3, 1, cache_age_seconds=0)],
+        [line],
+        observed_checkpoint_indices={("KMB", "X", "outbound"): {3, 4, 5, 6}},
+    )
+    assert len(estimates) == 1
+    assert estimates[0].bracket is None
+    assert estimates[0].boundary_age_seconds is None
+
+
 def test_probe_selection_uses_bounded_evenly_spaced_anchors():
     from dashboard.providers.route_geometry import select_probe_stops
 
@@ -1367,7 +1425,7 @@ def test_probe_selection_uses_bounded_evenly_spaced_anchors():
     probes = select_probe_stops([line])
     # Every stop of the direction is probed, termini included: the route is
     # just a stop sequence with ETAs — there is no interior/exterior split.
-    assert len(probes) == 5
+    assert len(probes) == 6
     assert probes[0].index == 0 and probes[-1].index == 5
 
 
@@ -1376,7 +1434,9 @@ def test_probe_selection_downsamples_long_routes_and_keeps_mandatory_stop():
 
     stops = [Stop(str(index), f"Stop {index}", 22.33, 114.26 + index * 0.001) for index in range(31)]
     line = RouteLine("X", "KMB", "outbound", stops)
-    probes = select_probe_stops([line], mandatory_stop_ids={"17"})
+    probes = select_probe_stops(
+        [line], mandatory_stop_ids={"17"}, max_anchors=5
+    )
     assert len(probes) == 5
     assert [probe.index for probe in probes] == [0, 10, 17, 20, 30]
 

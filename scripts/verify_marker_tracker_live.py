@@ -14,7 +14,6 @@ import aiohttp
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from dashboard.config import Settings  # noqa: E402
 from dashboard.http import HttpClient  # noqa: E402
 from dashboard.maps import _authoritative_etas, _destination_map  # noqa: E402
 from dashboard.maps.positions import estimate_bus_positions  # noqa: E402
@@ -38,7 +37,10 @@ POSITION_EPSILON = 0.05
 # preserving marker identity/order; retain sensitivity to real spacing errors.
 GAP_TOLERANCE = 1.0
 EVIDENCE_TTL = 900.0
+HTTP_TIMEOUT_SECONDS = 30.0
+TRACKER_BOUNDARY_FRESH_SECONDS = 5.0
 RouteKey = tuple[str, str, str]
+FAILED_OPERATOR_CODES = {"KMB": "KMB", "Citybus": "CTB", "GMB": "GMB"}
 
 
 def route_key(v):
@@ -80,6 +82,19 @@ def _tracks(items):
 
 
 def frame_record(snapshot, candidates, tracked, route_max=None, timestamp=None):
+    def evidence(x):
+        arrival = getattr(x, "eta_arrival_at", None)
+        return {
+            "bracket": getattr(x, "bracket", None),
+            "eta_minutes": getattr(x, "eta_minutes", None),
+            "eta_arrival_at": arrival.isoformat() if hasattr(arrival, "isoformat") else arrival,
+            "boundary_age_seconds": getattr(x, "boundary_age_seconds", None),
+            "source_indices": sorted(getattr(x, "source_indices", ()) or ()),
+            "source_observations": sorted(getattr(x, "source_observations", ()) or ()),
+        }
+    def evidence_record(x):
+        e = evidence(x)
+        return {"position": float(getattr(x, "position", 0)), **e}
     return {
         "utc": timestamp or datetime.now(UTC).isoformat(),
         "generations": {
@@ -87,7 +102,16 @@ def frame_record(snapshot, candidates, tracked, route_max=None, timestamp=None):
             for x in snapshot.complete_routes
         },
         "candidates": _positions(candidates),
+        "candidate_evidence": {key: [evidence_record(x) for x in sorted(values, key=lambda x: float(x.position or 0))]
+                               for key, values in ((key, [x for x in candidates if route_key(x) == key])
+                                                   for key in {route_key(x) for x in candidates})},
         "tracks": _tracks(tracked),
+        "track_evidence": {
+            key: {int(x.track_id): evidence(x) for x in values if x.track_id is not None}
+            for key, values in ((key, [x for x in tracked if route_key(x) == key])
+                                for key in {route_key(x) for x in tracked})
+        },
+        "observed_checkpoints": _observed_checkpoint_map(snapshot),
         "route_max": route_max or {},
     }
 
@@ -98,6 +122,8 @@ def _json_safe_record(x):
             ("/".join(k) if isinstance(k, tuple) else str(k)): _json_safe_record(v)
             for k, v in x.items()
         }
+    if isinstance(x, (set, frozenset)):
+        return [_json_safe_record(v) for v in sorted(x, key=str)]
     if isinstance(x, (tuple, list)):
         return [_json_safe_record(v) for v in x]
     return x
@@ -110,10 +136,11 @@ def _evidence_state(state=None):
         "latest_complete_collected_at": {},
         "minute_baselines": {}, "minute_checks": {}, "gap_checks": {},
         "gap_inconclusive": {}, "lifecycle_inconclusive": {},
+        "bracket_checks": {}, "bracket_inconclusive": {},
         }
     for key in ("last_generation_by_route", "last_ids_by_route", "latest_complete_collected_at",
                 "minute_baselines", "minute_checks", "gap_checks", "gap_inconclusive",
-                "lifecycle_inconclusive"):
+                "lifecycle_inconclusive", "bracket_checks", "bracket_inconclusive"):
         state.setdefault(key, {})
     return state
 
@@ -121,6 +148,65 @@ def _evidence_state(state=None):
 def _route_maps(record):
     return {key: {int(track): pos for track, pos in values}
             for key, values in record.get("tracks", {}).items()}
+
+
+def _eta_allows_motion(old, new, key, track):
+    before = old.get("track_evidence", {}).get(key, {}).get(track, {})
+    after = new.get("track_evidence", {}).get(key, {}).get(track, {})
+    fields = ("bracket", "eta_minutes", "eta_arrival_at", "source_indices", "source_observations")
+    changed = tuple(after.get(k) for k in fields) != tuple(before.get(k) for k in fields)
+    age = after.get("boundary_age_seconds")
+    return changed and isinstance(age, (int, float)) and 0 <= age <= TRACKER_BOUNDARY_FRESH_SECONDS
+
+
+def _observed_checkpoint_map(snapshot):
+    checkpoints = getattr(snapshot, "positioning_checkpoints", None)
+    if isinstance(checkpoints, dict):
+        return {tuple(key): frozenset(value) for key, value in checkpoints.items()}
+    if checkpoints is not None:
+        observed = {}
+        for operator, route, bound, index in checkpoints:
+            observed.setdefault((operator, route, bound), set()).add(index)
+        if observed:
+            return {key: frozenset(value) for key, value in observed.items()}
+    return {tuple(route.route_key): getattr(route, "observed_checkpoint_indices", frozenset())
+            for route in getattr(snapshot, "complete_routes", ())}
+
+
+def _direct_bracket_evidence(record, key, track, position):
+    evidence = record.get("track_evidence", {}).get(key, {}).get(track, {})
+    bracket = evidence.get("bracket") or ()
+    sources = {int(index) for index in evidence.get("source_indices", ())}
+    observed = {
+        int(index) for index in record.get("observed_checkpoints", {}).get(key, ())
+    }
+    age = evidence.get("boundary_age_seconds")
+    eta = evidence.get("eta_minutes")
+    if (
+        len(bracket) != 2
+        or not sources
+        or not isinstance(age, (int, float))
+        or not 0 <= age <= TRACKER_BOUNDARY_FRESH_SECONDS
+        or not isinstance(eta, (int, float))
+    ):
+        return False
+    lower, upper = map(float, bracket)
+    first_present = min(sources)
+    if upper != float(first_present):
+        return False
+    if first_present == 0:
+        if lower != 0.0:
+            return False
+    else:
+        absent = [
+            index for index in observed
+            if index < first_present and index not in sources
+        ]
+        if not absent or lower != float(max(absent)):
+            return False
+    expected = first_present - min(1.0, max(0.0, float(eta) / 2.0))
+    expected = min(upper, max(lower, expected))
+    return lower <= position <= upper and abs(position - expected) <= POSITION_EPSILON
 
 
 def compare_adjacent(old, new, state=None):
@@ -174,8 +260,10 @@ def compare_adjacent(old, new, state=None):
                 elif age < EVIDENCE_TTL:
                     state["lifecycle_inconclusive"][key] = state["lifecycle_inconclusive"].get(key, 0) + 1
         for track, position in a.items():
-            if track in b and b[track] + POSITION_EPSILON < position:
-                issues.append({"kind": "backward", "route": key, "track_id": track})
+            if track in b and abs(b[track] - position) > POSITION_EPSILON and not _eta_allows_motion(old, new, key, track):
+                kind = "backward_without_eta_evidence" if b[track] < position else "movement_without_eta_evidence"
+                issues.append({"kind": kind, "route": key, "track_id": track,
+                               "detail": "movement lacks fresh changed ETA/bracket evidence"})
         common = [track for track in a if track in b]
         if len(common) > 1 and common != [track for track in b if track in a]:
             issues.append({"kind": "identity_order_crossing", "route": key})
@@ -190,6 +278,42 @@ def compare_adjacent(old, new, state=None):
                 issues.append({"kind": "spacing_mismatch", "route": key})
         elif current_generation and len(candidates) != len(b):
             state["gap_inconclusive"][key] = state["gap_inconclusive"].get(key, 0) + 1
+        valid_tracks = [
+            (track, position)
+            for track, position in b.items()
+            if _direct_bracket_evidence(new, key, track, position)
+        ]
+        invalid_fresh = [
+            track
+            for track, position in b.items()
+            if len(
+                new.get("track_evidence", {})
+                .get(key, {})
+                .get(track, {})
+                .get("bracket")
+                or ()
+            ) == 2
+            and isinstance(
+                new["track_evidence"][key][track].get("boundary_age_seconds"),
+                (int, float),
+            )
+            and 0
+            <= new["track_evidence"][key][track]["boundary_age_seconds"]
+            <= TRACKER_BOUNDARY_FRESH_SECONDS
+            and not _direct_bracket_evidence(new, key, track, position)
+        ]
+        for track in invalid_fresh:
+            issues.append({
+                "kind": "invalid_bracket_evidence",
+                "route": key,
+                "track_id": track,
+            })
+        if len(valid_tracks) == len(b) >= 2:
+            state["bracket_checks"][key] = (
+                state["bracket_checks"].get(key, 0) + len(valid_tracks) - 1
+            )
+        elif current_generation:
+            state["bracket_inconclusive"][key] = state["bracket_inconclusive"].get(key, 0) + 1
     return issues, checks
 
 
@@ -207,10 +331,8 @@ def minute_checks(old, new, state=None):
                 continue
             q = bm[i]
             checks += 1
-            if q + POSITION_EPSILON < p:
+            if q + POSITION_EPSILON < p and not _eta_allows_motion(old, new, key, i):
                 issues.append({"kind": "minute_backward", "route": key, "track_id": i})
-            elif q <= p + POSITION_EPSILON and q < new.get("route_max", {}).get(key, float("inf")) - POSITION_EPSILON:
-                issues.append({"kind": "minute_stalled", "route": key, "track_id": i})
             state["minute_checks"][key] = state["minute_checks"].get(key, 0) + 1
     return issues, checks
 
@@ -261,7 +383,7 @@ def fresh_routes(collected, started, ended):
 
 
 def evaluate_run(
-    requested, fresh, tracks_seen, minute_count, spacing_count, violations, provider_errors=(), lifecycle_inconclusive=()
+    requested, fresh, tracks_seen, minute_count, spacing_count, violations, provider_errors=(), lifecycle_inconclusive=(), bracket_count=()
 ):
     if violations:
         return 1
@@ -270,13 +392,13 @@ def evaluate_run(
     active = tracks_seen if isinstance(tracks_seen, dict) else ({key: 1 for key in requested} if tracks_seen else {})
     minutes = minute_count if isinstance(minute_count, dict) else ({key: minute_count for key in requested} if minute_count else {})
     gaps = spacing_count if isinstance(spacing_count, dict) else ({key: spacing_count for key in requested} if spacing_count else {})
-    if any(not active.get(key, 0) or not minutes.get(key, 0) or not gaps.get(key, 0) for key in requested):
+    brackets = bracket_count if isinstance(bracket_count, dict) else ({key: bracket_count for key in requested} if bracket_count else {})
+    if any(not active.get(key, 0) or not minutes.get(key, 0) or not gaps.get(key, 0) or not brackets.get(key, 0) for key in requested):
         return 2
     return 0
 
 
 async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
-    settings = Settings.from_env(require_keys=False)
     previous = None
     seen = set()
     requested = set()
@@ -293,7 +415,7 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
     completed_frames = 0
     try:
         async with aiohttp.ClientSession() as session:
-            client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
+            client = HttpClient(session, timeout_seconds=HTTP_TIMEOUT_SECONDS)
             geometry = await fetch_route_geometry(client, cache_dir=cache_dir)
             lines = [x for x in geometry.routes if not watch or route_key(x) in watch]
             requested = {route_key(x) for x in lines}
@@ -307,16 +429,25 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
             tracker = MarkerTracker(evidence_ttl_seconds=EVIDENCE_TTL)
             for n in range(cycles):
                 groups, _, failed = await fetch_transit_etas(client)
-                provider_errors.update(failed or ())
-                snap = await fetch_probe_snapshot(client, probes)
+                requested_operators = {key[0] for key in requested}
+                provider_errors.update(
+                    name
+                    for name in failed or ()
+                    if FAILED_OPERATOR_CODES.get(name, name) in requested_operators
+                )
+                snap = await fetch_probe_snapshot(client, probes, priorities=tracker.poll_priorities())
                 seen.update(tuple(x.route_key) for x in snap.complete_routes)
                 for item in snap.complete_routes:
                     fresh[tuple(item.route_key)] = item.collected_at
+                positioning_rows = getattr(snap, "positioning_rows", None)
+                rows = list(snap.rows) if positioning_rows is None else list(positioning_rows)
+                observed = _observed_checkpoint_map(snap)
                 cand = estimate_bus_positions(
-                    list(snap.rows),
+                    rows,
                     lines,
                     _destination_map(groups, lines),
                     _authoritative_etas(groups, lines),
+                    observed_checkpoint_indices=observed,
                 )
                 tracked = await tracker.update(snap, cand, lines)
                 completed_frames += 1
@@ -341,6 +472,8 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
                     "gap_checks": dict(evidence["gap_checks"]),
                     "gap_inconclusive": dict(evidence["gap_inconclusive"]),
                     "lifecycle_inconclusive": dict(evidence["lifecycle_inconclusive"]),
+                    "bracket_checks": dict(evidence["bracket_checks"]),
+                    "bracket_inconclusive": dict(evidence["bracket_inconclusive"]),
                 }
                 if handle:
                     handle.write(json.dumps(_json_safe_record(cur), separators=(",", ":")) + "\n")
@@ -354,7 +487,10 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
                 if n + 1 < cycles:
                     await asyncio.sleep(interval)
     except Exception as exc:
-        print(f"SUMMARY status=INCONCLUSIVE diagnostic_error={type(exc).__name__}")
+        print(
+            "SUMMARY status=INCONCLUSIVE "
+            f"diagnostic_error={type(exc).__name__}: {exc}"
+        )
         return 2
     finally:
         if handle:
@@ -371,9 +507,10 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
         violations,
         provider_errors,
         evidence["lifecycle_inconclusive"],
+        evidence["bracket_checks"],
     )
     print(
-        f"SUMMARY frames={completed_frames} gap_checks={sum(evidence['gap_checks'].values())} minute_checks={sum(evidence['minute_checks'].values())} lifecycle_inconclusive={sum(evidence['lifecycle_inconclusive'].values())} violations={violations} status={'FAIL' if violations else ('INCONCLUSIVE' if return_code == 2 else 'PASS')}"
+        f"SUMMARY frames={completed_frames} gap_checks={sum(evidence['gap_checks'].values())} minute_checks={sum(evidence['minute_checks'].values())} bracket_checks={sum(evidence['bracket_checks'].values())} bracket_inconclusive={sum(evidence['bracket_inconclusive'].values())} lifecycle_inconclusive={sum(evidence['lifecycle_inconclusive'].values())} violations={violations} status={'FAIL' if violations else ('INCONCLUSIVE' if return_code == 2 else 'PASS')}"
     )
     return return_code
 

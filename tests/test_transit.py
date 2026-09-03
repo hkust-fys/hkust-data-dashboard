@@ -30,8 +30,12 @@ def _reset_gmb_state(monkeypatch):
     transit._gate_eta_cache.stored = None  # noqa: SLF001
     transit._probe_cache._store.clear()  # noqa: SLF001
     transit._probe_route_generations.clear()  # noqa: SLF001
+    transit._probe_group_versions.clear()  # noqa: SLF001
+    transit._probe_group_rows.clear()  # noqa: SLF001
+    transit._probe_route_published_versions.clear()  # noqa: SLF001
     monkeypatch.setattr(transit, "_probe_generation", 0)
-    monkeypatch.setattr(transit, "_probe_cursor", 0)
+    monkeypatch.setattr(transit, "_probe_priority_cursor", 0)
+    monkeypatch.setattr(transit, "_probe_background_cursor", 0)
     monkeypatch.setattr(transit, "_gate_network_refresh_at", None)
     monkeypatch.setattr(transit, "_probe_network_refresh_at", None)
     monkeypatch.setattr(transit, "_gate_refresh_task", None)
@@ -52,7 +56,7 @@ def test_probe_cache_ages_cached_countdowns_between_rotated_probes(operator):
 
     now[0] += 65
     aged = cache.get("probe")[0]
-    assert aged.minutes == pytest.approx(2.9166667)
+    assert aged.minutes == pytest.approx(4)
     assert aged.cache_age_seconds == 65
     assert cache._store["probe"][1] == [eta]  # noqa: SLF001
 
@@ -63,7 +67,7 @@ def test_probe_cache_removes_departed_cached_rows():
     cache.set("probe", [transit.ProbeEta("GMB", "11", "seq-1", "stop", 3, 1)])
 
     now[0] += 120
-    assert cache.get("probe") == []
+    assert cache.get("probe")[0].minutes == pytest.approx(1)
 
 
 def test_probe_cache_expires_only_after_multi_sweep_ceiling():
@@ -74,7 +78,7 @@ def test_probe_cache_expires_only_after_multi_sweep_ceiling():
     cache.set("probe", [eta])
 
     now[0] += 419
-    assert cache.get("probe")[0].minutes == pytest.approx(993.0166667)
+    assert cache.get("probe")[0].minutes == pytest.approx(1000)
     now[0] += 2
     assert cache.get("probe") is None
     assert "probe" not in cache._store  # noqa: SLF001
@@ -88,14 +92,23 @@ def test_probe_cache_uses_injected_wall_clock_for_absolute_age_and_expiry():
     eta = transit.ProbeEta("KMB", "X", "outbound", "stop", 1, 1.5, arrival_at=arrival)
     cache.set("probe", [eta])
     wall[0] += timedelta(seconds=30)
-    assert cache.get("probe")[0].minutes == pytest.approx(1.0)
+    assert cache.get("probe")[0].minutes == pytest.approx(1.5)
     wall[0] += timedelta(seconds=61)
-    assert cache.get("probe") == []
+    assert cache.get("probe")[0].minutes == pytest.approx(1.5)
+
+
+def test_probe_cache_defensively_copies_source_rows():
+    cache = transit.ProbeEtaCache()
+    rows = [transit.ProbeEta("KMB", "X", "outbound", "stop", 1, 5)]
+    cache.set("probe", rows)
+    rows.clear()
+    assert cache.get("probe")[0].minutes == 5
 
 
 def test_probe_generation_public_shape_is_small_and_topology_is_canonical():
     assert {field.name for field in fields(transit.ProbeRouteGeneration)} == {
         "route_key", "rows", "generation", "collected_at",
+        "observed_checkpoint_indices",
     }
     first = SimpleNamespace(
         operator="GMB", route="11", bound="seq-1", stop_id="stop-a", index=2,
@@ -146,12 +159,15 @@ def test_gmb_probe_parser_uses_matching_stop_sequence_and_precise_timestamp():
 
 
 @pytest.mark.asyncio
-async def test_probe_snapshot_ages_timestamp_less_rows_from_generation_collection(monkeypatch):
+async def test_probe_snapshot_preserves_source_minutes_and_ages_cache_metadata(monkeypatch):
     mono = [10.0]
     wall = [s.utc()]
     monkeypatch.setattr(transit.time, "monotonic", lambda: mono[0])
     monkeypatch.setattr(transit, "_probe_mono_clock", lambda: mono[0])
     monkeypatch.setattr(transit, "_probe_wall_clock", lambda: wall[0])
+    monkeypatch.setattr(
+        transit, "_probe_cache", transit.ProbeEtaCache(clock=lambda: mono[0])
+    )
     monkeypatch.setattr(transit, "TRANSIT_NETWORK_REFRESH_SECONDS", 1000.0)
     probe = SimpleNamespace(operator="GMB", route="R", bound="b", stop_id="s",
                             route_id=1, sequence=1, index=0)
@@ -165,10 +181,12 @@ async def test_probe_snapshot_ages_timestamp_less_rows_from_generation_collectio
     mono[0] += 30
     wall[0] += timedelta(seconds=30)
     second = await transit.fetch_probe_snapshot(object(), [probe], max_per_cycle=1)
-    assert second.rows[0].minutes == pytest.approx(1.5)
+    assert second.rows[0].minutes == pytest.approx(2)
     mono[0] += 90
     wall[0] += timedelta(seconds=90)
-    assert (await transit.fetch_probe_snapshot(object(), [probe], max_per_cycle=1)).rows == ()
+    aged = await transit.fetch_probe_snapshot(object(), [probe], max_per_cycle=1)
+    assert aged.rows[0].minutes == pytest.approx(2)
+    assert aged.rows[0].cache_age_seconds == pytest.approx(120)
 
 
 def test_probe_parser_preserves_absolute_eta_and_observation_times():
@@ -180,13 +198,94 @@ def test_probe_parser_preserves_absolute_eta_and_observation_times():
     observed = now - timedelta(seconds=3)
     rows = transit._parse_probe_etas(
         probe,
-        {"data": [{"route": "91", "dir": "O", "eta": arrival.isoformat(),
+        {"data": [{"route": "91", "dir": "O", "seq": 3,
+                   "eta": arrival.isoformat(),
                    "data_timestamp": observed.isoformat()}]},
         now,
     )
     assert len(rows) == 1
     assert rows[0].arrival_at == arrival
     assert rows[0].observed_at == observed
+
+
+def test_kmb_route_eta_parser_filters_by_one_based_sequence():
+    now = s.utc()
+    probe = SimpleNamespace(
+        operator="KMB", route="91M", bound="outbound", stop_id="official-stop", index=2,
+    )
+    raw = {"data": [
+        {"route": "91M", "dir": "O", "service_type": 1, "seq": 2,
+         "eta": (now + timedelta(minutes=2)).isoformat()},
+        {"route": "91M", "dir": "O", "service_type": 1, "seq": 3,
+         "eta": (now + timedelta(minutes=3)).isoformat()},
+    ]}
+    rows = transit._parse_probe_etas(probe, raw, now)  # noqa: SLF001
+    assert len(rows) == 1
+    assert rows[0].index == 2
+    assert rows[0].minutes == pytest.approx(3)
+
+
+@pytest.mark.asyncio
+async def test_priority_refresh_is_visible_before_next_complete_generation(monkeypatch):
+    now = s.utc()
+    route_key = ("CTB", "R", "outbound")
+    probes = [
+        SimpleNamespace(
+            operator="CTB", route="R", bound="outbound", stop_id=f"s{index}",
+            route_id=1, sequence=1, index=index,
+        )
+        for index in range(3)
+    ]
+    minutes = {"s0": 8, "s1": 10, "s2": 12}
+
+    async def fetch(_client, probe):
+        return {"data": [{
+            "dir": "O",
+            "eta": (now + timedelta(minutes=minutes[probe.stop_id])).isoformat(),
+            "data_timestamp": now.isoformat(),
+        }]}
+
+    monkeypatch.setattr(transit, "_probe_wall_clock", lambda: now)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    first = await transit.fetch_probe_snapshot(object(), probes, max_per_cycle=3)
+    assert len(first.complete_routes) == 1
+    generation = first.complete_routes[0].generation
+
+    minutes["s0"] = 3
+    second = await transit.fetch_probe_snapshot(
+        object(), probes, max_per_cycle=2, priorities={route_key: {0}}
+    )
+    assert second.complete_routes[0].generation == generation
+    assert {row.index: row.minutes for row in second.positioning_rows}[0] == 3
+    assert {row.index: row.minutes for row in second.complete_routes[0].rows}[0] == 8
+
+
+@pytest.mark.asyncio
+async def test_sustained_gmb_priorities_reserve_rotating_background_capacity(monkeypatch):
+    probes = [
+        SimpleNamespace(
+            operator="GMB", route=f"R{index}", bound="seq-1",
+            stop_id=f"stop-{index}", route_id=index, sequence=1, index=0,
+        )
+        for index in range(8)
+    ]
+    priorities = {
+        (probe.operator, probe.route, probe.bound): {probe.index}
+        for probe in probes[:6]
+    }
+    calls: list[str] = []
+
+    async def fetch(_client, probe):
+        calls.append(probe.stop_id)
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 4)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit._refresh_probe_etas(object(), probes, 4, priorities)  # noqa: SLF001
+    await transit._refresh_probe_etas(object(), probes, 4, priorities)  # noqa: SLF001
+
+    assert len(calls) == 8
+    assert {"stop-6", "stop-7"} <= set(calls)
 
 
 def test_gmb_repeated_physical_stop_occurrences_have_distinct_cache_keys():
@@ -216,7 +315,7 @@ async def test_gmb_probe_cap_rotates_across_all_groups(monkeypatch):
         return {"data": [{"enabled": True, "route_id": 1, "route_seq": 1, "eta": [{"diff": 1}]}]}
 
     monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
-    monkeypatch.setattr(transit, "_probe_cursor", 0)
+    monkeypatch.setattr(transit, "_probe_background_cursor", 0)
     monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
     # Twenty GMB groups per cycle require three cycles to cover all 35.
     for _ in range(3):
@@ -444,7 +543,8 @@ async def test_probe_snapshot_publishes_whole_route_with_shared_generation(monke
     assert len(snapshot.routes) == 1
     route = snapshot.routes[0]
     assert route.generation > 0
-    assert route.rows and {row.refresh_generation for row in route.rows} == {route.generation}
+    assert route.rows
+    assert all(0 < row.refresh_generation < route.generation for row in route.rows)
 
     async def fail(_client, _probe):
         fail.calls += 1
@@ -512,7 +612,8 @@ async def test_refresh_cadence_uses_deterministic_clock_and_ages_correctly(monke
     clock[0] += 10
     aged_probe = await transit.fetch_probe_etas(object(), [probe])
     assert probe_calls == 1
-    assert aged_probe[0].minutes == pytest.approx(first_probe[0].minutes - 1 / 6)
+    assert aged_probe[0].minutes == pytest.approx(first_probe[0].minutes)
+    assert aged_probe[0].cache_age_seconds == pytest.approx(10)
     clock[0] += 20
     await transit.fetch_probe_etas(object(), [probe])
     assert probe_calls == 2
@@ -696,7 +797,7 @@ async def test_gmb_gate_403_sets_shared_cooldown_and_serves_aged_cache():
 
     rows = await _fetch_gmb(client, s.utc())
     assert client.calls == 1
-    assert rows and rows[0].minutes == 4
+    assert rows and rows[0].minutes == 5
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,8 @@ BASE_TIME = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def _candidate(position, *, gate=False, route="R", operator=Operator.KMB,
-               bound="out", unreliable=False, scheduled=False):
+               bound="out", unreliable=False, scheduled=False, bracket=None,
+               boundary_age=None, arrival_at=None):
     code = {Operator.KMB: "KMB", Operator.CITYBUS: "CTB", Operator.GMB: "GMB"}[operator]
     return BusEstimate(
         f"{route} destination", 22.3, 114.2, operator, 0.0,
@@ -22,6 +23,9 @@ def _candidate(position, *, gate=False, route="R", operator=Operator.KMB,
             "gate" if gate else ("scheduled" if scheduled else "probe"),
             int(position * 10),
         )}),
+        bracket=bracket,
+        boundary_age_seconds=boundary_age,
+        eta_arrival_at=arrival_at,
     )
 
 
@@ -224,3 +228,61 @@ async def test_scheduled_first_generation_is_tentative_then_confirms():
     assert await tracker.update(_snapshot(1), [scheduled]) == []
     visible = await tracker.update(_snapshot(2), [scheduled])
     assert len(visible) == 1
+
+
+@pytest.mark.asyncio
+async def test_priority_poll_covers_every_active_marker_boundary():
+    tracker = MarkerTracker()
+    candidates = [
+        _candidate(1.5, bracket=(1.0, 2.0), boundary_age=0),
+        _candidate(4.5, bracket=(4.0, 5.0), boundary_age=0),
+        _candidate(7.5, bracket=(7.0, 8.0), boundary_age=0),
+    ]
+    await tracker.update(_snapshot(1), candidates)
+    assert tracker.poll_priorities() == {
+        ("KMB", "R", "out"): frozenset({1, 2, 4, 5, 7, 8})
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_bracket_holds_exactly_across_generation_change():
+    tracker = MarkerTracker()
+    fresh = _candidate(3.5, bracket=(3.0, 4.0), boundary_age=0)
+    first = await tracker.update(_snapshot(1), [fresh])
+    stale = _candidate(4.5, bracket=(4.0, 5.0), boundary_age=30)
+    second = await tracker.update(
+        _snapshot(2, collected_at=BASE_TIME + timedelta(seconds=60)), [stale]
+    )
+    assert second[0].track_id == first[0].track_id
+    assert second[0].position == first[0].position
+    assert second[0].bracket == first[0].bracket
+
+
+@pytest.mark.asyncio
+async def test_fresh_same_generation_boundary_can_snap_backward_without_birth():
+    tracker = MarkerTracker()
+    first = await tracker.update(
+        _snapshot(1), [_candidate(5.5, bracket=(5.0, 6.0), boundary_age=0)]
+    )
+    corrected = await tracker.update(
+        _snapshot(1, collected_at=BASE_TIME + timedelta(seconds=30)),
+        [_candidate(4.5, bracket=(4.0, 5.0), boundary_age=0)],
+    )
+    assert len(corrected) == 1
+    assert corrected[0].track_id == first[0].track_id
+    assert corrected[0].position == 4.5
+
+
+@pytest.mark.asyncio
+async def test_unbracketed_partial_probe_holds_last_real_boundary():
+    tracker = MarkerTracker()
+    first = await tracker.update(
+        _snapshot(1), [_candidate(5.5, bracket=(5.0, 6.0), boundary_age=0)]
+    )
+    partial = await tracker.update(
+        _snapshot(1, collected_at=BASE_TIME + timedelta(seconds=30)),
+        [_candidate(3.0)],
+    )
+    assert partial[0].track_id == first[0].track_id
+    assert partial[0].position == first[0].position
+    assert partial[0].bracket == (5.0, 6.0)

@@ -13,6 +13,7 @@ MAX_TRACKS_PER_ROUTE = 128
 MATCH_DISTANCE = 3.5
 SECONDS_PER_STOP = 120.0
 SMOOTHING_ALPHA = 0.35
+MAX_PRIORITY_ENDPOINTS_PER_ROUTE = 32
 
 
 @dataclass
@@ -69,6 +70,23 @@ class MarkerTracker:
     def state_size(self):
         return sum(len(tracks) for tracks in self._routes.values())
 
+    def poll_priorities(self):
+        """Return the bounded route/checkpoint hints needed by the next poll."""
+        priorities = {}
+        for key, tracks in self._routes.items():
+            endpoints = set()
+            for track in tracks.values():
+                for endpoint in getattr(track.estimate, "bracket", None) or ():
+                    if isinstance(endpoint, int) and endpoint >= 0:
+                        endpoints.add(endpoint)
+                    elif isinstance(endpoint, float) and endpoint.is_integer() and endpoint >= 0:
+                        endpoints.add(int(endpoint))
+            if endpoints:
+                priorities[key] = frozenset(
+                    sorted(endpoints)[:MAX_PRIORITY_ENDPOINTS_PER_ROUTE]
+                )
+        return priorities
+
     def _update(self, snapshot, candidates, route_lines):
         now = _timestamp(getattr(snapshot, "collected_at", 0.0))
         complete = {
@@ -101,9 +119,31 @@ class MarkerTracker:
                     track = old[old_index]
                     candidate = rows[new_index]
                     used.add(new_index)
+                    candidate_bracket = getattr(candidate, "bracket", None)
+                    bracket_position = _bracket_position(track, candidate)
+                    if candidate_bracket is not None and bracket_position is None:
+                        # Complete lifecycle evidence can advance generation,
+                        # but stale positioning evidence must hold the track.
+                        track.generation = generation
+                        track.hits += 1
+                        track.misses = 0
+                        track.confirmed = track.confirmed or track.hits >= 2
+                        track.last_evidence_at = now
+                        continue
+                    if candidate_bracket is None and not _authoritative_evidence(candidate):
+                        # A complete generation may confirm that this identity
+                        # still exists, but incomplete probe geometry cannot
+                        # replace the last real positioning boundary.
+                        track.generation = generation
+                        track.hits += 1
+                        track.misses = 0
+                        track.confirmed = track.confirmed or track.hits >= 2
+                        track.last_evidence_at = now
+                        continue
                     target_phase = now - float(candidate.position or track.position) * SECONDS_PER_STOP
                     track.phase += SMOOTHING_ALPHA * (target_phase - track.phase)
-                    track.position = max(track.position, (now - track.phase) / SECONDS_PER_STOP)
+                    track.position = (bracket_position if bracket_position is not None
+                                      else max(track.position, (now - track.phase) / SECONDS_PER_STOP))
                     track.estimate = replace(candidate, track_id=track.track_id, operator_code=key[0])
                     track.generation = generation
                     track.last_evidence_at = now
@@ -135,6 +175,29 @@ class MarkerTracker:
                 merged = _merge_tracks(old_survivors, births)
                 tracks.clear()
                 tracks.update((track.track_id, track) for track in merged)
+            elif generation is not None and tracks:
+                # A publication may be re-rendered with aged/corrected ETA
+                # rows. Refresh matched tracks, but never alter cardinality
+                # until a newer complete generation arrives.
+                old = list(tracks.values())
+                pairs = _ordered_pairs(old, rows)
+                for old_index, new_index in pairs:
+                    track = old[old_index]
+                    candidate = rows[new_index]
+                    position = _bracket_position(track, candidate)
+                    if (
+                        position is None
+                        and getattr(candidate, "bracket", None) is None
+                        and _authoritative_evidence(candidate)
+                    ):
+                        position = float(candidate.position or track.position)
+                    if position is None:
+                        continue
+                    track.position = position
+                    track.estimate = replace(candidate, track_id=track.track_id,
+                                             operator_code=key[0])
+                    track.last_evidence_at = now
+                    track.misses = 0
             self._bound()
 
         output = []
@@ -172,7 +235,12 @@ class MarkerTracker:
     def _predict(self, tracks, now, route_lines):
         prior = -inf
         for track in tracks:
-            position = max(track.position, (now - track.phase) / SECONDS_PER_STOP)
+            # Bracketed estimates move only when a fresh boundary poll updates
+            # them.  Cached ETA age must never become synthetic motion.
+            if getattr(track.estimate, "bracket", None) is not None:
+                position = track.position
+            else:
+                position = max(track.position, (now - track.phase) / SECONDS_PER_STOP)
             maximum = _route_max(track.estimate, route_lines)
             if maximum != inf:
                 position = min(position, maximum)
@@ -221,6 +289,14 @@ def _ordered_pairs(old, new):
     for i in range(1, len(old) + 1):
         for j in range(1, len(new) + 1):
             choices = [dp[i - 1][j], dp[i][j - 1]]
+            old_anchor = getattr(old[i - 1].estimate, "eta_arrival_at", None)
+            new_anchor = getattr(new[j - 1], "eta_arrival_at", None)
+            anchor_distance = 0.0
+            if old_anchor is not None and new_anchor is not None:
+                try:
+                    anchor_distance = abs(_timestamp(old_anchor) - _timestamp(new_anchor)) / 60.0
+                except (TypeError, ValueError):
+                    anchor_distance = 0.0
             distance = abs(old[i - 1].position - float(new[j - 1].position or 0.0))
             if distance <= MATCH_DISTANCE:
                 previous = dp[i - 1][j - 1]
@@ -231,12 +307,34 @@ def _ordered_pairs(old, new):
                 choices.append(
                     (
                         previous[0] + 1,
-                        previous[1] + distance,
+                        previous[1] + (
+                            anchor_distance * 10.0 + distance * 0.01
+                            if old_anchor is not None and new_anchor is not None
+                            else distance
+                        ),
                         previous[2] + ((0 if overlap else 1, i - 1, j - 1),),
                     )
                 )
             dp[i][j] = min(choices, key=lambda item: (-item[0], item[1], item[2]))
     return [(item[1], item[2]) for item in dp[-1][-1][2]]
+
+
+def _bracket_position(track, candidate):
+    """Use only a freshly observed boundary to reposition a marker."""
+    bracket = getattr(candidate, "bracket", None)
+    if not bracket:
+        return None
+    lower, upper = map(float, bracket)
+    age = getattr(candidate, "boundary_age_seconds", None)
+    if age is None:
+        return None
+    try:
+        age = float(age)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(age) or age < 0.0 or age > 5.0:
+        return None
+    return min(upper, max(lower, float(candidate.position or lower)))
 
 
 def _timestamp(value):
@@ -247,6 +345,13 @@ def _reliable(candidate):
     return not bool(getattr(candidate, "unreliable", False)) and any(
         str(kind).lower() in {"gate", "authoritative"}
         for kind, _ in candidate.source_observations
+    )
+
+
+def _authoritative_evidence(candidate):
+    return any(
+        str(kind).lower() in {"gate", "authoritative"}
+        for kind, _ in getattr(candidate, "source_observations", ())
     )
 
 

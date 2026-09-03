@@ -65,6 +65,7 @@ GMB_STOPS: dict[int, tuple[tuple[str, str, str, int, int], ...]] = {
 }
 
 KMB_BASE = "https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{stop}"
+KMB_ROUTE_ETA_BASE = "https://data.etabus.gov.hk/v1/transport/kmb/route-eta/{route}/1"
 CTB_BASE = "https://rt.data.gov.hk/v2/transport/citybus/eta/CTB/{stop}/{route}"
 GMB_BASE = "https://data.etagmb.gov.hk/eta/stop/{stop}"
 GMB_COOLDOWN_SECONDS = 60.0
@@ -78,7 +79,7 @@ GMB_GROUPS_PER_CYCLE = 20
 
 
 class _GmbGateCache:
-    """Last-good gate ETAs, aged while the shared GMB origin is cooling down."""
+    """Immutable last-good gate ETAs while the shared GMB origin cools down."""
 
     TTL_SECONDS = 900.0
 
@@ -96,14 +97,7 @@ class _GmbGateCache:
         if age_seconds > self.TTL_SECONDS:
             self._stored = None
             return []
-        elapsed_minutes = int(age_seconds // 60.0)
-        aged: list[EtaRow] = []
-        for row in rows:
-            if row.minutes is None:
-                aged.append(row)
-            elif row.minutes - elapsed_minutes >= 0:
-                aged.append(replace(row, minutes=row.minutes - elapsed_minutes))
-        return aged
+        return list(rows)
 
 
 _gmb_gate_cache = _GmbGateCache()
@@ -111,7 +105,7 @@ _gmb_gate_cache = _GmbGateCache()
 # ETA network refreshes are deliberately slower than the map/render cadence.
 # The dashboard may render every ten seconds, but polling the estimator feeds
 # every render tick causes avoidable bursts (especially against GMB). Cached
-# observations are aged and served between refreshes.
+# observations retain their source values and carry cache age between refreshes.
 TRANSIT_NETWORK_REFRESH_SECONDS = 30.0
 
 
@@ -131,14 +125,7 @@ class _GateEtaCache:
         if self.stored is None:
             return None
         stamped, rows, latest, failed = self.stored
-        elapsed_minutes = int(max(0.0, time.monotonic() - stamped) // 60.0)
-        aged: list[EtaRow] = []
-        for row in rows:
-            if row.minutes is None:
-                aged.append(row)
-            elif row.minutes - elapsed_minutes >= 0:
-                aged.append(replace(row, minutes=row.minutes - elapsed_minutes))
-        return aged, latest, list(failed)
+        return list(rows), latest, list(failed)
 
 
 _gate_eta_cache = _GateEtaCache()
@@ -557,9 +544,9 @@ class ProbeEta:
     index: int  # official stop-sequence index of the probe stop
     minutes: float | None
     kind: EtaKind = EtaKind.REALTIME
-    # Age of this stop's last successful response at collection time.  ETA
-    # minutes are already aged to the same clock; this metadata only resolves
-    # contradictory vehicle lists across staggered stop refreshes.
+    # Age of this stop's last successful response at collection time. Source
+    # minutes remain immutable; this metadata aligns identities across
+    # staggered refreshes and controls whether a boundary may move a marker.
     cache_age_seconds: float = 0.0
     arrival_at: datetime | None = None
     observed_at: datetime | None = None
@@ -574,6 +561,17 @@ class ProbeRouteGeneration:
     rows: tuple[ProbeEta, ...]
     generation: int
     collected_at: datetime
+    observed_checkpoint_indices: frozenset[int] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not self.observed_checkpoint_indices:
+            object.__setattr__(
+                self,
+                "observed_checkpoint_indices",
+                frozenset(
+                    int(row.index) for row in self.rows if hasattr(row, "index")
+                ),
+            )
 
 
 @dataclass(frozen=True)
@@ -592,9 +590,13 @@ class ProbeEtaSnapshot:
 
     routes: tuple[ProbeRouteGeneration, ...]
     collected_at: datetime
+    positioning_rows: tuple[ProbeEta, ...] | None = None
+    positioning_checkpoints: frozenset[tuple[str, str, str, int]] = frozenset()
 
     @property
     def rows(self) -> tuple[ProbeEta, ...]:
+        if self.positioning_rows is not None:
+            return self.positioning_rows
         return tuple(row for route in self.routes for row in route.rows)
 
     @property
@@ -624,18 +626,21 @@ def _probe_topology_key(probe) -> tuple[Any, ...]:
 def _fetch_group_key(probe) -> str:
     """Group probes by the single HTTP request that serves them.
 
-    KMB/GMB ETA feeds are per-stop (all routes at once); Citybus is per
-    (stop, route). One fetch per group covers every probe in it.
+    KMB is fetched once per route (both directions), GMB once per physical
+    stop (all routes), and Citybus once per (stop, route). One fetch per group
+    covers every matching probe in it.
     """
+    if probe.operator == "KMB":
+        return f"KMB:route:{probe.route}"
     if probe.operator == "CTB":
         return f"CTB:{probe.stop_id}:{probe.route}"
     return f"{probe.operator}:{probe.stop_id}"
 
 
 class ProbeEtaCache:
-    """Last-value cache so the map can render between staggered sweeps.
+    """Immutable last-value cache between staggered all-stop sweep steps.
 
-    The TTL spans normal anchor sweeps, preventing mid-generation splits, but
+    The TTL spans normal route sweeps, preventing mid-generation splits, but
     bounds staleness when repeated failures leave an entry untouched.
     """
 
@@ -671,48 +676,33 @@ class ProbeEtaCache:
         if entry is None:
             return None
         age_seconds = max(0.0, now_mono - entry[0])
-        # Requests rotate across stops, so cached ETAs must count down
-        # continuously between probes; otherwise a bus marker freezes and
-        # then jumps a full minute.
-        elapsed_minutes = age_seconds / 60.0
-        if elapsed_minutes <= 0 and not any(eta.arrival_at is not None for eta in entry[1]):
-            return entry[1]
-        aged: list[ProbeEta] = []
-        for eta in entry[1]:
-            if eta.minutes is None:
-                aged.append(replace(eta, cache_age_seconds=age_seconds))
-                continue
-            if eta.arrival_at is not None:
-                # Absolute arrivals are always evaluated against the current
-                # injected wall clock. Monotonic time is used only for cache
-                # age and expiry, so clock injection remains testable.
-                now = self._wall_clock()
-                remaining = max(0.0, (eta.arrival_at - now).total_seconds() / 60.0)
-            else:
-                remaining = eta.minutes - elapsed_minutes
-            if remaining > 0:
-                aged.append(
-                    replace(
-                        eta,
-                        minutes=remaining,
-                        cache_age_seconds=age_seconds,
-                    )
-                )
-        return aged
+        # Cached source values are immutable.  Consumers use this age to
+        # decide whether a boundary is fresh enough to move a marker.
+        return [replace(eta, cache_age_seconds=age_seconds) for eta in entry[1]]
+
+    def age_seconds(self, key: str) -> float | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        return max(0.0, self._clock() - entry[0])
 
     def set(self, key: str, value: list[ProbeEta]) -> None:
         now = self._clock()
         self._sweep(now)
-        self._store[key] = (now, value)
+        self._store[key] = (now, list(value))
         self._sweep(now)
 
 
 _probe_cache = ProbeEtaCache()
 
 
-_probe_cursor = 0
+_probe_priority_cursor = 0
+_probe_background_cursor = 0
 _probe_generation = 0
 _probe_route_generations: dict[tuple[str, str, str], _StoredProbeGeneration] = {}
+_probe_group_versions: dict[str, int] = {}
+_probe_group_rows: dict[str, tuple[ProbeEta, ...]] = {}
+_probe_route_published_versions: dict[tuple[str, str, str], dict[str, int]] = {}
 
 # data.etagmb.gov.hk rate-limits bursts with 403s. GMB groups are capped per
 # cycle and the whole GMB sweep backs off for a cooldown when a 403 appears;
@@ -749,7 +739,7 @@ def _record_gmb_403() -> None:
 async def _fetch_raw_stop_eta(client: HttpClient, probe) -> Any:
     """Fetch the raw ETA payload covering ``probe`` (one request per group)."""
     if probe.operator == "KMB":
-        return await client.fetch_json(KMB_BASE.format(stop=probe.stop_id))
+        return await client.fetch_json(KMB_ROUTE_ETA_BASE.format(route=probe.route))
     if probe.operator == "CTB":
         return await client.fetch_json(
             CTB_BASE.format(stop=probe.stop_id, route=probe.route)
@@ -764,6 +754,18 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
     _CTB_BOUND_DIRS = {"outbound": "O", "inbound": "I"}
     if probe.operator == "KMB":
         for entry in entries:
+            entry_stop = entry.get("stop") or entry.get("stop_id")
+            if entry_stop is not None:
+                if str(entry_stop) != str(probe.stop_id):
+                    continue
+            else:
+                # The route-wide endpoint identifies the official occurrence
+                # by one-based sequence, not by stop ID.
+                try:
+                    if int(entry.get("seq")) != int(probe.index) + 1:
+                        continue
+                except (TypeError, ValueError):
+                    continue
             if entry.get("route") != probe.route:
                 continue
             if entry.get("service_type", 1) != 1:
@@ -871,6 +873,7 @@ async def fetch_probe_etas(
     client: HttpClient,
     probes: Sequence[Any],
     max_per_cycle: int = 36,
+    priorities=None,
 ) -> list[ProbeEta]:
     """Return cached probe observations, refreshing the network at most every 30s."""
     global _probe_network_refresh_at, _probe_refresh_task, _probe_refresh_waiters
@@ -884,7 +887,7 @@ async def fetch_probe_etas(
     if _probe_refresh_task is None or _probe_refresh_task.done():
         _probe_network_refresh_at = now_mono
         _probe_refresh_task = asyncio.create_task(
-            _refresh_probe_etas(client, probes, max_per_cycle)
+            _refresh_probe_etas(client, probes, max_per_cycle, priorities)
         )
     task = _probe_refresh_task
     _probe_refresh_waiters += 1
@@ -927,17 +930,18 @@ async def _refresh_probe_etas(
     client: HttpClient,
     probes: Sequence[Any],
     max_per_cycle: int = 36,
+    priorities=None,
 ) -> list[ProbeEta]:
     """Poll up to ``max_per_cycle`` fetch groups round-robin; cache results.
 
-    Probes sharing one HTTP request (same physical stop for KMB/GMB; same
-    stop+route for Citybus) are fetched ONCE per sweep step and parsed once
+    Probes sharing one HTTP request (same KMB route, same physical GMB stop,
+    or same Citybus stop+route) are fetched ONCE per sweep step and parsed once
     per probe, so dense probing stays cheap. Cached values are returned for
     probes outside this cycle's window. GMB groups are additionally capped
     per cycle and the GMB sweep backs off for a cooldown when the host
     rate-limits (HTTP 403), serving last-good cache meanwhile.
     """
-    global _probe_cursor, _probe_generation
+    global _probe_priority_cursor, _probe_background_cursor, _probe_generation
     if not probes:
         return []
     unique: dict[str, Any] = {}
@@ -951,6 +955,10 @@ async def _refresh_probe_etas(
         groups.setdefault(_fetch_group_key(probe), []).append(probe)
 
     group_keys = sorted(groups)
+    active_groups = set(group_keys)
+    for stale_group in set(_probe_group_versions) - active_groups:
+        _probe_group_versions.pop(stale_group, None)
+        _probe_group_rows.pop(stale_group, None)
     routes: dict[tuple[str, str, str], list[str]] = {}
     for key, route_probes in groups.items():
         for probe in route_probes:
@@ -958,7 +966,11 @@ async def _refresh_probe_etas(
             route_list = routes.setdefault(route_key, [])
             if key not in route_list:
                 route_list.append(key)
-    route_keys = sorted(routes)
+    for route_key, published_groups in tuple(_probe_route_published_versions.items()):
+        current_groups = set(routes.get(route_key, ()))
+        if current_groups != set(published_groups):
+            _probe_route_published_versions.pop(route_key, None)
+            _probe_route_generations.pop(route_key, None)
     gmb_paused = time.monotonic() < _gmb_cooldown_until
 
     def selectable(group_key: str) -> bool:
@@ -975,35 +987,62 @@ async def _refresh_probe_etas(
             _gmb_cooldown_until - time.monotonic(),
         )
     cycle_budget = max(0, max_per_cycle)
-    # Select whole routes in deterministic round-robin order. A route is
-    # publishable only when every one of its anchor groups is refreshed.
-    selected_routes: list[tuple[str, str, str]] = []
+    # Stage individual fetch groups in a bounded round-robin. Publications are
+    # assembled below only after every group has advanced since publication.
     selected_groups: list[str] = []
-    used_groups: set[str] = set()
+    selected_priority: list[str] = []
+    selected_background: list[str] = []
     used_gmb = 0
-    start = _probe_cursor % len(route_keys) if route_keys else 0
-    last_considered = 0
-    last_selected = -1
-    for offset in range(len(route_keys)):
-        last_considered = offset + 1
-        route_key = route_keys[(start + offset) % len(route_keys)]
-        route_groups = [key for key in routes[route_key] if key in selectable_keys]
-        if len(route_groups) != len(routes[route_key]):
+    priority_groups = []
+    priority_indices = priorities or {}
+    for group_key, route_probes in groups.items():
+        is_priority = False
+        for probe in route_probes:
+            wanted = {int(index) for index in priority_indices.get(
+                (probe.operator, probe.route, probe.bound), ())
+                      if isinstance(index, int) or str(index).isdigit()}
+            if int(getattr(probe, "index", -1)) in wanted:
+                is_priority = True
+                break
+        if is_priority:
+            priority_groups.append(group_key)
+    background_groups = [key for key in group_keys if key not in priority_groups]
+    priority_start = _probe_priority_cursor % len(priority_groups) if priority_groups else 0
+    background_start = _probe_background_cursor % len(background_groups) if background_groups else 0
+    reserve = min(len(background_groups), max(1, cycle_budget // 4)) if cycle_budget else 0
+    gmb_background_reserve = min(
+        sum(key.startswith("GMB:") for key in background_groups),
+        max(1, GMB_GROUPS_PER_CYCLE // 4),
+    )
+    priority_gmb_limit = max(0, GMB_GROUPS_PER_CYCLE - gmb_background_reserve)
+    for key in (priority_groups[priority_start:] + priority_groups[:priority_start]):
+        if key not in selectable_keys or len(selected_priority) >= max(0, cycle_budget - reserve):
             continue
-        extra = [key for key in route_groups if key not in used_groups]
-        extra_gmb = sum(key.startswith("GMB:") for key in extra)
-        if len(selected_groups) + len(extra) > cycle_budget:
+        if key.startswith("GMB:") and used_gmb >= priority_gmb_limit:
             continue
-        if used_gmb + extra_gmb > GMB_GROUPS_PER_CYCLE:
+        selected_priority.append(key)
+        used_gmb += int(key.startswith("GMB:"))
+    for key in (background_groups[background_start:] + background_groups[:background_start]):
+        if key not in selectable_keys or len(selected_background) >= reserve:
             continue
-        selected_routes.append(route_key)
-        last_selected = offset
-        selected_groups.extend(extra)
-        used_groups.update(extra)
-        used_gmb += extra_gmb
-    if route_keys:
-        advance = (last_selected + 1) if last_selected >= 0 else last_considered
-        _probe_cursor = (start + max(1, advance)) % len(route_keys)
+        if key.startswith("GMB:") and used_gmb >= GMB_GROUPS_PER_CYCLE:
+            continue
+        selected_background.append(key)
+        used_gmb += int(key.startswith("GMB:"))
+    remaining = cycle_budget - len(selected_priority) - len(selected_background)
+    for key in (background_groups[background_start:] + background_groups[:background_start]):
+        if key in selected_background or key not in selectable_keys or remaining <= 0:
+            continue
+        if key.startswith("GMB:") and used_gmb >= GMB_GROUPS_PER_CYCLE:
+            continue
+        selected_background.append(key)
+        used_gmb += int(key.startswith("GMB:"))
+        remaining -= 1
+    selected_groups = selected_priority + selected_background
+    if priority_groups:
+        _probe_priority_cursor = (priority_start + len(selected_priority)) % len(priority_groups)
+    if background_groups:
+        _probe_background_cursor = (background_start + len(selected_background)) % len(background_groups)
     if not selected_groups:
         return [
             eta
@@ -1016,8 +1055,6 @@ async def _refresh_probe_etas(
     selected_gmb = [key for key in selected_groups if key.startswith("GMB:")]
     successful: dict[str, bool] = {}
     refreshed_rows: dict[str, tuple[ProbeEta, ...]] = {}
-    _probe_generation += 1
-    generation = _probe_generation
     async def refresh_group(group_key: str) -> bool:
         global _gmb_cooldown_until
         if group_key.startswith("GMB:") and time.monotonic() < _gmb_cooldown_until:
@@ -1047,14 +1084,21 @@ async def _refresh_probe_etas(
             )
             successful[group_key] = False
             return False
+        global _probe_generation
+        _probe_generation += 1
+        group_generation = _probe_generation
+        group_rows: list[ProbeEta] = []
         for probe in probes_in_group:
             key = _probe_cache_key(probe)
             parsed = [
-                replace(row, refresh_generation=generation)
+                replace(row, refresh_generation=group_generation)
                 for row in _parse_probe_etas(probe, raw, now)
             ]
             _probe_cache.set(key, parsed)
             refreshed_rows[key] = tuple(parsed)
+            group_rows.extend(parsed)
+        _probe_group_versions[group_key] = group_generation
+        _probe_group_rows[group_key] = tuple(group_rows)
         successful[group_key] = True
         return False
 
@@ -1071,24 +1115,33 @@ async def _refresh_probe_etas(
     # complete generation.
     collected_at = _probe_wall_clock()
     published_monotonic = _probe_mono_clock()
+    selected_routes = sorted({route_key for key in selected_groups for route_key in routes
+                              if key in routes[route_key]})
     for route_key in selected_routes:
         route_groups = routes[route_key]
-        if not all(successful.get(key, False) for key in route_groups):
+        if not all(key in _probe_group_versions for key in route_groups):
+            continue
+        previous = _probe_route_published_versions.get(route_key, {})
+        if previous and not all(_probe_group_versions[key] > previous.get(key, 0)
+                                for key in route_groups):
             continue
         route_probes = tuple(
             probe for probe in unique.values()
             if (probe.operator, probe.route, probe.bound) == route_key
         )
-        rows = tuple(
-            eta for probe in route_probes
-            for eta in refreshed_rows.get(_probe_cache_key(probe), ())
-        )
+        rows = tuple(eta for probe in route_probes
+                     for eta in (_probe_cache.get(_probe_cache_key(probe)) or ()))
+        _probe_generation += 1
         public = ProbeRouteGeneration(
             route_key=route_key,
             rows=rows,
-            generation=generation,
+            generation=_probe_generation,
             collected_at=collected_at,
+            observed_checkpoint_indices=frozenset(p.index for p in route_probes),
         )
+        _probe_route_published_versions[route_key] = {
+            key: _probe_group_versions[key] for key in route_groups
+        }
         _probe_route_generations[route_key] = _StoredProbeGeneration(
             public=public,
             topology_keys=frozenset(_probe_topology_key(probe) for probe in route_probes),
@@ -1114,9 +1167,11 @@ async def fetch_probe_snapshot(
     client: HttpClient,
     probes: Sequence[Any],
     max_per_cycle: int = 36,
+    priorities=None,
 ) -> ProbeEtaSnapshot:
     """Fetch probes and expose only atomically complete route generations."""
-    await fetch_probe_etas(client, probes, max_per_cycle=max_per_cycle)
+    await fetch_probe_etas(client, probes, max_per_cycle=max_per_cycle,
+                           priorities=priorities)
     collected_at = _probe_wall_clock()
     monotonic_at = _probe_mono_clock()
     for stale_key, stale_generation in tuple(_probe_route_generations.items()):
@@ -1151,28 +1206,38 @@ async def fetch_probe_snapshot(
         ):
             _probe_route_generations.pop(key, None)
             continue
-        elapsed_minutes = max(
-            0.0, (collected_at - generation.public.collected_at).total_seconds() / 60.0
-        )
         aged_rows = tuple(
             replace(
                 row,
-                minutes=(
-                    max(0.0, (row.arrival_at - collected_at).total_seconds() / 60.0)
-                    if row.arrival_at is not None
-                    else row.minutes - elapsed_minutes
+                minutes=row.minutes,
+                cache_age_seconds=(
+                    float(getattr(row, "cache_age_seconds", 0.0) or 0.0)
+                    + max(0.0, (collected_at - generation.public.collected_at).total_seconds())
                 ),
             )
             for row in generation.public.rows
-            if (
-                row.arrival_at is not None and row.arrival_at > collected_at
-            ) or (
-                row.arrival_at is None
-                and row.minutes is not None
-                and row.minutes - elapsed_minutes > 0
-            )
         )
         routes.append(replace(generation.public, rows=aged_rows))
+    positioning: list[ProbeEta] = []
+    positioning_checkpoints: set[tuple[str, str, str, int]] = set()
+    for probe in probes:
+        key = _probe_cache_key(probe)
+        cached = _probe_cache.get(key)
+        if cached is None:
+            continue
+        checkpoint = (str(probe.operator), str(probe.route), str(probe.bound), int(probe.index))
+        positioning_checkpoints.add(checkpoint)
+        if cached:
+            positioning.extend(cached)
+        else:
+            positioning.append(ProbeEta(
+                operator=str(probe.operator), route=str(probe.route),
+                bound=str(probe.bound), stop_id=str(probe.stop_id),
+                index=int(probe.index), minutes=None,
+                cache_age_seconds=float(_probe_cache.age_seconds(key) or 0.0),
+            ))
     return ProbeEtaSnapshot(
-        routes=tuple(routes), collected_at=collected_at
+        routes=tuple(routes), collected_at=collected_at,
+        positioning_rows=tuple(positioning),
+        positioning_checkpoints=frozenset(positioning_checkpoints),
     )

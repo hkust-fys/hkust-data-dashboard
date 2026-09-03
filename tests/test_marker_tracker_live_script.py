@@ -50,13 +50,78 @@ def test_backward_and_crossing_violations():
     old = frame(1, ((1, 2.0), (2, 5.0)), (2.0, 5.0))
     new = frame(1, ((2, 1.0), (1, 4.0)), (1.0, 4.0))
     kinds = {x["kind"] for x in compare_adjacent(old, new)[0]}
-    assert {"backward", "identity_order_crossing"} <= kinds
+    assert {"backward_without_eta_evidence", "identity_order_crossing"} <= kinds
+
+
+def evidence_frame(pos=(3.5, 7.5), *, age=1.0, eta=(1, 1), brackets=((3, 4), (7, 8))):
+    tracks = [SimpleNamespace(operator="KMB", route="A", bound="in", position=p, track_id=i + 1,
+                              bracket=brackets[i], eta_minutes=eta[i], eta_arrival_at=None,
+                              boundary_age_seconds=age, source_indices=(int(brackets[i][1]),))
+              for i, p in enumerate(pos)]
+    candidates = [SimpleNamespace(operator="KMB", route="A", bound="in", position=p,
+                                  bracket=brackets[i], eta_minutes=eta[i], boundary_age_seconds=age)
+                 for i, p in enumerate(pos)]
+    return frame_record(SimpleNamespace(
+        complete_routes=(SimpleNamespace(
+            route_key=KEY, generation=1,
+            collected_at=datetime.fromisoformat("2026-01-01T00:00:00+00:00"),
+        ),),
+        positioning_checkpoints=frozenset(
+            ("KMB", "A", "in", index) for index in range(9)
+        ),
+    ),
+        candidates, tracks, {KEY: 20}, "2026-01-01T00:00:00+00:00")
+
+
+def test_fresh_changed_backward_and_bracket_pairs_are_evidence():
+    old, new = evidence_frame(), evidence_frame(pos=(3.0, 7.0), eta=(2, 2))
+    assert not compare_adjacent(old, new)[0]
+    state = {}
+    compare_adjacent(old, new, state)
+    assert state["bracket_checks"][KEY] == 1
+
+
+def test_stale_or_unchanged_motion_is_rejected_and_hold_passes():
+    old = evidence_frame()
+    stale = evidence_frame(pos=(3.0, 7.5), age=6.0, eta=(2, 1))
+    unchanged = evidence_frame(pos=(4.0, 7.5), age=2.0)
+    assert any(x["kind"] == "backward_without_eta_evidence" for x in compare_adjacent(old, stale)[0])
+    assert any(x["kind"] == "movement_without_eta_evidence" for x in compare_adjacent(old, unchanged)[0])
+    assert compare_adjacent(old, evidence_frame())[0] == []
+
+
+def test_minute_baseline_allows_fresh_eta_snap_but_rejects_stale_snap():
+    old = evidence_frame()
+    fresh = evidence_frame(pos=(3.0, 7.0), eta=(2, 2), age=1.0)
+    fresh["utc"] = "2026-01-01T00:01:00+00:00"
+    assert minute_checks(old, fresh) == ([], 2)
+
+    stale = evidence_frame(pos=(3.0, 7.0), eta=(2, 2), age=6.0)
+    stale["utc"] = "2026-01-01T00:01:00+00:00"
+    assert {issue["kind"] for issue in minute_checks(old, stale)[0]} == {
+        "minute_backward"
+    }
+
+
+def test_bracket_qualification_rejects_marker_outside_its_boundary():
+    invalid = evidence_frame(pos=(2.5, 7.5))
+    state = {}
+    issues, _ = compare_adjacent(invalid, invalid, state)
+    assert any(issue["kind"] == "invalid_bracket_evidence" for issue in issues)
+    assert state.get("bracket_checks", {}).get(KEY, 0) == 0
+    assert state["bracket_inconclusive"][KEY] == 1
+
+
+def test_checkpoint_set_is_grouped():
+    snap = SimpleNamespace(positioning_checkpoints=frozenset({("KMB", "A", "in", 2)}), complete_routes=())
+    from scripts.verify_marker_tracker_live import _observed_checkpoint_map
+    assert _observed_checkpoint_map(snap) == {KEY: frozenset({2})}
 
 
 def test_evaluate_run_requires_freshness_and_actual_evidence():
     assert evaluate_run({KEY}, set(), True, 2, 2, 0) == 2
     assert evaluate_run({KEY}, {KEY}, True, 0, 2, 0) == 2
-    assert evaluate_run({KEY}, {KEY}, True, 1, 1, 0) == 0
+    assert evaluate_run({KEY}, {KEY}, True, 1, 1, 0, bracket_count=1) == 0
     assert evaluate_run({KEY}, {KEY}, True, 1, 1, 1) == 1
     assert evaluate_run({KEY}, {KEY}, True, 1, 1, 0, {"transit"}) == 2
 
@@ -82,10 +147,10 @@ def test_route_change_is_never_hidden_by_generation_change():
     assert any(x["kind"] == "identity_route_change" for x in compare_adjacent(old, current)[0])
 
 
-def test_minute_check_requires_mature_observation_and_uses_terminus_exemption():
+def test_minute_check_allows_a_legitimate_hold_and_uses_terminus_exemption():
     old = frame(1, ((1, 2.0),), (2.0,), "2026-01-01T00:00:00+00:00")
     stalled = frame(1, ((1, 2.0),), (2.0,), "2026-01-01T00:01:00+00:00")
-    assert minute_checks(old, stalled)[0][0]["kind"] == "minute_stalled"
+    assert minute_checks(old, stalled)[0] == []
     at_end = frame_record(SimpleNamespace(complete_routes=(SimpleNamespace(
         route_key=KEY, generation=1, collected_at=datetime.fromisoformat("2026-01-01T00:01:00+00:00")),)),
         [item(20.0)], [item(20.0, 1)], {KEY: 20.0}, "2026-01-01T00:01:00+00:00")
@@ -95,6 +160,7 @@ def test_minute_check_requires_mature_observation_and_uses_terminus_exemption():
 def test_json_safe_counters_and_global_pass_threshold():
     state = {"gap_checks": {KEY: 1}, "minute_checks": {KEY: 1}, "gap_inconclusive": {}}
     assert _json_safe_record({"counters": state})["counters"]["gap_checks"]["KMB/A/in"] == 1
+    assert _json_safe_record({"seen": frozenset({2, 1})})["seen"] == [1, 2]
     assert evaluate_run({KEY, ("KMB", "B", "in")}, {KEY}, True, {KEY: 1}, {KEY: 1}, 0) == 2
 
 

@@ -214,7 +214,11 @@ async def fetch_traffic_map(
             mandatory |= {str(stop_id) for stop_id in GMB_STOPS}
             probes = (select_probe_stops(route_lines, mandatory_stop_ids=mandatory)
                       if route_lines else [])
-            probe_task = asyncio.create_task(fetch_probe_snapshot(client, probes))
+            priority_provider = getattr(tracker, "poll_priorities", None)
+            priorities = priority_provider() if callable(priority_provider) else None
+            probe_task = asyncio.create_task(
+                fetch_probe_snapshot(client, probes, priorities=priorities)
+            )
             operation_tasks.append(probe_task)
 
         # Collect independent work together.  return_exceptions keeps a
@@ -239,13 +243,26 @@ async def fetch_traffic_map(
                 log.warning("probe ETA estimation failed: %s", type(probe_result).__name__)
             else:
                 snapshot = probe_result
-                probe_etas = list(getattr(snapshot, "rows", ()) or ())
+                positioning_rows = getattr(snapshot, "positioning_rows", None)
+                probe_etas = list(
+                    positioning_rows
+                    if positioning_rows is not None
+                    else (getattr(snapshot, "rows", ()) or ())
+                )
+                observed_positions: dict[tuple[str, str, str], set[int]] = {}
+                for operator, route, bound, index in getattr(
+                        snapshot, "positioning_checkpoints", ()):
+                    observed_positions.setdefault((operator, route, bound), set()).add(index)
                 try:
                     estimates = estimate_bus_positions(
                         probe_etas,
                         route_lines,
                         _destination_map(groups or [], route_lines),
                         authoritative,
+                        observed_checkpoint_indices=observed_positions or {
+                            tuple(route.route_key): route.observed_checkpoint_indices
+                            for route in getattr(snapshot, "complete_routes", ())
+                        },
                     )
                     audit_estimates = list(estimates)
                 except Exception as exc:  # noqa: BLE001

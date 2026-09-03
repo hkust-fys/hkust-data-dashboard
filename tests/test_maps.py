@@ -864,10 +864,11 @@ def test_bus_label_layout_keeps_opposite_direction_arrows_separate():
     ]
     placed = renderer._layout_bus_labels(markers, draw, renderer._font(13), canvas.size)
     assert len(placed) == 2
-    assert {placement.marker for placement in placed} == {(100, 58.0), (101, 62.0)}
+    assert {placement.marker for placement in placed} == {(100, 60), (101, 60)}
+    assert not renderer._rects_overlap(placed[0].rect, placed[1].rect)
 
 
-def test_bus_label_layout_offsets_grouped_direction_against_opposite_group():
+def test_bus_label_layout_keeps_group_anchor_when_opposite_group_is_nearby():
     canvas = Image.new("RGBA", (240, 120), (255, 255, 255, 255))
     draw = renderer.ImageDraw.Draw(canvas)
     markers = [
@@ -877,7 +878,8 @@ def test_bus_label_layout_offsets_grouped_direction_against_opposite_group():
     ]
     placed = renderer._layout_bus_labels(markers, draw, renderer._font(13), canvas.size)
     assert len(placed) == 2
-    assert {placement.marker for placement in placed} == {(100.0, 58.0), (101.0, 62.0)}
+    assert {placement.marker for placement in placed} == {(100, 60), (101, 60)}
+    assert not renderer._rects_overlap(placed[0].rect, placed[1].rect)
 
 
 def test_grouped_label_spiral_avoids_initially_occupied_slots():
@@ -1194,104 +1196,191 @@ def test_unavoidable_traffic_keeps_bus_label_local_and_bounded():
     assert traffic.overlap(placement.rect)[0] > 0
 
 
-def test_bus_anchor_snaps_perpendicularly_to_traffic_band():
-    base = Image.new("RGB", (200, 120), (232, 238, 233))
-    renderer.ImageDraw.Draw(base).line((70, 50, 130, 50), fill=(22, 224, 152), width=5)
-    occupancy = renderer._traffic_occupancy(base)
-    snapped = occupancy.snap_anchor((100, 60), 0.0)
-    assert snapped[0] == pytest.approx(100)
-    assert 48 <= snapped[1] <= 52
-    assert math.hypot(snapped[0] - 100, snapped[1] - 60) <= 10
-
-
-def test_bus_anchor_without_traffic_retains_exact_route_anchor():
-    occupancy = renderer.TrafficOccupancy(Image.new("L", (200, 120), 0))
-    assert occupancy.snap_anchor((100, 60), 0.75) == (100, 60)
-
-
-def test_bus_anchor_does_not_jump_forward_to_along_route_traffic():
-    mask = Image.new("L", (200, 120), 0)
-    renderer.ImageDraw.Draw(mask).rectangle((107, 58, 145, 62), fill=255)
-    occupancy = renderer.TrafficOccupancy(mask)
-    assert occupancy.snap_anchor((100, 60), 0.0) == (100, 60)
-
-
-def test_saturated_circular_map_icon_does_not_attract_bus_anchor():
-    base = Image.new("RGB", (200, 120), (232, 238, 233))
-    renderer.ImageDraw.Draw(base).ellipse((96, 48, 104, 56), fill=(247, 74, 85))
-    occupancy = renderer._traffic_occupancy(base)
-    assert occupancy.snap_anchor((100, 60), 0.0) == (100, 60)
-
-
-def test_strong_right_road_band_beats_weak_left_speck():
-    mask = Image.new("L", (200, 120), 0)
-    draw = renderer.ImageDraw.Draw(mask)
-    draw.line((92, 52, 108, 52), fill=255, width=1)  # credible but weak left trace
-    draw.line((70, 69, 130, 69), fill=255, width=5)  # dense right road band
-    occupancy = renderer.TrafficOccupancy(mask)
-    snapped = occupancy.snap_anchor((100, 60), 0.0)
-    assert snapped[1] > 60
-    assert snapped[0] == pytest.approx(100)
-
-
-def test_strong_left_road_band_beats_weak_center_trace():
-    mask = Image.new("L", (200, 120), 0)
-    draw = renderer.ImageDraw.Draw(mask)
-    draw.line((92, 60, 108, 60), fill=255, width=1)
-    draw.line((70, 50, 130, 50), fill=255, width=5)
-    occupancy = renderer.TrafficOccupancy(mask)
-    snapped = occupancy.snap_anchor((100, 60), 0.0)
-    assert snapped[1] < 60
-    assert snapped != (100, 60)
-
-
-def test_left_side_anchor_snap_reverses_with_opposing_heading():
-    mask = Image.new("L", (200, 120), 0)
-    draw = renderer.ImageDraw.Draw(mask)
-    draw.rectangle((75, 49, 125, 52), fill=255)
-    draw.rectangle((75, 68, 125, 71), fill=255)
-    occupancy = renderer.TrafficOccupancy(mask)
-    eastbound = occupancy.snap_anchor((100, 60), 0.0)
-    westbound = occupancy.snap_anchor((100, 60), math.pi)
-    assert eastbound[1] < 60  # screen-up is left for eastbound traffic
-    assert westbound[1] > 60  # screen-down is left after heading reversal
-    assert eastbound[0] == pytest.approx(westbound[0], abs=0.01)
-
-
-def test_traffic_snap_then_opposing_separation_keeps_each_arrow_on_its_left():
-    mask = Image.new("L", (240, 120), 0)
-    renderer.ImageDraw.Draw(mask).line((70, 60, 170, 60), fill=255, width=5)
-    traffic = renderer.TrafficOccupancy(mask)
-    original = (120.0, 60.0)
-    east_anchor = traffic.snap_anchor(original, 0.0)
-    west_anchor = traffic.snap_anchor(original, math.pi)
-    markers = [
-        renderer.BusMarker(("91 east",), *east_anchor, Operator.KMB, 0.0),
-        renderer.BusMarker(("91 west",), *west_anchor, Operator.KMB, math.pi),
-    ]
-    canvas = Image.new("RGBA", mask.size, "white")
-    placements = renderer._layout_bus_labels(
-        markers, renderer.ImageDraw.Draw(canvas), renderer._font(13), canvas.size,
-        traffic=traffic,
+def _synthetic_route_mask(
+    *, scale=1.0, heading=0.0, width=3, anchor=(100.0, 60.0),
+    lateral=0.0, length=35.0,
+):
+    mask = Image.new("L", (round(200 * scale), round(120 * scale)), 0)
+    dx, dy = math.cos(heading), -math.sin(heading)
+    nx, ny = dy, -dx
+    center = (
+        anchor[0] * scale + nx * lateral * scale,
+        anchor[1] * scale + ny * lateral * scale,
     )
-    by_heading = {round(placement.heading): placement.marker for placement in placements}
-    east = by_heading[0]
-    west = by_heading[3]
-    # Screen travel left normals: east=(0,-1), west=(0,+1).
-    assert east[1] < east_anchor[1]
-    assert west[1] > west_anchor[1]
-    assert east[0] == pytest.approx(original[0])
-    assert west[0] == pytest.approx(original[0])
+    extent = length * scale
+    renderer.ImageDraw.Draw(mask).line(
+        (
+            round(center[0] - dx * extent), round(center[1] - dy * extent),
+            round(center[0] + dx * extent), round(center[1] + dy * extent),
+        ),
+        fill=255, width=max(1, round(width * scale)),
+    )
+    return mask
 
 
-def test_bus_anchor_snap_radius_scales_with_native_candidate():
-    mask = Image.new("L", (150, 90), 0)
+def _merged_synthetic_bus_anchor(
+    monkeypatch, traffic_or_mask, heading=0.0, scale=1.0, anchor=(100.0, 60.0),
+):
+    monkeypatch.setattr(
+        renderer, "project", lambda *args: (anchor[0] * scale, anchor[1] * scale)
+    )
+    estimate = BusEstimate("R destination", 22.3, 114.2, Operator.KMB, heading)
+    traffic = (
+        traffic_or_mask
+        if isinstance(traffic_or_mask, renderer.TrafficOccupancy)
+        else renderer.TrafficOccupancy(traffic_or_mask)
+    )
+    markers = renderer._merge_bus_markers(
+        [estimate], 0, 0, 0, (traffic.width, traffic.height),
+        renderer.RenderMetrics(scale), traffic,
+    )
+    return markers[0]
+
+
+def _expected_left_anchor(anchor, heading, scale, offset=2.5):
+    dx, dy = math.cos(heading), -math.sin(heading)
+    return (
+        anchor[0] * scale + dy * offset * scale,
+        anchor[1] * scale - dx * offset * scale,
+    )
+
+
+@pytest.mark.parametrize("width", [2, 3, 4, 5, 6])
+def test_route_marker_accepts_realistic_odd_and_even_route_strokes(monkeypatch, width):
+    marker = _merged_synthetic_bus_anchor(
+        monkeypatch, _synthetic_route_mask(width=width)
+    )
+    assert (marker.x, marker.y) == pytest.approx(_expected_left_anchor((100, 60), 0, 1))
+
+
+@pytest.mark.parametrize(
+    ("heading", "anchor"),
+    [(math.radians(8), (100.0, 60.0)), (math.radians(35), (100.35, 60.4))],
+)
+def test_route_marker_accepts_matching_diagonal_heading_and_subpixel_anchor(
+    monkeypatch, heading, anchor,
+):
+    marker = _merged_synthetic_bus_anchor(
+        monkeypatch,
+        _synthetic_route_mask(heading=heading, width=5, anchor=anchor),
+        heading=heading,
+        anchor=anchor,
+    )
+    assert (marker.x, marker.y) == pytest.approx(
+        _expected_left_anchor(anchor, heading, 1), abs=0.01
+    )
+
+
+@pytest.mark.parametrize("lateral", [-1, 1])
+def test_route_marker_accepts_registered_stroke_only_when_core_overlaps_centerline(
+    monkeypatch, lateral,
+):
+    marker = _merged_synthetic_bus_anchor(
+        monkeypatch, _synthetic_route_mask(width=3, lateral=lateral)
+    )
+    assert (marker.x, marker.y) == pytest.approx(_expected_left_anchor((100, 60), 0, 1))
+
+
+@pytest.mark.parametrize("gap", [1, 2])
+def test_route_marker_accepts_short_classification_gap(monkeypatch, gap):
+    mask = _synthetic_route_mask(width=4)
+    renderer.ImageDraw.Draw(mask).rectangle((88, 54, 87 + gap, 66), fill=0)
+    marker = _merged_synthetic_bus_anchor(monkeypatch, mask)
+    assert (marker.x, marker.y) == pytest.approx(_expected_left_anchor((100, 60), 0, 1))
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.9, 0.81, 0.75])
+@pytest.mark.parametrize("distance", [1, 2, 3])
+def test_route_marker_ignores_nearby_parallel_traffic(monkeypatch, distance, scale):
+    base = Image.new("RGB", (round(200 * scale), round(120 * scale)), (232, 238, 233))
+    core = _synthetic_route_mask(scale=scale, width=1, lateral=distance)
+    base.paste((247, 74, 85), mask=core)
+    marker = _merged_synthetic_bus_anchor(
+        monkeypatch, renderer._traffic_occupancy(base, renderer.RenderMetrics(scale)),
+        scale=scale,
+    )
+    assert (marker.x, marker.y) == (100 * scale, 60 * scale)
+
+
+def test_route_marker_without_traffic_is_exact_official_point(monkeypatch):
+    monkeypatch.setattr(renderer, "project", lambda *args: (100, 60))
+    estimate = BusEstimate("R destination", 22.3, 114.2, Operator.KMB, 0.0)
+    without_traffic = renderer._merge_bus_markers([estimate], 0, 0, 0, (200, 120))
+    with_empty_traffic = renderer._merge_bus_markers(
+        [estimate], 0, 0, 0, (200, 120), renderer.DEFAULT_METRICS,
+        renderer.TrafficOccupancy(Image.new("L", (200, 120), 0)),
+    )
+    assert without_traffic == with_empty_traffic
+    assert (without_traffic[0].x, without_traffic[0].y) == (100, 60)
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.9, 0.81, 0.75])
+def test_route_marker_uses_left_offset_when_own_road_has_center_hole(monkeypatch, scale):
+    mask = _synthetic_route_mask(scale=scale, width=4)
     draw = renderer.ImageDraw.Draw(mask)
-    draw.rectangle((55, 32, 95, 34), fill=255)  # just beyond the 0.75x radius
-    occupancy = renderer.TrafficOccupancy(mask)
-    anchor = (75, 45)
-    assert occupancy.snap_anchor(anchor, 0.0, renderer.RenderMetrics(0.75)) == anchor
-    assert occupancy.snap_anchor(anchor, 0.0, renderer.DEFAULT_METRICS)[1] < anchor[1]
+    draw.rectangle(
+        tuple(round(value * scale) for value in (96, 58, 104, 62)), fill=0
+    )  # map text-shaped hole
+    marker = _merged_synthetic_bus_anchor(monkeypatch, mask, scale=scale)
+    assert marker.x == pytest.approx(100 * scale)
+    assert marker.y == pytest.approx((60 - 2.5) * scale)
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.9, 0.81, 0.75])
+def test_rgb_route_core_survives_native_downscaled_mask(monkeypatch, scale):
+    base = Image.new("RGB", (round(200 * scale), round(120 * scale)), (232, 238, 233))
+    base.paste((247, 74, 85), mask=_synthetic_route_mask(scale=scale, width=4))
+    marker = _merged_synthetic_bus_anchor(
+        monkeypatch, renderer._traffic_occupancy(base, renderer.RenderMetrics(scale)),
+        scale=scale,
+    )
+    assert (marker.x, marker.y) == pytest.approx(
+        _expected_left_anchor((100, 60), 0, scale)
+    )
+
+
+def test_shallow_angle_crossing_cannot_gate_route_offset(monkeypatch):
+    mask = _synthetic_route_mask(heading=math.radians(12), width=4)
+    marker = _merged_synthetic_bus_anchor(monkeypatch, mask)
+    assert (marker.x, marker.y) == (100, 60)
+
+
+def test_perpendicular_crossing_cannot_gate_route_offset(monkeypatch):
+    mask = _synthetic_route_mask(heading=math.pi / 2, width=4)
+    marker = _merged_synthetic_bus_anchor(monkeypatch, mask)
+    assert (marker.x, marker.y) == (100, 60)
+
+
+def test_disconnected_route_aligned_fragments_cannot_gate_offset(monkeypatch):
+    mask = Image.new("L", (200, 120), 0)
+    draw = renderer.ImageDraw.Draw(mask)
+    for segment in ((86, 60, 90, 60), (93, 60, 94, 60),
+                    (106, 60, 108, 60), (111, 60, 114, 60)):
+        draw.line(segment, fill=255, width=1)
+    marker = _merged_synthetic_bus_anchor(monkeypatch, mask)
+    assert (marker.x, marker.y) == (100, 60)
+
+
+@pytest.mark.parametrize("shape", ["blob", "solid"])
+def test_blob_or_solid_region_cannot_gate_route_offset(monkeypatch, shape):
+    mask = Image.new("L", (200, 120), 0)
+    draw = renderer.ImageDraw.Draw(mask)
+    bounds = (84, 44, 116, 76)
+    if shape == "blob":
+        draw.ellipse(bounds, fill=255)
+    else:
+        draw.rectangle(bounds, fill=255)
+    marker = _merged_synthetic_bus_anchor(monkeypatch, mask)
+    assert (marker.x, marker.y) == (100, 60)
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.9, 0.81, 0.75])
+def test_route_marker_offset_reverses_with_heading(monkeypatch, scale):
+    mask = _synthetic_route_mask(scale=scale, width=4)
+    eastbound = _merged_synthetic_bus_anchor(monkeypatch, mask, 0.0, scale)
+    westbound = _merged_synthetic_bus_anchor(monkeypatch, mask, math.pi, scale)
+    assert eastbound.y == pytest.approx((60 - 2.5) * scale)
+    assert westbound.y == pytest.approx((60 + 2.5) * scale)
 
 
 def test_public_stops_merge_by_place_and_direction_but_keep_opposite_direction():
@@ -1719,6 +1808,62 @@ def test_bus_markers_merge_matching_route_operator_at_same_position():
     assert [marker.routes for marker in markers] == [
         ("91 Diamond Hill",), ("91 Diamond Hill",), ("91M Po Lam",)
     ]
+
+
+def test_mixed_route_support_preserves_anchors_through_label_layout(monkeypatch):
+    estimates = [
+        BusEstimate("R destination", lat, 114.2, Operator.KMB, 0.0)
+        for lat in (1.0, 1.0, 2.0, 2.0)
+    ]
+    monkeypatch.setattr(
+        renderer, "project",
+        lambda lat, *_args: (100.0, 60.0 if lat == 1.0 else 58.0),
+    )
+    traffic = renderer.TrafficOccupancy(_synthetic_route_mask(width=1))
+
+    markers = renderer._merge_bus_markers(
+        estimates, 0, 0, 0, (200, 120), traffic=traffic
+    )
+
+    assert len(markers) == 4
+    assert [marker.routes for marker in markers] == [("R destination",)] * 4
+    assert [(marker.x, marker.y) for marker in markers] == [
+        (100.0, 57.5), (100.0, 57.5),
+        (100.0, 58.0), (100.0, 58.0),
+    ]
+    assert [marker.route_supported for marker in markers] == [True, True, False, False]
+
+    canvas = Image.new("RGBA", (200, 120), "white")
+    placements = renderer._layout_bus_labels(
+        markers, renderer.ImageDraw.Draw(canvas), renderer._font(13), canvas.size
+    )
+
+    assert len(placements) == 2
+    assert {placement.marker for placement in placements} == {
+        (100.0, 57.5), (100.0, 58.0),
+    }
+    assert [len(placement.rows) for placement in placements] == [2, 2]
+
+
+def test_supported_opposing_markers_keep_only_fixed_route_offset(monkeypatch):
+    estimates = [
+        BusEstimate("R east", 1.0, 114.2, Operator.KMB, 0.0),
+        BusEstimate("R west", 1.0, 114.2, Operator.KMB, math.pi),
+    ]
+    monkeypatch.setattr(renderer, "project", lambda *_args: (100.0, 60.0))
+    traffic = renderer.TrafficOccupancy(_synthetic_route_mask(width=4))
+    markers = renderer._merge_bus_markers(
+        estimates, 0, 0, 0, (200, 120), traffic=traffic
+    )
+    canvas = Image.new("RGBA", (200, 120), "white")
+    placements = renderer._layout_bus_labels(
+        markers, renderer.ImageDraw.Draw(canvas), renderer._font(13), canvas.size
+    )
+
+    assert all(marker.route_supported for marker in markers)
+    assert {placement.marker for placement in placements} == {
+        (100.0, 57.5), (100.0, 62.5),
+    }
 
 
 @pytest.mark.parametrize("scale", [1.0, 0.75])

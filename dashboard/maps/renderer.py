@@ -73,6 +73,7 @@ class BusMarker(NamedTuple):
     operator: Operator
     heading: float
     unreliable: bool = False
+    route_supported: bool = False
 
 
 class LabelPlacement(NamedTuple):
@@ -156,13 +157,15 @@ def _traffic_cache_key(image: Image.Image) -> tuple[int, int, bytes]:
 class TrafficOccupancy:
     """Integral mask of saturated Google traffic-layer road pixels."""
 
-    __slots__ = ("height", "integral", "snap_integral", "stride", "width")
+    __slots__ = ("height", "integral", "route_integral", "stride", "width")
 
-    def __init__(self, mask: Image.Image, snap_mask: Image.Image | None = None) -> None:
+    def __init__(self, mask: Image.Image, route_mask: Image.Image | None = None) -> None:
         self.width, self.height = mask.size
         self.stride = self.width + 1
         self.integral = self._build_integral(mask)
-        self.snap_integral = self._build_integral(snap_mask if snap_mask is not None else mask)
+        self.route_integral = self._build_integral(
+            route_mask if route_mask is not None else mask
+        )
 
     def _build_integral(self, mask: Image.Image) -> array:
         integral = array("I", [0]) * ((self.width + 1) * (self.height + 1))
@@ -199,71 +202,119 @@ class TrafficOccupancy:
         """Return broad traffic pixels and clipped area covered by ``rect``."""
         return self._overlap(rect, self.integral)
 
-    def _snap_overlap(self, rect: tuple[float, float, float, float]) -> tuple[int, int]:
-        return self._overlap(rect, self.snap_integral)
-
-    def snap_anchor(
+    def route_support(
         self,
         anchor: tuple[float, float],
         heading: float,
         metrics: RenderMetrics = DEFAULT_METRICS,
-    ) -> tuple[float, float]:
-        """Snap perpendicularly to a credible, route-aligned traffic band.
+    ) -> bool:
+        """Return whether traffic supports the official point's local route.
 
-        Route progress and heading remain authoritative. Hong Kong's left-side
-        traffic is encoded by positive offsets along screen travel's left
-        normal ``(dy, -dx)``. Density and continuous along-heading support can
-        outweigh side preference, preventing a small icon from beating a road.
+        This is deliberately only a boolean gate. The raster cannot select the
+        marker position. Dense centerline continuity, a stable lateral fit, and
+        stronger along-route than cross-route evidence are all required. A
+        one-pixel core wholly beside the centerline is intentionally rejected:
+        it is indistinguishable from a nearby parallel road.
         """
         dx, dy = math.cos(heading), -math.sin(heading)
         nx, ny = dy, -dx
-        radius = metrics.px(10)
-        probe_radius = metrics.px(1.15, minimum=0.75)
-        along_offsets = tuple(item * metrics.scale for item in (-8, -4, 0, 4, 8))
-        samples: list[tuple[int, int]] = []
-        for offset in range(-math.ceil(radius), math.ceil(radius) + 1):
-            if abs(offset) > radius:
-                continue
-            support = []
-            for along in along_offsets:
-                x = anchor[0] + nx * offset + dx * along
-                y = anchor[1] + ny * offset + dy * along
-                count, _area = self._snap_overlap(
-                    (x - probe_radius, y - probe_radius,
-                     x + probe_radius, y + probe_radius)
-                )
-                support.append(count)
-            # A route-aligned traffic stroke persists over the full 16
-            # logical-pixel span. Isolated circular POIs and short labels do not.
-            if all(count > 0 for count in support):
-                samples.append((offset, sum(support)))
-        if not samples:
-            return anchor
+        scale = metrics.scale
+        extent = max(8, round(14 * scale))
+        hole_radius = max(2, round(4 * scale))
+        normal_radius = max(4, math.ceil(5 * scale))
+        max_gap = max(1, math.floor(2 * scale + 1e-9))
 
-        bands: list[list[tuple[int, int]]] = []
-        for sample in samples:
-            if not bands or sample[0] > bands[-1][-1][0] + 1:
-                bands.append([sample])
-            else:
-                bands[-1].append(sample)
-        def band_details(band: list[tuple[int, int]]) -> tuple[float, float]:
-            total = sum(count for _offset, count in band)
-            center = sum(offset * count for offset, count in band) / total
-            # Width/density dominate a modest left-side bonus. A strong road
-            # band can therefore beat a weak saturated speck on the left.
-            quality = total / len(band) + len(band) * 2.0
-            side_bonus = 8.0 if center > 0 else (2.0 if abs(center) <= 1 else 0.0)
-            score = quality + side_bonus - abs(center) * 0.35
-            return score, center
+        def occupied(along: int, normal: int = 0) -> bool:
+            x = round(anchor[0] + dx * along + nx * normal)
+            y = round(anchor[1] + dy * along + ny * normal)
+            if not (0 <= x < self.width and 0 <= y < self.height):
+                return False
+            count, _area = self._overlap(
+                (x, y, x + 1, y + 1), self.route_integral
+            )
+            return bool(count)
 
-        scored = [(band_details(band), band) for band in bands]
-        (_quality, center), band = max(
-            scored,
-            key=lambda item: (item[0][0], item[0][1] > 0, -abs(item[0][1])),
+        def profile(along: int) -> tuple[float, float] | None:
+            samples = [
+                occupied(along, normal)
+                for normal in range(-normal_radius, normal_radius + 1)
+            ]
+            if not samples[normal_radius]:
+                return None
+            low = high = normal_radius
+            while low and samples[low - 1]:
+                low -= 1
+            while high + 1 < len(samples) and samples[high + 1]:
+                high += 1
+            if low == 0 and high == len(samples) - 1:
+                return None
+            center = ((low + high) / 2 - normal_radius) / scale
+            width = (high - low + 1) / scale
+            return center, width
+
+        def longest_gap(items: list[tuple[float, float] | None]) -> int:
+            longest = current = 0
+            for item in items:
+                if item is None:
+                    current += 1
+                    longest = max(longest, current)
+                else:
+                    current = 0
+            return longest
+
+        def median(values: list[float]) -> float:
+            ordered = sorted(values)
+            middle = len(ordered) // 2
+            if len(ordered) % 2:
+                return ordered[middle]
+            return (ordered[middle - 1] + ordered[middle]) / 2
+
+        arm_offsets = [
+            *range(-extent, -hole_radius),
+            *range(hole_radius + 1, extent + 1),
+        ]
+        split = len(range(-extent, -hole_radius))
+        profiles = [profile(along) for along in arm_offsets]
+        arms = (profiles[:split], profiles[split:])
+        for arm in arms:
+            supported = sum(item is not None for item in arm)
+            if supported < math.ceil(len(arm) * 0.8) or longest_gap(arm) > max_gap:
+                return False
+
+        fitted = [
+            (along / scale, item[0], item[1])
+            for along, item in zip(arm_offsets, profiles, strict=True)
+            if item is not None
+        ]
+        centers = [center for _along, center, _width in fitted]
+        widths = [width for _along, _center, width in fitted]
+        if (
+            abs(median(centers)) > 1.0
+            or max(centers) - min(centers) > 2.0
+            or median(widths) > 7.25
+        ):
+            return False
+
+        mean_along = sum(along for along, _center, _width in fitted) / len(fitted)
+        mean_center = sum(center for _along, center, _width in fitted) / len(fitted)
+        denominator = sum((along - mean_along) ** 2 for along, _center, _width in fitted)
+        slope = (
+            sum(
+                (along - mean_along) * (center - mean_center)
+                for along, center, _width in fitted
+            )
+            / denominator
+            if denominator
+            else float("inf")
         )
-        total = sum(count for _offset, count in band)
-        offset = sum(offset * count for offset, count in band) / total
-        return anchor[0] + nx * offset, anchor[1] + ny * offset
+        if abs(math.atan(slope)) > math.radians(8):
+            return False
+
+        aligned_strength = len(fitted) / len(arm_offsets)
+        perpendicular_strength = (
+            sum(occupied(0, offset) for offset in arm_offsets) / len(arm_offsets)
+        )
+        return aligned_strength >= perpendicular_strength + 0.35
 
 
 def _traffic_occupancy(
@@ -283,27 +334,14 @@ def _traffic_occupancy(
     )
     saturation_mask = saturation.point([255 if item >= 105 else 0 for item in range(256)])
     value_mask = value.point([255 if item >= 85 else 0 for item in range(256)])
-    mask = ImageChops.multiply(ImageChops.multiply(hue_mask, saturation_mask), value_mask)
-    red, green, blue = rgb.split()
-    snap_mask = Image.new("L", rgb.size, 0)
-    tolerance = 38
-    for palette_red, palette_green, palette_blue in GOOGLE_TRAFFIC_COLORS:
-        red_match = red.point(
-            [255 if abs(item - palette_red) <= tolerance else 0 for item in range(256)]
-        )
-        green_match = green.point(
-            [255 if abs(item - palette_green) <= tolerance else 0 for item in range(256)]
-        )
-        blue_match = blue.point(
-            [255 if abs(item - palette_blue) <= tolerance else 0 for item in range(256)]
-        )
-        matched = ImageChops.multiply(ImageChops.multiply(red_match, green_match), blue_match)
-        snap_mask = ImageChops.lighter(snap_mask, matched)
+    route_mask = ImageChops.multiply(
+        ImageChops.multiply(hue_mask, saturation_mask), value_mask
+    )
+    mask = route_mask
     dilation = metrics.integer(1)
     if dilation:
         mask = mask.filter(ImageFilter.MaxFilter(dilation * 2 + 1))
-        snap_mask = snap_mask.filter(ImageFilter.MaxFilter(dilation * 2 + 1))
-    return TrafficOccupancy(mask, snap_mask)
+    return TrafficOccupancy(mask, route_mask)
 
 
 def _cached_traffic_occupancy(
@@ -415,10 +453,7 @@ def _draw_marker_on_left(
     square: bool,
     metrics: RenderMetrics = DEFAULT_METRICS,
 ) -> tuple[float, float]:
-    # Geographic heading uses +latitude as up.  After converting to screen
-    # travel (dx, dy), its left normal is (dy, -dx).
-    dx, dy = math.cos(heading), -math.sin(heading)
-    x, y = x + dy * metrics.px(7), y - dx * metrics.px(7)
+    x, y = _point_on_left(x, y, heading, 7, metrics)
     # PIL bounds are inclusive.  Integer bounds ending at start + size - 1
     # make the circle diameter and square side exactly STOP_MARKER_SIZE px.
     marker_size = metrics.integer(STOP_MARKER_SIZE, minimum=4)
@@ -437,6 +472,18 @@ def _draw_marker_on_left(
             width=outline_width,
         )
     return x, y
+
+
+def _point_on_left(
+    x: float,
+    y: float,
+    heading: float,
+    distance: float,
+    metrics: RenderMetrics = DEFAULT_METRICS,
+) -> tuple[float, float]:
+    """Offset a projected point toward the left side of screen travel."""
+    dx, dy = math.cos(heading), -math.sin(heading)
+    return x + dy * metrics.px(distance), y - dx * metrics.px(distance)
 
 
 def _nearest_road_heading(
@@ -625,6 +672,7 @@ def _layout_bus_labels(
                     <= metrics.px(8)
                     and _angular_distance(existing[0].heading, marker.heading)
                     <= math.radians(28)
+                    and existing[0].route_supported == marker.route_supported
                 )
             ),
             None,
@@ -633,38 +681,6 @@ def _layout_bus_labels(
             anchor_groups.append([marker])
         else:
             group.append(marker)
-
-    # Keep opposite carriageways visually legible when their geographic
-    # anchors coincide.  This is a display-only nudge; source coordinates and
-    # travel headings remain unchanged.  Apply it before label placement so
-    # the arrow and its label use the same deterministic visual anchor.
-    adjusted_groups: set[int] = set()
-    for left_index, left_group in enumerate(anchor_groups):
-        for right_group in anchor_groups[left_index + 1 :]:
-            first, second = left_group[0], right_group[0]
-            if (
-                math.hypot(first.x - second.x, first.y - second.y) <= metrics.px(8)
-                and _angular_distance(first.heading, second.heading) >= math.radians(120)
-            ):
-                first_dx, first_dy = math.cos(first.heading), -math.sin(first.heading)
-                second_dx, second_dy = math.cos(second.heading), -math.sin(second.heading)
-                # Nudge each heading independently towards its own left-side
-                # carriageway; never infer the second side by simple negation.
-                first_nx, first_ny = first_dy, -first_dx
-                second_nx, second_ny = second_dy, -second_dx
-                offset = metrics.px(2.0)
-                right_index = left_index + 1 + anchor_groups[left_index + 1 :].index(right_group)
-                if left_index in adjusted_groups or right_index in adjusted_groups:
-                    continue
-                left_group[:] = [
-                    m._replace(x=m.x + first_nx * offset, y=m.y + first_ny * offset)
-                    for m in left_group
-                ]
-                right_group[:] = [
-                    m._replace(x=m.x + second_nx * offset, y=m.y + second_ny * offset)
-                    for m in right_group
-                ]
-                adjusted_groups.update((left_index, right_index))
 
     placed: list[LabelPlacement] = []
     occupied: list[tuple[float, float, float, float]] = list(placed_rects)
@@ -1277,7 +1293,7 @@ def _merge_bus_markers(
     traffic: TrafficOccupancy | None = None,
 ) -> list[BusMarker]:
     grouped: dict[
-        tuple[Operator, str, int, int, int, bool],
+        tuple[Operator, str, int, int, int, bool, bool],
         tuple[set[str], float, float, float, int],
     ] = {}
     projected = []
@@ -1285,8 +1301,11 @@ def _merge_bus_markers(
         x, y = project(estimate.lat, estimate.lon, center_lat, center_lon, zoom, size)
         if not (0 <= x < size[0] and 0 <= y < size[1]):
             continue
-        if traffic is not None:
-            x, y = traffic.snap_anchor((x, y), estimate.heading, metrics)
+        route_supported = traffic is not None and traffic.route_support(
+            (x, y), estimate.heading, metrics
+        )
+        if route_supported:
+            x, y = _point_on_left(x, y, estimate.heading, 2.5, metrics)
         # Group by the full label so same-route opposite-destination markers
         # (e.g. 91 Diamond Hill vs 91 Clear Water Bay) stay distinct.
         projected.append(
@@ -1297,17 +1316,19 @@ def _merge_bus_markers(
                 y,
                 estimate.operator,
                 estimate.heading,
+                route_supported,
                 bool(getattr(estimate, "unreliable", False)),
             )
         )
     for row in sorted(projected):
-        _operator_name, label, x, y, operator, heading, unreliable = row
+        _operator_name, label, x, y, operator, heading, route_supported, unreliable = row
         key = (
             operator,
             label,
             round(x / metrics.px(4, minimum=1.0)),
             round(y / metrics.px(4, minimum=1.0)),
             round(heading / math.radians(10)),
+            route_supported,
             unreliable,
         )
         routes, canonical_x, canonical_y, canonical_heading, count = grouped.setdefault(
@@ -1317,7 +1338,7 @@ def _merge_bus_markers(
         grouped[key] = (routes, canonical_x, canonical_y, canonical_heading, count + 1)
     markers: list[BusMarker] = []
     for (
-        operator, _route, _x, _y, _heading, unreliable
+        operator, _route, _x, _y, _heading, _route_supported, unreliable
     ), (routes, x, y, heading, count) in sorted(
         grouped.items(),
         key=lambda item: (item[0][0].value, item[1][1], item[1][2], item[0][1:]),
@@ -1325,7 +1346,9 @@ def _merge_bus_markers(
         # Preserve multiplicity: layout coalesces these singleton markers into
         # repeated rows while retaining one canonical arrow and leader.
         markers.extend(
-            BusMarker((label,), x, y, operator, heading, unreliable)
+            BusMarker(
+                (label,), x, y, operator, heading, unreliable, _route_supported
+            )
             for _ in range(count)
             for label in sorted(routes)
         )

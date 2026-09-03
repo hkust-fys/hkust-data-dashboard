@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import sys
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -150,6 +151,50 @@ def _route_maps(record):
             for key, values in record.get("tracks", {}).items()}
 
 
+def _provenance_signature(evidence):
+    """Return identity evidence used to match candidates to displayed tracks.
+
+    Boundary age is deliberately excluded: it describes freshness of the
+    observation, not the identity of the ETA/bracket that produced it.
+    """
+    if not isinstance(evidence, dict):
+        return None
+    bracket = evidence.get("bracket")
+    eta_minutes = evidence.get("eta_minutes")
+    eta_arrival_at = evidence.get("eta_arrival_at")
+    source_indices = evidence.get("source_indices")
+    source_observations = evidence.get("source_observations")
+    if (bracket is None and eta_minutes is None and eta_arrival_at is None
+            and not source_indices and not source_observations):
+        return None
+    observations = tuple(
+        tuple(item) if isinstance(item, (list, tuple)) else item
+        for item in (source_observations or ())
+    )
+    return (tuple(bracket) if bracket is not None else None, eta_minutes,
+            eta_arrival_at, tuple(source_indices or ()), observations)
+
+
+def _spacing_provenance_comparable(record, key, tracks, candidates):
+    """Check whether current candidate/track positions have a safe bijection."""
+    candidate_evidence = record.get("candidate_evidence", {}).get(key)
+    track_evidence = record.get("track_evidence", {}).get(key)
+    if candidate_evidence is None and track_evidence is None:
+        return True
+    candidate_signatures = [
+        _provenance_signature(evidence) for evidence in (candidate_evidence or ())
+    ]
+    track_signatures = [
+        _provenance_signature((track_evidence or {}).get(track))
+        for track, _ in tracks
+    ]
+    if not any(candidate_signatures) and not any(track_signatures):
+        return True
+    if any(signature is None for signature in candidate_signatures + track_signatures):
+        return False
+    return Counter(candidate_signatures) == Counter(track_signatures)
+
+
 def _eta_allows_motion(old, new, key, track):
     before = old.get("track_evidence", {}).get(key, {}).get(track, {})
     after = new.get("track_evidence", {}).get(key, {}).get(track, {})
@@ -269,14 +314,15 @@ def compare_adjacent(old, new, state=None):
             issues.append({"kind": "identity_order_crossing", "route": key})
         # Gap evidence is a property of this complete frame, never an inferred match.
         candidates = new.get("candidates", {}).get(key, ())
-        if current_generation and len(candidates) == len(b) >= 2:
+        provenance_comparable = _spacing_provenance_comparable(new, key, b.items(), candidates)
+        if current_generation and len(candidates) == len(b) >= 2 and provenance_comparable:
             checks += len(candidates) - 1
             state["gap_checks"][key] = state["gap_checks"].get(key, 0) + len(candidates) - 1
             if any(abs((candidates[i + 1] - candidates[i]) -
                        (tuple(b.values())[i + 1] - tuple(b.values())[i])) > GAP_TOLERANCE
                    for i in range(len(candidates) - 1)):
                 issues.append({"kind": "spacing_mismatch", "route": key})
-        elif current_generation and len(candidates) != len(b):
+        elif current_generation and (len(candidates) != len(b) or not provenance_comparable):
             state["gap_inconclusive"][key] = state["gap_inconclusive"].get(key, 0) + 1
         valid_tracks = [
             (track, position)

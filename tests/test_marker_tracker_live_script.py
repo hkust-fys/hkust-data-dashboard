@@ -46,6 +46,85 @@ def test_spacing_requires_equal_complete_cardinality():
     assert not any(x["kind"] == "spacing_mismatch" for x in compare_adjacent(old, unequal)[0])
 
 
+def provenance_frame(candidate_positions, track_positions, *, generation=1,
+                     provenance=((1, (1, 2), (3,)), (2, (3, 4), (5,))),
+                     track_provenance=None,
+                     stamp="2026-01-01T00:00:00+00:00"):
+    route = SimpleNamespace(route_key=KEY, generation=generation,
+                            collected_at=datetime.fromisoformat(stamp), rows=())
+
+    def evidence(position, item_provenance):
+        eta, bracket, sources = item_provenance
+        return SimpleNamespace(operator="KMB", route="A", bound="in",
+                               position=position, bracket=bracket,
+                               eta_minutes=eta, eta_arrival_at=None,
+                               boundary_age_seconds=1.0, source_indices=sources)
+
+    candidates = [evidence(position, provenance[index])
+                  for index, position in enumerate(candidate_positions)]
+    track_provenance = provenance if track_provenance is None else track_provenance
+    tracks = [evidence(position, track_provenance[index])
+              for index, position in enumerate(track_positions)]
+    for index, track in enumerate(tracks):
+        track.track_id = index + 1
+    return frame_record(SimpleNamespace(complete_routes=(route,), rows=()),
+                        candidates, tracks, {KEY: 20}, stamp)
+
+
+def test_spacing_turnover_with_equal_cardinality_is_inconclusive_without_provenance_bijection():
+    old = provenance_frame((1.0, 5.0), (1.0, 5.0), generation=1)
+    new = provenance_frame((1.0, 2.0), (1.0, 5.0), generation=2,
+                           provenance=((3, (1, 2), (7,)), (4, (3, 4), (8,))),
+                           track_provenance=((1, (1, 2), (3,)), (2, (3, 4), (5,))))
+    state = {}
+    issues, checks = compare_adjacent(old, new, state)
+    assert not any(x["kind"] == "spacing_mismatch" for x in issues)
+    assert checks == 0 and state["gap_inconclusive"][KEY] == 1
+    repeated = provenance_frame((1.0, 2.0), (1.0, 5.0), generation=2,
+                                provenance=((3, (1, 2), (7,)), (4, (3, 4), (8,))),
+                                track_provenance=((1, (1, 2), (3,)), (2, (3, 4), (5,))))
+    issues, checks = compare_adjacent(new, repeated, state)
+    assert not any(x["kind"] == "spacing_mismatch" for x in issues)
+    assert checks == 0 and state["gap_inconclusive"][KEY] == 2
+
+
+def test_spacing_provenance_uses_duplicate_multisets():
+    same = ((1, (1, 2), (3,)), (1, (1, 2), (3,)))
+    old = provenance_frame((1.0, 5.0), (1.0, 5.0), provenance=same)
+    matching = provenance_frame((1.0, 5.0), (1.0, 5.0), provenance=same)
+    assert compare_adjacent(old, matching)[1] == 1
+    different = provenance_frame((1.0, 2.0), (1.0, 5.0), provenance=same)
+    different["candidate_evidence"][KEY][1]["source_indices"] = [9]
+    state = {}
+    issues, checks = compare_adjacent(old, different, state)
+    assert not any(x["kind"] == "spacing_mismatch" for x in issues)
+    assert checks == 0 and state["gap_inconclusive"][KEY] == 1
+
+
+def test_matching_provenance_still_reports_real_spacing_error():
+    old = provenance_frame((1.0, 5.0), (1.0, 5.0))
+    bad = provenance_frame((1.0, 2.0), (1.0, 5.0))
+    issues, checks = compare_adjacent(old, bad)
+    assert any(x["kind"] == "spacing_mismatch" for x in issues)
+    assert checks == 1
+
+
+def test_spacing_provenance_accepts_json_style_observation_lists():
+    old = provenance_frame((1.0, 5.0), (1.0, 5.0))
+    replayed = provenance_frame((1.0, 5.0), (1.0, 5.0))
+    replayed["candidate_evidence"][KEY][0]["source_observations"] = [
+        ["probe", 1]
+    ]
+    replayed["track_evidence"][KEY][1]["source_observations"] = [
+        ["probe", 1]
+    ]
+
+    issues, checks = compare_adjacent(old, replayed)
+
+    assert not any(x["kind"] == "spacing_mismatch" for x in issues)
+    assert checks == 1
+
+
 def test_backward_and_crossing_violations():
     old = frame(1, ((1, 2.0), (2, 5.0)), (2.0, 5.0))
     new = frame(1, ((2, 1.0), (1, 4.0)), (1.0, 4.0))

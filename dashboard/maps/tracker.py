@@ -51,12 +51,15 @@ class MarkerTracker:
         )
         self._routes = {}
         self._generations = {}
+        self._terminal_indices = {}
         self._next_id = 1
         self._lock = asyncio.Lock()
 
     async def update(self, snapshot, candidates, route_lines=()):
         async with self._lock:
-            return self._update(snapshot, list(candidates or ()), route_lines)
+            return self._update(
+                snapshot, list(candidates or ()), list(route_lines or ())
+            )
 
     async def track(self, snapshot, candidates, route_lines=()):
         return await self.update(snapshot, candidates, route_lines)
@@ -64,6 +67,7 @@ class MarkerTracker:
     def clear(self):
         self._routes.clear()
         self._generations.clear()
+        self._terminal_indices.clear()
         self._next_id = 1
 
     @property
@@ -74,6 +78,8 @@ class MarkerTracker:
         """Return the bounded route/checkpoint hints needed by the next poll."""
         priorities = {}
         for key, tracks in self._routes.items():
+            if not tracks:
+                continue
             endpoints = set()
             for track in tracks.values():
                 for endpoint in getattr(track.estimate, "bracket", None) or ():
@@ -81,14 +87,27 @@ class MarkerTracker:
                         endpoints.add(endpoint)
                     elif isinstance(endpoint, float) and endpoint.is_integer() and endpoint >= 0:
                         endpoints.add(int(endpoint))
+            terminal = self._terminal_indices.get(key)
+            if terminal is not None:
+                endpoints.add(terminal)
             if endpoints:
+                selected = sorted(endpoints)
+                if terminal is not None and terminal in endpoints:
+                    selected = sorted(
+                        set(sorted(endpoints - {terminal})[
+                            :MAX_PRIORITY_ENDPOINTS_PER_ROUTE - 1
+                        ]) | {terminal}
+                    )
                 priorities[key] = frozenset(
-                    sorted(endpoints)[:MAX_PRIORITY_ENDPOINTS_PER_ROUTE]
+                    selected[:MAX_PRIORITY_ENDPOINTS_PER_ROUTE]
                 )
         return priorities
 
     def _update(self, snapshot, candidates, route_lines):
         now = _timestamp(getattr(snapshot, "collected_at", 0.0))
+        route_terminals = _route_terminals(route_lines)
+        for key in set(self._routes) & route_terminals.keys():
+            self._terminal_indices[key] = route_terminals[key]
         complete = {
             tuple(route.route_key): route
             for route in getattr(snapshot, "complete_routes", ())
@@ -97,6 +116,8 @@ class MarkerTracker:
         keys = set(complete)
         keys.update(key for key in grouped if key in self._routes)
         for key in sorted(keys):
+            if key in route_terminals:
+                self._terminal_indices[key] = route_terminals[key]
             rows = sorted(grouped.get(key, ()), key=lambda item: float(item.position or 0.0))
             generation = getattr(complete.get(key), "generation", None)
             tracks = self._routes.get(key)
@@ -218,6 +239,7 @@ class MarkerTracker:
                     if not self._routes[key]:
                         self._routes.pop(key, None)
                         self._generations.pop(key, None)
+                        self._terminal_indices.pop(key, None)
             output.extend(
                 replace(track.estimate, track_id=track.track_id, operator_code=key[0])
                 for track in ordered
@@ -259,6 +281,11 @@ class MarkerTracker:
             key = next(iter(self._routes))
             self._routes.pop(key, None)
             self._generations.pop(key, None)
+            self._terminal_indices.pop(key, None)
+        active_keys = set(self._routes)
+        for key in list(self._terminal_indices):
+            if key not in active_keys:
+                self._terminal_indices.pop(key, None)
 
 
 def _group(items):
@@ -393,6 +420,20 @@ def _route_max(estimate, route_lines):
         if line_key == key:
             return max(0.0, float(len(list(getattr(line, "stops", ()))) - 1))
     return inf
+
+
+def _route_terminals(route_lines):
+    terminals = {}
+    for line in route_lines:
+        stops = list(getattr(line, "stops", ()) or ())
+        if stops:
+            key = (
+                str(getattr(line, "operator", "")),
+                str(getattr(line, "route", "")),
+                str(getattr(line, "bound", "")),
+            )
+            terminals[key] = len(stops) - 1
+    return terminals
 
 
 __all__ = ["MarkerTracker"]

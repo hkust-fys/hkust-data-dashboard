@@ -1383,6 +1383,31 @@ def test_all_stop_boundary_controls_proportion_and_ignores_unrelated_cache_age()
     assert estimates[0].boundary_age_seconds == 1
 
 
+def test_consecutive_empty_stops_then_downstream_observation_forms_one_boundary_marker():
+    line = _line(stop_count=7)
+    rows = [
+        # Several consecutive checkpoints see zero instances of this vehicle.
+        Probe("KMB", "X", "outbound", 1, None, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 3, None, cache_age_seconds=0),
+        # Stop 4 first sees it; stop 5 corroborates the same ETA ladder.
+        Probe("KMB", "X", "outbound", 4, 1, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 5, 3, cache_age_seconds=0),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={("KMB", "X", "outbound"): range(7)},
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].source_indices == frozenset({4, 5})
+    assert estimates[0].bracket == (3.0, 4.0)
+    assert estimates[0].eta_minutes == 1
+    assert estimates[0].position == 3.5
+
+
 def test_staggered_immutable_minutes_are_normalized_only_for_identity_matching():
     line = _line(stop_count=7)
     rows = [

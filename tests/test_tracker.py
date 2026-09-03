@@ -245,6 +245,68 @@ async def test_priority_poll_covers_every_active_marker_boundary():
 
 
 @pytest.mark.asyncio
+async def test_priority_poll_includes_route_terminus_with_marker_boundaries():
+    tracker = MarkerTracker()
+    candidates = [_candidate(1.5, bracket=(1.0, 2.0), boundary_age=0)]
+    await tracker.update(_snapshot(1), candidates, [_line(stops=6)])
+    assert tracker.poll_priorities() == {
+        ("KMB", "R", "out"): frozenset({1, 2, 5})
+    }
+
+
+@pytest.mark.asyncio
+async def test_priority_poll_ignores_terminus_without_an_active_marker():
+    tracker = MarkerTracker()
+    await tracker.update(_snapshot(1), [], [_line(stops=6)])
+    assert tracker.poll_priorities() == {}
+
+
+@pytest.mark.asyncio
+async def test_priority_poll_keeps_terminals_separate_for_each_direction():
+    tracker = MarkerTracker()
+    first_key = ("KMB", "A", "out")
+    second_key = ("KMB", "B", "in")
+    snapshot = ProbeEtaSnapshot(
+        (ProbeRouteGeneration(first_key, (), 1, BASE_TIME),
+         ProbeRouteGeneration(second_key, (), 1, BASE_TIME)),
+        BASE_TIME,
+    )
+    await tracker.update(
+        snapshot,
+        [_candidate(1.5, route="A", bound="out", bracket=(1.0, 2.0), boundary_age=0),
+         _candidate(2.5, route="B", bound="in", bracket=(2.0, 3.0), boundary_age=0)],
+        [_line(route="A", bound="out", stops=6),
+         _line(route="B", bound="in", stops=9)],
+    )
+    assert tracker.poll_priorities() == {
+        first_key: frozenset({1, 2, 5}),
+        second_key: frozenset({2, 3, 8}),
+    }
+
+
+@pytest.mark.asyncio
+async def test_priority_poll_cap_retains_route_terminus():
+    tracker = MarkerTracker()
+    candidates = [
+        _candidate(index * 2 + 0.5, bracket=(index * 2, index * 2 + 1), boundary_age=0)
+        for index in range(20)
+    ]
+    await tracker.update(_snapshot(1), candidates, [_line(stops=1000)])
+    priorities = tracker.poll_priorities()[("KMB", "R", "out")]
+    assert len(priorities) == 32
+    assert 999 in priorities
+
+
+@pytest.mark.asyncio
+async def test_clear_removes_remembered_route_terminus():
+    tracker = MarkerTracker()
+    await tracker.update(_snapshot(1), [_candidate(1.5, bracket=(1, 2), boundary_age=0)],
+                         [_line(stops=6)])
+    tracker.clear()
+    assert tracker.poll_priorities() == {}
+
+
+@pytest.mark.asyncio
 async def test_stale_bracket_holds_exactly_across_generation_change():
     tracker = MarkerTracker()
     fresh = _candidate(3.5, bracket=(3.0, 4.0), boundary_age=0)

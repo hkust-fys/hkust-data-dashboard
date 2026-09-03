@@ -404,6 +404,41 @@ def test_traffic_summary_omits_bare_road_from_quote_but_keeps_annotation():
     assert "↳ road: Waterloo Road" in embed.description
 
 
+def test_traffic_summary_does_not_annotate_direction_only_tracked_road():
+    from dashboard.models import TrafficIncident
+    from dashboard.providers.tracked_roads import TrackedRoads
+    from dashboard.render import _build_traffic_summary_embed
+
+    names = {
+        "tseung kwan o tunnel": "Tseung Kwan O Tunnel",
+        "tseung kwan o tunnel road": "Tseung Kwan O Tunnel Road",
+    }
+    roads = TrackedRoads(
+        display_names=names,
+        aliases={key: key for key in names},
+        road_routes={key: ("12",) for key in names},
+    )
+    incident = TrafficIncident(
+        identifier="tko-road-reopened",
+        title="Road Incident",
+        description=(
+            "The fast lane of Tseung Kwan O Road (Tseung Kwan O Tunnel bound) "
+            "near Hing Tin Estate which was closed due to traffic accident is re-opened "
+            "to all traffic."
+        ),
+        road="Tseung Kwan O Road",
+        location="Tseung Kwan O Road",
+        direction="",
+        status="active",
+    )
+
+    embed = _build_traffic_summary_embed([], [incident], None, roads=roads)
+
+    assert "Tseung Kwan O Tunnel bound" in embed.description
+    assert "↳ road:" not in embed.description
+    assert "↳ affects:" not in embed.description
+
+
 def test_traffic_summary_links_to_official_td_traffic_news():
     from dashboard.render import TD_TRAFFIC_NEWS_URL, _build_traffic_summary_embed
 

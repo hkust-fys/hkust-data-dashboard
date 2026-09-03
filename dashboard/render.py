@@ -26,6 +26,7 @@ from dashboard.models import (
     WeatherConditions,
     WeatherWarning,
 )
+from dashboard.providers.traffic import resolve_incident_road_keys
 
 # Discord limits (from the discord.py docs).
 FIELD_VALUE_MAX = 1024
@@ -326,6 +327,28 @@ def _matched_road_names(text: str, roads: object | None) -> list[str]:
     return names
 
 
+def _affected_routes_for_keys_line(keys: list[str], roads: object | None) -> str:
+    """Suffix line naming routes serving already-resolved traffic-news roads."""
+    if roads is None:
+        return ""
+    routes = roads.routes_for_keys(keys)
+    if not routes:
+        return ""
+    return f"  ↳ affects: {', '.join(routes)}"
+
+
+def _road_names_for_keys(keys: list[str], roads: object | None) -> list[str]:
+    """Display names for already-resolved traffic-news roads."""
+    if roads is None:
+        return []
+    names: list[str] = []
+    for key in keys:
+        name = roads.display_name(key)
+        if name not in names:
+            names.append(name)
+    return names
+
+
 def _build_traffic_summary_embed(
     statuses: list[TrafficCorridorStatus] | None,
     incidents: list[TrafficIncident] | None,
@@ -364,8 +387,8 @@ def _build_traffic_summary_embed(
     if notices:
         lines.append("\n**Active traffic notices**")
         for incident in notices:
-            text = f"{incident.title} {incident.description} {incident.location} {incident.road}"
-            road_names = _matched_road_names(text, roads)
+            road_keys = resolve_incident_road_keys(incident, roads)
+            road_names = _road_names_for_keys(road_keys, roads)
             matched_roads = {name.casefold().strip() for name in road_names}
             # Preserve the notice wording itself as a quote and avoid
             # repeating title/location fragments from TD's feed. A bare road
@@ -385,7 +408,7 @@ def _build_traffic_summary_embed(
                 lines.append(f"> {_esc(part)}")
             if road_names:
                 lines.append(f"  ↳ road: {', '.join(_esc(name) for name in road_names)}")
-            affected = _affected_routes_line(text, roads)
+            affected = _affected_routes_for_keys_line(road_keys, roads)
             if affected:
                 lines.append(_esc(affected))
     works = list(roadworks or [])

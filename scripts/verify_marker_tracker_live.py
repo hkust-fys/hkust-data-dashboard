@@ -310,8 +310,21 @@ def compare_adjacent(old, new, state=None):
                 issues.append({"kind": kind, "route": key, "track_id": track,
                                "detail": "movement lacks fresh changed ETA/bracket evidence"})
         common = [track for track in a if track in b]
-        if len(common) > 1 and common != [track for track in b if track in a]:
-            issues.append({"kind": "identity_order_crossing", "route": key})
+        new_common = [track for track in b if track in a]
+        if len(common) > 1 and common != new_common:
+            crossing = False
+            new_order = {track: index for index, track in enumerate(new_common)}
+            for left_index, left_track in enumerate(common):
+                for right_track in common[left_index + 1:]:
+                    old_gap = a[right_track] - a[left_track]
+                    if (old_gap != 0.0
+                            and new_order[left_track] > new_order[right_track]):
+                        crossing = True
+                        break
+                if crossing:
+                    break
+            if crossing:
+                issues.append({"kind": "identity_order_crossing", "route": key})
         # Gap evidence is a property of this complete frame, never an inferred match.
         candidates = new.get("candidates", {}).get(key, ())
         provenance_comparable = _spacing_provenance_comparable(new, key, b.items(), candidates)

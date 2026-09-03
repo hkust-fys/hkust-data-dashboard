@@ -4,8 +4,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from dashboard.models import SpeedBand
-from dashboard.providers.tracked_roads import fallback_roads
+from dashboard.models import SpeedBand, TrafficIncident
+from dashboard.providers.tracked_roads import TrackedRoads, fallback_roads
 from dashboard.providers.traffic import (
     DETECTOR_META_SPEC,
     DETECTOR_META_URL,
@@ -24,6 +24,7 @@ from dashboard.providers.traffic import (
     parse_detector_observations,
     parse_roadworks,
     parse_special_news,
+    resolve_incident_road_keys,
     speed_band,
 )
 from tests.fixtures import sample_data as s
@@ -82,6 +83,103 @@ def test_match_roads_aliases():
     assert match_roads("Nathan Road", roads) == []
     # no table loaded: matches nothing rather than over-matching
     assert match_roads("Clear Water Bay Road", None) == []
+
+
+def _notice_roads() -> TrackedRoads:
+    names = {
+        "tseung kwan o tunnel": "Tseung Kwan O Tunnel",
+        "tseung kwan o tunnel road": "Tseung Kwan O Tunnel Road",
+    }
+    return TrackedRoads(
+        display_names=names,
+        aliases={key: key for key in names},
+        road_routes={key: ("12",) for key in names},
+    )
+
+
+def _tko_road_notice() -> TrafficIncident:
+    return TrafficIncident(
+        identifier="tko-road-reopened",
+        title="Road Incident",
+        description=(
+            "The fast lane of Tseung Kwan O Road (Tseung Kwan O Tunnel bound) "
+            "near Hing Tin Estate which was closed due to traffic accident is re-opened "
+            "to all traffic."
+        ),
+        road="Tseung Kwan O Road",
+        location="Tseung Kwan O Road",
+        direction="",
+        status="active",
+    )
+
+
+def test_incident_road_resolution_rejects_directional_parenthetical_for_untracked_road():
+    roads = _notice_roads()
+    incident = _tko_road_notice()
+
+    assert resolve_incident_road_keys(incident, roads) == []
+    assert filter_relevant_incidents([incident], roads) == []
+
+
+def test_incident_road_resolution_ignores_parenthetical_direction_without_explicit_road():
+    roads = _notice_roads()
+    incident = _tko_road_notice()
+    incident.road = ""
+    incident.location = "Hing Tin Estate"
+
+    assert resolve_incident_road_keys(incident, roads) == []
+
+    incident.description = "A lane on Tseung Kwan O Tunnel is closed."
+    assert resolve_incident_road_keys(incident, roads) == ["tseung kwan o tunnel"]
+
+
+def test_incident_road_resolution_explicit_fields_outrank_unrelated_narrative():
+    roads = TrackedRoads(
+        display_names={"clear water bay road": "Clear Water Bay Road"},
+        aliases={"clear water bay road": "clear water bay road"},
+    )
+    incident = _tko_road_notice()
+    incident.description += " Traffic remains normal on Clear Water Bay Road."
+
+    assert resolve_incident_road_keys(incident, roads) == []
+
+    incident.road = "Clear Water Bay Road"
+    incident.location = "Hing Tin Estate"
+    assert resolve_incident_road_keys(incident, roads) == ["clear water bay road"]
+
+
+def test_incident_road_resolution_keeps_explicit_road_and_strict_subroad_refinement():
+    names = {
+        "lung cheung road": "Lung Cheung Road",
+        "lung cheung road flyover": "Lung Cheung Road flyover",
+    }
+    roads = TrackedRoads(
+        display_names=names,
+        aliases={key: key for key in names},
+        road_routes={key: ("91",) for key in names},
+    )
+    incident = TrafficIncident(
+        identifier="lung-cheung-flyover",
+        title="Traffic incident",
+        description="Lung Cheung Road flyover is closed",
+        road="Lung Cheung Road",
+        location="Choi Hung Estate",
+        direction="Mong Kok-bound",
+        status="active",
+        near_landmark="Choi Hung Estate",
+    )
+
+    assert resolve_incident_road_keys(incident, roads) == ["lung cheung road"]
+    assert resolve_incident_road_keys(incident, roads, prefer_refinement=True) == [
+        "lung cheung road flyover"
+    ]
+    subroad_only = TrackedRoads(
+        display_names={"lung cheung road flyover": "Lung Cheung Road flyover"},
+        aliases={"lung cheung road flyover": "lung cheung road flyover"},
+    )
+    assert resolve_incident_road_keys(incident, subroad_only) == [
+        "lung cheung road flyover"
+    ]
 
 
 def test_speed_bands():

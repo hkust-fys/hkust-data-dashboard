@@ -122,8 +122,7 @@ async def collect_all(
         for incident in traffic_result[1] or []:
             latitude = getattr(incident, "latitude", None)
             longitude = getattr(incident, "longitude", None)
-            text = f"{incident.title} {incident.description} {incident.location} {incident.road}"
-            keys = roads.match(text)
+            keys = traffic_provider.resolve_incident_road_keys(incident, roads)
             has_coordinates = (
                 isinstance(latitude, (int, float))
                 and isinstance(longitude, (int, float))
@@ -146,22 +145,14 @@ async def collect_all(
                     # sub-road (for example, "Lung Cheung Road flyover").
                     # Permit the conservative whole-way fallback only for
                     # that explicit refinement, never for the generic road.
-                    def _words(value: object) -> str:
-                        return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
-
-                    road_words = _words(getattr(incident, "road", ""))
-                    text_words = _words(text)
-                    keys = [
-                        key
-                        for key in keys
-                        if (key_words := _words(key))
-                        and road_words
-                        and key_words.startswith(f"{road_words} ")
-                        and key_words in text_words
-                    ]
+                    keys = traffic_provider.resolve_incident_road_keys(
+                        incident, roads, prefer_refinement=True
+                    )
                     if not keys:
                         continue
                 latitude = longitude = None
+            if not keys:
+                continue
             for path in segments_near(keys, latitude, longitude) or ():
                 normalized = tuple((float(lat), float(lon)) for lat, lon in path)
                 if len(normalized) >= 2 and normalized not in seen_paths:

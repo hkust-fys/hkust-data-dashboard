@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 from collections import namedtuple
 
 import aiohttp
@@ -199,6 +200,84 @@ def test_roads_for_line_matches_nearby_geometry_only():
     assert roads_for_line(line_points, ways) == ["Clear Water Bay Road"]
 
 
+def test_roads_for_line_requires_sustained_heading_aligned_overlap():
+    line_points = [(22.3330, 114.2600), (22.3330, 114.2700)]
+    ways = [
+        {
+            "name": "Aligned One-way Road",
+            "name_en": "Aligned One-way Road",
+            # Reverse coordinate order proves heading comparison is undirected.
+            "points": [(22.3331, 114.2680), (22.3331, 114.2620)],
+        },
+        {
+            "name": "Perpendicular Crossing",
+            "name_en": "Perpendicular Crossing",
+            "points": [(22.3300, 114.2650), (22.3360, 114.2650)],
+        },
+        {
+            "name": "Single-hit Parallel Fragment",
+            "name_en": "Single-hit Parallel Fragment",
+            "points": [(22.3331, 114.2649), (22.3331, 114.2651)],
+        },
+    ]
+
+    assert roads_for_line(line_points, ways) == ["Aligned One-way Road"]
+
+
+def test_roads_for_line_accepts_only_complete_tightly_aligned_short_way():
+    origin = (22.3330, 114.2600)
+
+    def point(east_metres: float, north_metres: float = 0.0) -> tuple[float, float]:
+        return (
+            origin[0] + north_metres / 111_320.0,
+            origin[1]
+            + east_metres / (111_320.0 * math.cos(math.radians(origin[0]))),
+        )
+
+    line_points = [point(0), point(100)]
+    shallow_east = 22.5 * math.cos(math.radians(15))
+    shallow_north = 22.5 * math.sin(math.radians(15))
+    ways = [
+        {
+            "name": "Complete Short Road",
+            "name_en": "Complete Short Road",
+            "points": [point(20, 2), point(65, 2)],  # complete 45 m alignment
+        },
+        {
+            "name": "Nearby Parallel Road",
+            "name_en": "Nearby Parallel Road",
+            # Within the broad 30 m radius, but outside the strict short-way radius.
+            "points": [point(20, 12), point(65, 12)],
+        },
+        {
+            "name": "Tiny Incidental Fragment",
+            "name_en": "Tiny Incidental Fragment",
+            "points": [point(40), point(60)],
+        },
+        {
+            "name": "Short Crossing",
+            "name_en": "Short Crossing",
+            "points": [point(50, -22.5), point(50, 22.5)],
+        },
+        {
+            "name": "Shallow Short Crossing",
+            "name_en": "Shallow Short Crossing",
+            # Entirely within 8 m, but 15 degrees off the route heading.
+            "points": [
+                point(50 - shallow_east, -shallow_north),
+                point(50 + shallow_east, shallow_north),
+            ],
+        },
+        {
+            "name": "Partial Short Road",
+            "name_en": "Partial Short Road",
+            "points": [point(80, 2), point(125, 2)],
+        },
+    ]
+
+    assert roads_for_line(line_points, ways) == ["Complete Short Road"]
+
+
 def test_replace_fetched_at_returns_stamped_copy():
     roads = fallback_roads()
     stamped = replace_fetched_at(roads, 1234.5)
@@ -235,6 +314,10 @@ def test_disk_cache_roundtrip_and_legacy_missing_paths(tmp_path):
     assert legacy is not None
     assert legacy.display_names == roads.display_names
     assert legacy.paths == {}
+
+    raw["version"] = tracked_roads.ROADS_CACHE_VERSION - 1
+    cache_path.write_text(json.dumps(raw), encoding="utf-8")
+    assert tracked_roads._load_disk_cache(str(tmp_path)) is None
 
 
 def test_build_tracked_roads_retains_all_distinct_fragments_and_anchors_nearest():

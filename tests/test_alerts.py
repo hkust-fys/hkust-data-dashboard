@@ -269,6 +269,7 @@ def test_relevant_td_traffic_notice_posts_and_clears():
     events = mon.update([], [], [incident])
     assert len(events) == 1
     assert "Lane closure on Clear Water Bay Road" in events[0].text
+    assert events[0].ping
 
     events = mon.update([], [], [])
     assert len(events) == 1
@@ -298,6 +299,37 @@ def test_priority_road_traffic_news_pings_only_when_new():
         cleared = mon.update([], [], [])
         assert len(cleared) == 1 and not cleared[0].ping
         assert "<@&123456789>" not in mon.ping_for(cleared[0], role_id=123456789)
+
+
+def test_direction_only_parenthetical_does_not_feed_incident_alert_keys(monkeypatch):
+    import dashboard.alerts as alerts_module
+    from dashboard.providers.tracked_roads import TrackedRoads
+
+    names = {
+        "tseung kwan o tunnel": "Tseung Kwan O Tunnel",
+        "tseung kwan o tunnel road": "Tseung Kwan O Tunnel Road",
+    }
+    roads = TrackedRoads(
+        display_names=names,
+        aliases={key: key for key in names},
+        road_routes={key: ("12",) for key in names},
+    )
+    incident = TrafficIncident(
+        identifier="tko-road-reopened",
+        title="Road Incident",
+        description=(
+            "The fast lane of Tseung Kwan O Road (Tseung Kwan O Tunnel bound) "
+            "near Hing Tin Estate which was closed due to traffic accident is re-opened "
+            "to all traffic."
+        ),
+        road="Tseung Kwan O Road",
+        location="Tseung Kwan O Road",
+        direction="",
+        status="active",
+    )
+    monkeypatch.setattr(alerts_module, "WATCHED_ALERT_ROADS", frozenset(names))
+
+    assert AlertMonitor(roads=roads)._incident_road_keys(incident) == set()
 
 
 def test_other_traffic_news_and_roadworks_do_not_ping():

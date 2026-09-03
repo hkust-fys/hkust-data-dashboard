@@ -132,6 +132,41 @@ def test_backward_and_crossing_violations():
     assert {"backward_without_eta_evidence", "identity_order_crossing"} <= kinds
 
 
+def test_equal_position_identity_reordering_has_no_verifier_issues():
+    old = frame(1, ((21, 10.0), (19, 10.0)), (10.0, 10.0))
+    new = frame(2, ((19, 10.0), (21, 10.0)), (10.0, 10.0))
+    issues, _ = compare_adjacent(old, new)
+    assert not issues
+
+
+def test_strict_position_inversion_remains_a_crossing():
+    old = frame(1, ((19, 10.0), (21, 11.0)), (10.0, 11.0))
+    new = frame(1, ((21, 9.0), (19, 12.0)), (9.0, 12.0))
+    issues, _ = compare_adjacent(old, new)
+    assert any(issue["kind"] == "identity_order_crossing" for issue in issues)
+
+
+def test_strict_pair_collapsing_to_reordered_tie_remains_a_crossing():
+    old = frame(1, ((19, 10.0), (21, 11.0)), (10.0, 11.0))
+    new = frame(2, ((21, 10.0), (19, 10.0)), (10.0, 10.0))
+    issues, _ = compare_adjacent(old, new)
+    assert any(issue["kind"] == "identity_order_crossing" for issue in issues)
+
+
+def test_strict_pair_collapsing_to_same_order_tie_is_allowed():
+    old = frame(1, ((19, 10.0), (21, 11.0)), (10.0, 11.0))
+    new = frame(2, ((19, 10.0), (21, 10.0)), (10.0, 10.0))
+    issues, _ = compare_adjacent(old, new)
+    assert not any(issue["kind"] == "identity_order_crossing" for issue in issues)
+
+
+def test_near_tie_is_strict_for_identity_order_crossing():
+    old = frame(1, ((19, 10.00), (21, 10.01)), (10.00, 10.01))
+    new = frame(2, ((21, 10.00), (19, 10.00)), (10.00, 10.00))
+    issues, _ = compare_adjacent(old, new)
+    assert any(issue["kind"] == "identity_order_crossing" for issue in issues)
+
+
 def evidence_frame(pos=(3.5, 7.5), *, age=1.0, eta=(1, 1), brackets=((3, 4), (7, 8))):
     tracks = [SimpleNamespace(operator="KMB", route="A", bound="in", position=p, track_id=i + 1,
                               bracket=brackets[i], eta_minutes=eta[i], eta_arrival_at=None,

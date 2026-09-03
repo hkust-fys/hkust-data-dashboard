@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from dashboard.models import Roadwork, TrafficCorridorStatus, TrafficIncident, WeatherWarning
+from dashboard.providers.traffic import resolve_incident_road_keys
 
 log = logging.getLogger(__name__)
 
@@ -167,23 +168,12 @@ class AlertMonitor:
 
     def _incident_road_keys(self, incident: TrafficIncident) -> set[str]:
         """Resolve a TD notice to the watched canonical road keys."""
-        text = " ".join(
-            (
-                incident.title,
-                incident.description,
-                incident.road,
-                incident.location,
-                incident.near_landmark,
-                incident.between_landmark,
-            )
+        keys = resolve_incident_road_keys(
+            incident,
+            self.roads,
+            explicit_fallback_keys=WATCHED_ALERT_ROADS,
         )
-        if self.roads is not None:
-            return WATCHED_ALERT_ROADS.intersection(self.roads.match(text))
-        # Production normally has the tracked-road table. Retain a strict
-        # exact-field fallback so a temporary table failure does not suppress
-        # an explicitly named priority road or confuse New CWB with CWB.
-        named_fields = {incident.road.casefold().strip(), incident.location.casefold().strip()}
-        return WATCHED_ALERT_ROADS.intersection(named_fields)
+        return WATCHED_ALERT_ROADS.intersection(keys)
 
     @staticmethod
     def _roadwork_key(roadwork: Roadwork) -> str:

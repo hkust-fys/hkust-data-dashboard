@@ -787,6 +787,68 @@ async def test_collect_all_passes_only_anchored_affected_road_segments(
 
 
 @pytest.mark.asyncio
+async def test_collect_all_does_not_map_direction_only_tracked_road(monkeypatch):
+    import bot as bot_module
+    from dashboard.models import TrafficIncident
+    from dashboard.providers.tracked_roads import TrackedRoads
+
+    names = {
+        "tseung kwan o tunnel": "Tseung Kwan O Tunnel",
+        "tseung kwan o tunnel road": "Tseung Kwan O Tunnel Road",
+    }
+    roads_table = TrackedRoads(
+        display_names=names,
+        aliases={key: key for key in names},
+        road_routes={key: ("12",) for key in names},
+        paths={
+            key: (((22.33, 114.24), (22.33, 114.245)),) for key in names
+        },
+    )
+    incident = TrafficIncident(
+        identifier="tko-road-reopened",
+        title="Road Incident",
+        description=(
+            "The fast lane of Tseung Kwan O Road (Tseung Kwan O Tunnel bound) "
+            "near Hing Tin Estate which was closed due to traffic accident is re-opened "
+            "to all traffic."
+        ),
+        road="Tseung Kwan O Road",
+        location="Tseung Kwan O Road",
+        direction="",
+        status="active",
+    )
+    captured: dict[str, object] = {}
+
+    async def roads(*_args, **_kwargs):
+        return roads_table
+
+    async def transit(*_args, **_kwargs):
+        return ([], None, [])
+
+    async def weather(*_args, **_kwargs):
+        return (None, [], None)
+
+    async def traffic(*_args, **_kwargs):
+        return ([], [incident], [], None)
+
+    async def traffic_map(*_args, **kwargs):
+        captured.update(kwargs)
+        return (b"map", [])
+
+    from dashboard.providers import tracked_roads as tracked_roads_provider
+
+    monkeypatch.setattr(tracked_roads_provider, "fetch_tracked_roads", roads)
+    monkeypatch.setattr(bot_module.transit, "fetch_transit_etas", transit)
+    monkeypatch.setattr(bot_module.weather_provider, "fetch_weather_conditions", weather)
+    monkeypatch.setattr(bot_module.traffic_provider, "fetch_traffic_data", traffic)
+    monkeypatch.setattr(bot_module.maps, "fetch_traffic_map", traffic_map)
+
+    await bot_module.collect_all(object(), _fake_settings())
+
+    assert captured["affected_road_paths"] == []
+
+
+@pytest.mark.asyncio
 async def test_collect_all_allows_explicit_short_subroad_for_landmark_notice(monkeypatch):
     """A landmark-only notice may select a named short sub-road, not its parent road."""
     import bot as bot_module

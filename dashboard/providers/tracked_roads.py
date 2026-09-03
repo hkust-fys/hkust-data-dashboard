@@ -27,7 +27,7 @@ from dashboard.providers.route_geometry import RouteLine, fetch_route_geometry
 log = logging.getLogger(__name__)
 
 ROADS_TTL_SECONDS = 12 * 3600.0
-ROADS_CACHE_VERSION = 2
+ROADS_CACHE_VERSION = 4
 ROADS_CACHE_NAME = "tracked-roads.json"
 OVERPASS_TIMEOUT_SECONDS = 180.0
 OVERPASS_ATTEMPTS = 1
@@ -76,6 +76,17 @@ _EXCLUDED_HIGHWAY_TYPES = {
 
 SAMPLE_STEP_METRES = 150.0
 MATCH_RADIUS_METRES = 30.0
+ASSOCIATION_SAMPLE_STEP_METRES = 20.0
+MAX_ASSOCIATION_HEADING_DEGREES = 25.0
+MIN_ALIGNED_SAMPLES = 3
+MIN_ALIGNED_OVERLAP_METRES = 50.0
+MIN_ALIGNED_RUN_METRES = 40.0
+MIN_COMPLETE_SHORT_WAY_METRES = 35.0
+COMPLETE_SHORT_WAY_SAMPLE_STEP_METRES = 5.0
+COMPLETE_SHORT_WAY_MATCH_RADIUS_METRES = 8.0
+MAX_COMPLETE_SHORT_WAY_HEADING_DEGREES = 10.0
+MIN_COMPLETE_SHORT_WAY_COVERAGE = 0.85
+MAX_COMPLETE_SHORT_WAY_GAP_METRES = 6.0
 # A TD news coordinate must be genuinely on the named OSM way.  This generous
 # bound covers GPS/map snapping error without turning an incident into a whole
 # route or whole-road highlight.  The returned line is capped at 500 m either
@@ -318,12 +329,12 @@ def _metres_between(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot((b[0] - a[0]) * lat_scale, (b[1] - a[1]) * lon_scale)
 
 
-def _point_to_segment_metres(
+def _point_to_segment_projection_metres(
     point: tuple[float, float],
     start: tuple[float, float],
     end: tuple[float, float],
-) -> float:
-    """Distance in metres from ``point`` to the great-circle-ish segment."""
+) -> tuple[float, float]:
+    """Distance and unclamped along-segment ratio in local metric space."""
     lat_scale = 111_320.0
     lon_scale = lat_scale * math.cos(math.radians((start[0] + end[0]) / 2))
     px = (point[0] - start[0]) * lat_scale
@@ -331,10 +342,132 @@ def _point_to_segment_metres(
     ex = (end[0] - start[0]) * lat_scale
     ey = (end[1] - start[1]) * lon_scale
     length_sq = ex * ex + ey * ey
-    ratio = 0.0 if length_sq == 0 else max(0.0, min(1.0, (px * ex + py * ey) / length_sq))
+    raw_ratio = 0.0 if length_sq == 0 else (px * ex + py * ey) / length_sq
+    ratio = max(0.0, min(1.0, raw_ratio))
     dx = px - ratio * ex
     dy = py - ratio * ey
-    return math.hypot(dx, dy)
+    return math.hypot(dx, dy), raw_ratio
+
+
+def _unit_heading(
+    start: tuple[float, float], end: tuple[float, float]
+) -> tuple[float, float] | None:
+    """Return a local metric heading; direction is ignored by the caller."""
+    lat_scale = 111_320.0
+    lon_scale = lat_scale * math.cos(math.radians((start[0] + end[0]) / 2))
+    north = (end[0] - start[0]) * lat_scale
+    east = (end[1] - start[1]) * lon_scale
+    length = math.hypot(north, east)
+    if length == 0:
+        return None
+    return (north / length, east / length)
+
+
+def _association_samples(
+    path: list[tuple[float, float]],
+    step_metres: float = ASSOCIATION_SAMPLE_STEP_METRES,
+) -> list[tuple[tuple[float, float], tuple[float, float], float]]:
+    """Densely sample a route with local headings and represented lengths."""
+    samples: list[tuple[tuple[float, float], tuple[float, float], float]] = []
+    for start, end in zip(path, path[1:], strict=False):
+        length = _metres_between(start, end)
+        heading = _unit_heading(start, end)
+        if length == 0 or heading is None:
+            continue
+        pieces = max(1, math.ceil(length / step_metres))
+        represented = length / pieces
+        for index in range(pieces):
+            ratio = (index + 0.5) / pieces
+            point = (
+                start[0] + ratio * (end[0] - start[0]),
+                start[1] + ratio * (end[1] - start[1]),
+            )
+            samples.append((point, heading, represented))
+    return samples
+
+
+def _way_segment(
+    start: tuple[float, float], end: tuple[float, float]
+) -> tuple[
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float, float, float],
+] | None:
+    heading = _unit_heading(start, end)
+    if heading is None:
+        return None
+    lat_pad = MATCH_RADIUS_METRES / 111_320.0
+    mid_lat = (start[0] + end[0]) / 2
+    lon_scale = 111_320.0 * max(0.1, math.cos(math.radians(mid_lat)))
+    lon_pad = MATCH_RADIUS_METRES / lon_scale
+    bounds = (
+        min(start[0], end[0]) - lat_pad,
+        max(start[0], end[0]) + lat_pad,
+        min(start[1], end[1]) - lon_pad,
+        max(start[1], end[1]) + lon_pad,
+    )
+    return (start, end, heading, bounds)
+
+
+def _complete_short_way_matches_route(
+    way_points: list[tuple[float, float]],
+    route_segments: list[tuple],
+) -> bool:
+    """Accept only a nearly complete, tightly registered short named way."""
+    way_length = sum(
+        _metres_between(start, end)
+        for start, end in zip(way_points, way_points[1:], strict=False)
+    )
+    if not (MIN_COMPLETE_SHORT_WAY_METRES <= way_length < MIN_ALIGNED_OVERLAP_METRES):
+        return False
+
+    samples = _association_samples(
+        way_points,
+        step_metres=COMPLETE_SHORT_WAY_SAMPLE_STEP_METRES,
+    )
+    if not samples:
+        return False
+    cosine_limit = math.cos(math.radians(MAX_COMPLETE_SHORT_WAY_HEADING_DEGREES))
+    supported: list[bool] = []
+    supported_length = 0.0
+    current_gap = 0.0
+    longest_gap = 0.0
+    for point, way_heading, represented in samples:
+        matched = False
+        for start, end, route_heading, bounds in route_segments:
+            min_lat, max_lat, min_lon, max_lon = bounds
+            if not (
+                min_lat <= point[0] <= max_lat and min_lon <= point[1] <= max_lon
+            ):
+                continue
+            alignment = abs(
+                way_heading[0] * route_heading[0]
+                + way_heading[1] * route_heading[1]
+            )
+            if alignment < cosine_limit:
+                continue
+            distance, ratio = _point_to_segment_projection_metres(point, start, end)
+            if (
+                0.0 <= ratio <= 1.0
+                and distance <= COMPLETE_SHORT_WAY_MATCH_RADIUS_METRES
+            ):
+                matched = True
+                break
+        supported.append(matched)
+        if matched:
+            supported_length += represented
+            current_gap = 0.0
+        else:
+            current_gap += represented
+            longest_gap = max(longest_gap, current_gap)
+
+    return (
+        supported[0]
+        and supported[-1]
+        and supported_length / way_length >= MIN_COMPLETE_SHORT_WAY_COVERAGE
+        and longest_gap <= MAX_COMPLETE_SHORT_WAY_GAP_METRES
+    )
 
 
 def collect_way_roads(raw: dict) -> list[dict]:
@@ -364,33 +497,82 @@ def collect_way_roads(raw: dict) -> list[dict]:
 
 
 def roads_for_line(line_points: list[tuple[float, float]], ways: list[dict]) -> list[str]:
-    """Road names whose OSM geometry passes near the official route line."""
+    """Road names with sustained, heading-aligned overlap with a route line."""
+    route_samples = _association_samples(line_points)
+    if not route_samples:
+        return []
+
+    route_segments = [
+        segment
+        for start, end in zip(line_points, line_points[1:], strict=False)
+        if (segment := _way_segment(start, end)) is not None
+    ]
+    grouped: dict[str, tuple[str, list[tuple], list[list[tuple[float, float]]]]] = {}
+    for way in ways:
+        display = str(way.get("name_en") or way.get("name") or "").strip()
+        if not display:
+            continue
+        key = display.casefold()
+        if key not in grouped:
+            grouped[key] = (display, [], [])
+        segments = grouped[key][1]
+        points = list(way.get("points") or [])
+        way_segments: list[tuple] = []
+        for start, end in zip(points, points[1:], strict=False):
+            segment = _way_segment(start, end)
+            if segment is not None:
+                segments.append(segment)
+                way_segments.append(segment)
+        if way_segments:
+            grouped[key][2].append(points)
+
+    cosine_limit = math.cos(math.radians(MAX_ASSOCIATION_HEADING_DEGREES))
     names: list[str] = []
-    seen: set[str] = set()
-    for sample in _sample_path(line_points):
-        for way in ways:
-            points = way["points"]
-            # Cheap bbox rejection before per-segment distance checks.
-            lats = [p[0] for p in points]
-            lons = [p[1] for p in points]
-            if (
-                sample[0] < min(lats) - 0.001
-                or sample[0] > max(lats) + 0.001
-                or sample[1] < min(lons) - 0.001
-                or sample[1] > max(lons) + 0.001
-            ):
-                continue
-            near = any(
-                _point_to_segment_metres(sample, a, b) <= MATCH_RADIUS_METRES
-                for a, b in zip(points, points[1:], strict=False)
-            )
-            if not near:
-                continue
-            display = way["name_en"] or way["name"]
-            key = display.lower()
-            if key not in seen:
-                seen.add(key)
-                names.append(display)
+    for display, segments, way_paths in grouped.values():
+        aligned_samples = 0
+        aligned_overlap = 0.0
+        current_run = 0.0
+        longest_run = 0.0
+        for point, route_heading, represented in route_samples:
+            supported = False
+            for start, end, way_heading, bounds in segments:
+                min_lat, max_lat, min_lon, max_lon = bounds
+                if not (
+                    min_lat <= point[0] <= max_lat and min_lon <= point[1] <= max_lon
+                ):
+                    continue
+                # OSM one-way geometry may run opposite the route coordinate
+                # order, so compare the undirected heading via |dot product|.
+                alignment = abs(
+                    route_heading[0] * way_heading[0]
+                    + route_heading[1] * way_heading[1]
+                )
+                if alignment < cosine_limit:
+                    continue
+                distance, ratio = _point_to_segment_projection_metres(point, start, end)
+                if 0.0 <= ratio <= 1.0 and distance <= MATCH_RADIUS_METRES:
+                    supported = True
+                    break
+            if supported:
+                aligned_samples += 1
+                aligned_overlap += represented
+                current_run += represented
+                longest_run = max(longest_run, current_run)
+            else:
+                current_run = 0.0
+        normal_overlap = (
+            sum(_metres_between(start, end) for start, end, _heading, _bounds in segments)
+            >= MIN_ALIGNED_OVERLAP_METRES
+            and aligned_samples >= MIN_ALIGNED_SAMPLES
+            and aligned_overlap >= MIN_ALIGNED_OVERLAP_METRES
+            and longest_run >= MIN_ALIGNED_RUN_METRES
+        )
+        complete_short_way = not normal_overlap and any(
+            _complete_short_way_matches_route(path, route_segments)
+            for path in way_paths
+        )
+        if normal_overlap or complete_short_way:
+            names.append(display)
     return names
 
 

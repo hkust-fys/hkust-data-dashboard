@@ -115,6 +115,12 @@ class MarkerTracker:
         grouped = _group(candidates)
         keys = set(complete)
         keys.update(key for key in grouped if key in self._routes)
+        # Capture every stored route before any complete or same-generation
+        # branch can mutate positions. Omitted routes still reach prediction.
+        split_ties = {
+            key: _tie_components(tracks)
+            for key, tracks in self._routes.items()
+        }
         for key in sorted(keys):
             if key in route_terminals:
                 self._terminal_indices[key] = route_terminals[key]
@@ -125,6 +131,7 @@ class MarkerTracker:
                 if generation is None:
                     continue
                 tracks = self._routes.setdefault(key, {})
+            split_ties.setdefault(key, _tie_components(tracks))
             if generation is not None and generation != self._generations.get(key):
                 old_generation = self._generations.get(key)
                 rollback = old_generation is not None and generation < old_generation
@@ -133,6 +140,9 @@ class MarkerTracker:
                     old_generation = None
                 self._generations[key] = generation
                 old = list(tracks.values())
+                held_positions = {
+                    track.track_id: track.position for track in old
+                }
                 self._predict(old, now, route_lines)
                 pairs = _ordered_pairs(old, rows)
                 used = set()
@@ -145,6 +155,7 @@ class MarkerTracker:
                     if candidate_bracket is not None and bracket_position is None:
                         # Complete lifecycle evidence can advance generation,
                         # but stale positioning evidence must hold the track.
+                        _hold_track(track, now, held_positions[track.track_id])
                         track.generation = generation
                         track.hits += 1
                         track.misses = 0
@@ -155,6 +166,7 @@ class MarkerTracker:
                         # A complete generation may confirm that this identity
                         # still exists, but incomplete probe geometry cannot
                         # replace the last real positioning boundary.
+                        _hold_track(track, now, held_positions[track.track_id])
                         track.generation = generation
                         track.hits += 1
                         track.misses = 0
@@ -225,7 +237,9 @@ class MarkerTracker:
         for key in sorted(self._routes):
             tracks = self._routes[key]
             ordered = list(tracks.values())
-            self._predict(ordered, now, route_lines)
+            self._predict(ordered, now, route_lines, split_ties.get(key, ()))
+            self._routes[key] = tracks = self._sort_tracks(tracks)
+            ordered = list(tracks.values())
             if key not in complete:
                 stale = {
                     track.track_id
@@ -254,8 +268,14 @@ class MarkerTracker:
         raw_position = max(track.position, (now - track.phase) / SECONDS_PER_STOP)
         return raw_position >= maximum and now - track.last_evidence_at >= self.evidence_ttl_seconds
 
-    def _predict(self, tracks, now, route_lines):
-        prior = -inf
+    def _predict(self, tracks, now, route_lines, split_ties=()):
+        split_ties = dict(split_ties)
+        input_positions = [track.position for track in tracks]
+        components = [
+            split_ties.get(track.track_id, ("track", track.track_id))
+            for track in tracks
+        ]
+        positions = []
         for track in tracks:
             # Bracketed estimates move only when a fresh boundary poll updates
             # them.  Cached ETA age must never become synthetic motion.
@@ -266,11 +286,35 @@ class MarkerTracker:
             maximum = _route_max(track.estimate, route_lines)
             if maximum != inf:
                 position = min(position, maximum)
-            # Preserve order without inventing a positive separation.
-            position = max(position, prior)
+            positions.append(position)
+
+        # Preserve the order of distinct prior-position components globally.
+        # Members of one exact prior tie may split, but a correction at one
+        # boundary must be allowed to propagate through an arbitrarily long
+        # chain of strict components.
+        for _ in range(len(positions)):
+            changed = False
+            for left in range(len(positions) - 1):
+                for right in range(left + 1, len(positions)):
+                    if (components[left] == components[right]
+                            or positions[left] <= positions[right]):
+                        continue
+                    if (positions[left] > input_positions[right]
+                            and positions[right] <= input_positions[right]):
+                        positions[left] = positions[right]
+                    else:
+                        positions[right] = positions[left]
+                    changed = True
+            if not changed:
+                break
+
+        for track, position in zip(tracks, positions, strict=True):
             track.position = position
-            prior = position
             track.estimate = reproject_estimate(track.estimate, position, route_lines)
+
+    @staticmethod
+    def _sort_tracks(tracks):
+        return dict(sorted(tracks.items(), key=lambda item: (item[1].position, item[0])))
 
     def _bound(self):
         for key in sorted(self._routes):
@@ -293,6 +337,15 @@ def _group(items):
     for item in items:
         grouped.setdefault(_key(item), []).append(item)
     return grouped
+
+
+def _tie_components(tracks):
+    positions = [track.position for track in tracks.values()]
+    return {
+        track.track_id: track.position
+        for track in tracks.values()
+        if positions.count(track.position) > 1
+    }
 
 
 def _merge_tracks(old, new):
@@ -362,6 +415,12 @@ def _bracket_position(track, candidate):
     if not isfinite(age) or age < 0.0 or age > 5.0:
         return None
     return min(upper, max(lower, float(candidate.position or lower)))
+
+
+def _hold_track(track, now, position):
+    """Keep a generation-confirmed track fixed until fresh evidence arrives."""
+    track.position = position
+    track.phase = now - position * SECONDS_PER_STOP
 
 
 def _timestamp(value):

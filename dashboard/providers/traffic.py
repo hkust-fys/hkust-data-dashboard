@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
@@ -308,6 +309,107 @@ def match_roads(text: str, roads: Any) -> list[str]:
     return roads.match(text)
 
 
+_PARENTHETICAL = re.compile(r"\([^()]*\)")
+_DIRECTIONAL_WORD = re.compile(
+    r"\b(?:bound|inbound|outbound|towards?|direction|heading|clockwise|anticlockwise)\b",
+    re.IGNORECASE,
+)
+_ROAD_DESIGNATOR = re.compile(
+    r"\b(?:road|street|highway|expressway|tunnel|flyover|bridge|bypass|avenue|drive|lane)\b",
+    re.IGNORECASE,
+)
+
+
+def _without_direction_parentheticals(text: str) -> str:
+    """Remove parenthetical directions before looking for narrative road names."""
+
+    return _PARENTHETICAL.sub(
+        lambda match: " " if _DIRECTIONAL_WORD.search(match.group(0)) else match.group(0),
+        text,
+    )
+
+
+def _road_words(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).strip()
+
+
+def _road_key_phrases(key: str, roads: Any) -> set[str]:
+    """Return normalized names that may identify one canonical road key."""
+
+    values: list[object] = [key]
+    aliases = getattr(roads, "aliases", None)
+    if isinstance(aliases, dict):
+        values.append(aliases.get(key, ""))
+    display_name = getattr(roads, "display_name", None)
+    if callable(display_name):
+        values.append(display_name(key))
+    return {words for value in values if (words := _road_words(value))}
+
+
+def resolve_incident_road_keys(
+    incident: TrafficIncident,
+    roads: Any = None,
+    *,
+    prefer_refinement: bool = False,
+    explicit_fallback_keys: Iterable[str] = (),
+) -> list[str]:
+    """Resolve a TD traffic notice to canonical tracked-road keys.
+
+    TD's dedicated ``road``/``location`` fields are authoritative. Narrative
+    road names are considered only when those fields do not name a road, with
+    one conservative exception: a specifically written tracked key may refine
+    an explicit parent (for example ``Lung Cheung Road flyover``). Parenthetical
+    direction labels are never road evidence. ``explicit_fallback_keys`` keeps
+    table-outage behavior exact-field-only rather than reopening prose matching.
+    """
+
+    explicit_fields: list[str] = []
+    seen_fields: set[str] = set()
+    for value in (incident.road, incident.location):
+        cleaned = _without_direction_parentheticals(value).strip()
+        identity = cleaned.casefold()
+        if cleaned and identity not in seen_fields:
+            seen_fields.add(identity)
+            explicit_fields.append(cleaned)
+
+    if roads is None:
+        explicit_words = {_road_words(field) for field in explicit_fields}
+        return [key for key in explicit_fallback_keys if _road_words(key) in explicit_words]
+
+    explicit_matches: list[str] = []
+    seen_keys: set[str] = set()
+    for field in explicit_fields:
+        for key in match_roads(field, roads):
+            if key not in seen_keys:
+                seen_keys.add(key)
+                explicit_matches.append(key)
+
+    explicit_parents = [
+        _road_words(field) for field in explicit_fields if _ROAD_DESIGNATOR.search(field)
+    ]
+    narrative = _without_direction_parentheticals(
+        " ".join((incident.title, incident.description))
+    )
+    narrative_matches = match_roads(narrative, roads)
+    refinements = [
+        key
+        for key in narrative_matches
+        if any(
+            phrase.startswith(f"{parent} ")
+            for parent in explicit_parents
+            for phrase in _road_key_phrases(key, roads)
+        )
+    ]
+
+    if explicit_matches:
+        if prefer_refinement:
+            return refinements
+        return explicit_matches
+    if explicit_parents:
+        return refinements
+    return narrative_matches
+
+
 def _direction_from(text: str, meta_direction: str = "") -> str:
     lowered = text.lower()
     for hint, arrow in DIRECTION_HINTS:
@@ -478,11 +580,11 @@ def _dedupe_incidents(incidents: list[TrafficIncident]) -> list[TrafficIncident]
 def filter_relevant_incidents(
     incidents: list[TrafficIncident], roads: Any = None, limit: int = 3
 ) -> list[TrafficIncident]:
-    """Keep only incidents whose text matches our tracked roads; dedupe already done."""
+    """Keep incidents resolved to tracked roads; dedupe already done."""
     relevant = [
         inc
         for inc in incidents
-        if match_roads(f"{inc.title} {inc.description} {inc.location} {inc.road}", roads)
+        if resolve_incident_road_keys(inc, roads)
     ]
     return relevant[:limit]
 

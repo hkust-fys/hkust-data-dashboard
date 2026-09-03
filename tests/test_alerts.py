@@ -276,6 +276,29 @@ def test_relevant_td_traffic_notice_posts_and_clears():
     assert "TD traffic notice cleared" in events[0].text
 
 
+def test_traffic_notice_thread_messages_preserve_full_source_within_limits():
+    mon = AlertMonitor()
+    source = "first " + ("x" * 4_100) + " last"
+    incident = TrafficIncident(
+        identifier="td-long",
+        title="Lane closure",
+        description=source,
+        road="Clear Water Bay Road",
+        location="HKUST approach",
+        direction="eastbound",
+        status="active",
+    )
+    mon.update([], [], [])
+
+    event = mon.update([], [], [incident])[0]
+    messages = mon.messages_for(event, role_id=123)
+
+    assert len(messages) == 3
+    assert all(len(message) <= 2_000 for message in messages)
+    assert source in "".join(messages)
+    assert "<@&123>" in messages[0]
+
+
 def test_priority_road_traffic_news_pings_only_when_new():
     from dashboard.providers.tracked_roads import fallback_roads
 

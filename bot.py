@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -780,6 +781,9 @@ class DashboardUpdater:
         self._collection_task: asyncio.Task | None = None
         self._collection_generation = 0
         self._last_alert_generation = 0
+        self._last_queued_alert_generation = 0
+        self._pending_alert_snapshots: deque[CollectionSnapshot] = deque()
+        self._pending_alert_messages: deque[str] = deque()
         self._message = None
         self._thread = None
         self._loop_task: asyncio.Task | None = None
@@ -826,20 +830,68 @@ class DashboardUpdater:
 
     async def _ensure_thread(self) -> None:
         """Create the updates thread under the dashboard message once."""
-        if self._thread is not None or self._message is None:
+        if self._message is None:
             return
         try:
-            # reuse an existing thread by name if present
-            for t in self._message.channel.threads:
-                if t.name == "status updates":
-                    self._thread = t
-                    return
-            self._thread = await self._message.create_thread(
-                name="status updates", auto_archive_duration=10080
-            )
-            log.info("created status thread %s", self._thread.id)
+            # Public thread IDs equal their starter-message IDs.  Archived
+            # threads are absent from ``channel.threads``, so resolve the
+            # thread through its dashboard message before trying to create it.
+            thread = self._thread or getattr(self._message, "thread", None)
+            if thread is None:
+                thread = next(
+                    (
+                        item
+                        for item in getattr(
+                            getattr(self._message, "channel", None), "threads", []
+                        )
+                        if getattr(item, "id", None) == self._message.id
+                    ),
+                    None,
+                )
+            if thread is None:
+                fetch_thread = getattr(self._message, "fetch_thread", None)
+                if fetch_thread is not None:
+                    try:
+                        thread = await fetch_thread()
+                    except discord.NotFound:
+                        thread = None
+                else:
+                    # ``Message.fetch_thread`` was added in discord.py 2.4,
+                    # while this project still supports 2.3.  Public thread
+                    # IDs equal their starter-message IDs, so the guild fetch
+                    # is the equivalent compatibility path.
+                    fetch_channel = getattr(
+                        getattr(self._message, "guild", None), "fetch_channel", None
+                    )
+                    if fetch_channel is not None:
+                        try:
+                            thread = await fetch_channel(self._message.id)
+                        except discord.NotFound:
+                            thread = None
+            if thread is None:
+                thread = await self._message.create_thread(
+                    name="status updates", auto_archive_duration=10080
+                )
+                log.info("created status thread %s", thread.id)
+            if getattr(thread, "archived", False):
+                await thread.edit(archived=False)
+            self._thread = thread
         except Exception as exc:  # noqa: BLE001
-            log.warning("could not create status thread: %s", exc)
+            self._thread = None
+            log.warning("could not resolve status thread: %s", exc)
+
+    async def _flush_alert_messages(self) -> None:
+        """Deliver queued thread content in order, retaining failures for retry."""
+        while self._pending_alert_messages and self._thread is not None:
+            text = self._pending_alert_messages[0]
+            try:
+                await self._thread.send(content=text)
+            except Exception as exc:  # noqa: BLE001
+                # Force a fresh resolve/unarchive on the next presentation tick.
+                self._thread = None
+                log.warning("alert post failed (retaining for retry): %s", exc)
+                return
+            self._pending_alert_messages.popleft()
 
     async def _post_alert_events(self, results: dict[str, object]) -> None:
         """Feed the alert monitor and post any thread messages."""
@@ -862,14 +914,43 @@ class DashboardUpdater:
         if roads is not None and not isinstance(roads, Exception):
             self.alerts.roads = roads
         events = self.alerts.update(warnings, statuses, incidents, roadworks)
-        if not events or self._thread is None:
-            return
         for event in events:
-            text = self.alerts.ping_for(event, self.settings.alert_role_id)
-            try:
-                await self._thread.send(content=text)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("alert post failed: %s", exc)
+            self._pending_alert_messages.extend(
+                self.alerts.messages_for(event, self.settings.alert_role_id)
+            )
+        await self._flush_alert_messages()
+
+    def _queue_alert_snapshot_if_ready(
+        self, snapshot: CollectionSnapshot | None
+    ) -> None:
+        """Retain each completed alert generation until the presenter consumes it."""
+        if (
+            snapshot is None
+            or snapshot.generation <= self._last_queued_alert_generation
+        ):
+            return
+        settled = snapshot.settled_providers
+        if settled and not {"weather", "traffic"}.issubset(settled):
+            return
+        self._pending_alert_snapshots.append(snapshot)
+        self._last_queued_alert_generation = snapshot.generation
+
+    async def _process_alert_snapshot(self) -> None:
+        """Process complete alert snapshots in order and retry queued messages."""
+        await self._flush_alert_messages()
+        # Directly injected test/dev snapshots do not pass through the normal
+        # publisher, so offer the current value to the same queue here.
+        self._queue_alert_snapshot_if_ready(self._snapshot)
+        while self._pending_alert_snapshots:
+            snapshot = self._pending_alert_snapshots[0]
+            if snapshot.generation <= self._last_alert_generation:
+                self._pending_alert_snapshots.popleft()
+                continue
+            await self._post_alert_events(snapshot.results)
+            # Keep the generation paired with the exact queued results above;
+            # Discord I/O can allow a newer snapshot to publish while we await.
+            self._last_alert_generation = snapshot.generation
+            self._pending_alert_snapshots.popleft()
 
     async def _update_loop(self, channel=None) -> None:
         # Start collection promptly, but never make rendering wait for it.
@@ -972,6 +1053,7 @@ class DashboardUpdater:
             stale_providers=frozenset(stale),
             settled_providers=frozenset(settled),
         )
+        self._queue_alert_snapshot_if_ready(self._snapshot)
 
     def _snapshot_payload(self) -> DashboardPayload | None:
         """Build from the latest completed snapshot, never from a live fetch."""
@@ -1045,9 +1127,7 @@ class DashboardUpdater:
 
         # status thread + alerts (create the thread after the message exists)
         await self._ensure_thread()
-        if self._snapshot is not None and self._snapshot.generation != self._last_alert_generation:
-            await self._post_alert_events(self._snapshot.results)
-            self._last_alert_generation = self._snapshot.generation
+        await self._process_alert_snapshot()
 
     async def stop(self) -> None:
         self._running = False

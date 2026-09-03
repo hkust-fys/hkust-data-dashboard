@@ -35,6 +35,7 @@ CRITICAL_WARNING_CODES: frozenset[str] = frozenset(
 
 CONGESTION_RED_TICKS_REQUIRED = 2
 ROAD_ALERT_COOLDOWN_SECONDS = 60 * 60.0
+DISCORD_MESSAGE_CONTENT_LIMIT = 2_000
 WATCHED_ALERT_ROADS: frozenset[str] = frozenset(
     {"clear water bay road", "new clear water bay road"}
 )
@@ -76,6 +77,7 @@ class AlertEvent:
     text: str
     critical: bool = False
     ping: bool = False
+    source_text: str = ""
 
 
 @dataclass
@@ -155,6 +157,7 @@ class AlertMonitor:
                         text=f"📢 **{incident.title}**{suffix} "
                         f"(<t:{int(now.timestamp())}:t>)",
                         ping=self._claim_road_alert(self._incident_road_keys(incident)),
+                        source_text=incident.description,
                     )
                 )
         for key in sorted(self.state.traffic_incidents - current):
@@ -331,3 +334,13 @@ class AlertMonitor:
         if event.ping and role_id is not None:
             return f"{event.text}\n<@&{role_id}>"
         return event.text
+
+    def messages_for(self, event: AlertEvent, role_id: int | None) -> list[str]:
+        """Render bounded thread messages while retaining the complete TD notice."""
+        text = self.ping_for(event, role_id)
+        if event.source_text:
+            text = f"{text}\n\n**Full TD source text:**\n{event.source_text}"
+        return [
+            text[start : start + DISCORD_MESSAGE_CONTENT_LIMIT]
+            for start in range(0, len(text), DISCORD_MESSAGE_CONTENT_LIMIT)
+        ]

@@ -61,11 +61,64 @@ class _FakeChannel:
 
 
 class _FakeThread:
-    def __init__(self):
+    def __init__(self, *, archived=False):
         self.sent = []
+        self.archived = archived
+        self.edits = []
 
     async def send(self, **kwargs):
         self.sent.append(kwargs)
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+        self.archived = kwargs.get("archived", self.archived)
+
+
+class _FailOnceThread(_FakeThread):
+    def __init__(self):
+        super().__init__()
+        self.failures = 0
+
+    async def send(self, **kwargs):
+        if self.failures == 0:
+            self.failures += 1
+            raise RuntimeError("archived between resolve and send")
+        await super().send(**kwargs)
+
+
+class _ThreadedMessage(_FakeMessage):
+    def __init__(self, thread):
+        super().__init__(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+        self.thread = None
+        self._fetched_thread = thread
+        self.created_threads = 0
+
+    async def fetch_thread(self):
+        return self._fetched_thread
+
+    async def create_thread(self, **_kwargs):
+        self.created_threads += 1
+        raise AssertionError("must not recreate an existing archived thread")
+
+
+class _LegacyThreadedMessage(_FakeMessage):
+    """discord.py 2.3-shaped message without Message.fetch_thread."""
+
+    def __init__(self, thread):
+        super().__init__(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+        self.thread = None
+        self.created_threads = 0
+        self.fetched_ids = []
+
+        async def fetch_channel(channel_id):
+            self.fetched_ids.append(channel_id)
+            return thread
+
+        self.guild = type("Guild", (), {"fetch_channel": staticmethod(fetch_channel)})()
+
+    async def create_thread(self, **_kwargs):
+        self.created_threads += 1
+        raise AssertionError("must not recreate an existing archived thread")
 
 
 @pytest.mark.asyncio
@@ -931,6 +984,203 @@ async def test_updater_posts_new_and_cleared_roadworks_to_dashboard_thread():
     assert len(messages) == 2
     assert "Lane closure near HKUST" in messages[0]
     assert "TD roadworks cleared" in messages[1]
+
+
+@pytest.mark.asyncio
+async def test_updater_fetches_and_unarchives_dashboard_message_thread():
+    updater = DashboardUpdater(_fake_settings())
+    thread = _FakeThread(archived=True)
+    message = _ThreadedMessage(thread)
+    updater._message = message  # noqa: SLF001
+
+    await updater._ensure_thread()  # noqa: SLF001
+
+    assert updater._thread is thread  # noqa: SLF001
+    assert thread.edits == [{"archived": False}]
+    assert message.created_threads == 0
+
+
+@pytest.mark.asyncio
+async def test_updater_unarchives_thread_that_archives_after_startup():
+    updater = DashboardUpdater(_fake_settings())
+    thread = _FakeThread(archived=True)
+    updater._message = _ThreadedMessage(thread)  # noqa: SLF001
+    updater._thread = thread  # noqa: SLF001
+
+    await updater._ensure_thread()  # noqa: SLF001
+
+    assert updater._thread is thread  # noqa: SLF001
+    assert thread.edits == [{"archived": False}]
+
+
+@pytest.mark.asyncio
+async def test_updater_fetches_archived_thread_with_discord_py_23_shape():
+    updater = DashboardUpdater(_fake_settings())
+    thread = _FakeThread(archived=True)
+    message = _LegacyThreadedMessage(thread)
+    updater._message = message  # noqa: SLF001
+
+    await updater._ensure_thread()  # noqa: SLF001
+
+    assert updater._thread is thread  # noqa: SLF001
+    assert message.fetched_ids == [message.id]
+    assert message.created_threads == 0
+    assert thread.edits == [{"archived": False}]
+
+
+@pytest.mark.asyncio
+async def test_alert_snapshot_waits_for_both_incremental_inputs():
+    import bot as bot_module
+
+    updater = DashboardUpdater(_fake_settings())
+    processed = []
+
+    async def record(results):
+        processed.append(results)
+
+    updater._post_alert_events = record  # type: ignore[method-assign]
+    updater._snapshot = bot_module.CollectionSnapshot(  # noqa: SLF001
+        {"weather": (None, [], None)},
+        1,
+        0.0,
+        settled_providers=frozenset({"weather"}),
+    )
+    await updater._process_alert_snapshot()  # noqa: SLF001
+    assert processed == []
+    assert updater._last_alert_generation == 0  # noqa: SLF001
+
+    complete = {
+        "weather": (None, [], None),
+        "traffic": ([], [], [], None),
+    }
+    updater._snapshot = bot_module.CollectionSnapshot(  # noqa: SLF001
+        complete,
+        1,
+        0.0,
+        settled_providers=frozenset({"weather", "traffic"}),
+    )
+    await updater._process_alert_snapshot()  # noqa: SLF001
+    await updater._process_alert_snapshot()  # noqa: SLF001 - no duplicate
+
+    assert processed == [complete]
+    assert updater._last_alert_generation == 1  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_alert_generation_stays_paired_when_new_snapshot_publishes():
+    import bot as bot_module
+
+    updater = DashboardUpdater(_fake_settings())
+    first = {"weather": (None, [], None), "traffic": ([], [], [], None)}
+    second = {"weather": (None, [], None), "traffic": ([], [], [], "new")}
+    updater._snapshot = bot_module.CollectionSnapshot(  # noqa: SLF001
+        first,
+        1,
+        0.0,
+        settled_providers=frozenset({"weather", "traffic"}),
+    )
+    processed = []
+
+    async def publish_during_post(results):
+        processed.append(results)
+        updater._snapshot = bot_module.CollectionSnapshot(  # noqa: SLF001
+            second,
+            2,
+            0.0,
+            settled_providers=frozenset({"weather", "traffic"}),
+        )
+
+    updater._post_alert_events = publish_during_post  # type: ignore[method-assign]
+    await updater._process_alert_snapshot()  # noqa: SLF001
+
+    assert processed == [first]
+    assert updater._last_alert_generation == 1  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_tick_keeps_completed_alert_generation_when_next_collection_starts(
+    monkeypatch,
+):
+    import bot as bot_module
+    from dashboard.models import TrafficIncident
+
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = _FakeMessage(  # noqa: SLF001
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER
+    )
+    updater._collection_generation = 1  # noqa: SLF001
+    incident = TrafficIncident(
+        "transient",
+        "Transient TD notice",
+        "Present for one completed collection only",
+        "Clear Water Bay Road",
+        "",
+        "",
+        "active",
+    )
+    updater._publish_provider_result(  # noqa: SLF001
+        1, "weather", (None, [], None)
+    )
+    updater._publish_provider_result(  # noqa: SLF001
+        1, "traffic", ([], [incident], [], None)
+    )
+    first_results = updater._snapshot.results  # noqa: SLF001
+    processed = []
+
+    def start_next_collection():
+        updater._collection_generation = 2  # noqa: SLF001
+        updater._publish_provider_result(2, "transit", ([], None, []))  # noqa: SLF001
+
+    async def record(results):
+        processed.append(results)
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(updater, "_start_collection_if_idle", start_next_collection)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: DashboardPayload())
+    monkeypatch.setattr(updater, "_ensure_thread", no_op)
+    monkeypatch.setattr(updater, "_post_alert_events", record)
+    monkeypatch.setattr(bot_module, "_apply_payload", no_op)
+
+    await updater._tick(object())  # noqa: SLF001
+
+    assert processed == [first_results]
+    assert updater._last_alert_generation == 1  # noqa: SLF001
+    assert updater._snapshot.generation == 2  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_failed_alert_send_is_retained_and_retried_without_duplication():
+    from dashboard.models import Roadwork
+
+    updater = DashboardUpdater(_fake_settings())
+    flaky = _FailOnceThread()
+    updater._thread = flaky  # noqa: SLF001
+    baseline = {"weather": (None, [], None), "traffic": ([], [], [], None)}
+    active = {
+        "weather": (None, [], None),
+        "traffic": (
+            [],
+            [],
+            [Roadwork("rw-retry", "Lane closure", "Clear Water Bay Road")],
+            None,
+        ),
+    }
+    await updater._post_alert_events(baseline)  # noqa: SLF001 - seed
+    await updater._post_alert_events(active)  # noqa: SLF001 - first send fails
+
+    assert updater._thread is None  # noqa: SLF001
+    assert len(updater._pending_alert_messages) == 1  # noqa: SLF001
+    replacement = _FakeThread()
+    updater._thread = replacement  # noqa: SLF001
+    await updater._flush_alert_messages()  # noqa: SLF001
+    await updater._post_alert_events(active)  # noqa: SLF001 - same state, no duplicate
+
+    assert len(replacement.sent) == 1
+    assert "Lane closure" in replacement.sent[0]["content"]
+    assert not updater._pending_alert_messages  # noqa: SLF001
 
 
 def _fake_settings():

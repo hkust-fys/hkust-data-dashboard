@@ -76,6 +76,12 @@ class BusEstimate:
     eta_arrival_at: object | None = None
     bracket_initial_eta: float | None = None
     boundary_age_seconds: float | None = None
+    # Stop occurrences whose current rows form the useful refresh frontier for
+    # this exact ETA instance: every due/zero rung plus the first positive rung
+    # after it.  MarkerTracker combines these with the physical bracket and
+    # terminus so a zero plateau advances promptly without sharing evidence
+    # between simultaneous vehicles.
+    priority_indices: frozenset[int] = frozenset()
 
     @property
     def bracket_lower(self):
@@ -1469,6 +1475,7 @@ def estimate_bus_positions(
             eta_minutes = None
             eta_arrival_at = None
             boundary_age_seconds = None
+            priority_indices = frozenset()
             observed = observed_by_route.get((operator_name, route, bound))
             if observed is not None and provenance:
                 first_present = min(provenance)
@@ -1483,6 +1490,34 @@ def estimate_bus_positions(
                                if str(kind).lower() == "probe"
                                and 0 <= index < len(probe_inputs)]
                 source_rows = [row for row in source_rows if getattr(row, "minutes", None) is not None]
+                zero_indices = sorted({
+                    int(row.index)
+                    for row in source_rows
+                    if float(row.minutes) <= 0
+                })
+                positive_indices = sorted({
+                    int(row.index)
+                    for row in source_rows
+                    if float(row.minutes) > 0
+                })
+                refresh_frontier = set(zero_indices)
+                if zero_indices:
+                    next_positive = next(
+                        (
+                            index
+                            for index in positive_indices
+                            if index > zero_indices[-1]
+                        ),
+                        None,
+                    )
+                    if next_positive is not None:
+                        refresh_frontier.add(next_positive)
+                else:
+                    # With no zero plateau yet, keep the first two positive
+                    # rungs fresh so the next hand-off already has an upper
+                    # observation when the first rung becomes due or vanishes.
+                    refresh_frontier.update(positive_indices[:2])
+                priority_indices = frozenset(refresh_frontier)
                 present_rows = [row for row in source_rows
                                 if (str(getattr(row, "operator", "")),
                                     str(getattr(row, "route", "")),
@@ -1556,6 +1591,7 @@ def estimate_bus_positions(
                     eta_arrival_at=eta_arrival_at,
                     bracket_initial_eta=eta_minutes,
                     boundary_age_seconds=boundary_age_seconds,
+                    priority_indices=priority_indices,
                 )
             )
     return estimates

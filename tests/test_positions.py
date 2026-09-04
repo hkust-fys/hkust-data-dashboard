@@ -1403,6 +1403,32 @@ def test_all_stop_boundary_controls_proportion_and_ignores_unrelated_cache_age()
     assert estimates[0].position == 2.5
     assert estimates[0].eta_minutes == 1
     assert estimates[0].boundary_age_seconds == 1
+    assert estimates[0].priority_indices == frozenset({3, 4})
+
+
+def test_priority_indices_cover_full_zero_plateau_and_next_positive_stop():
+    line = _line(stop_count=9)
+    rows = [
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 3, 0, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 4, 0, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 5, 0, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 6, 2, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 7, 4, cache_age_seconds=0),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={("KMB", "X", "outbound"): range(9)},
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].bracket == (2.0, 3.0)
+    # Zero minutes has no evidence for passing stop 3, so rendering stays at
+    # the upstream edge of the zero plateau rather than jumping into it.
+    assert estimates[0].position == 3.0
+    assert estimates[0].priority_indices == frozenset({3, 4, 5, 6})
 
 
 def test_consecutive_empty_stops_then_downstream_observation_forms_one_boundary_marker():

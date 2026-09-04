@@ -101,6 +101,7 @@ def frame_record(
             "boundary_age_seconds": getattr(x, "boundary_age_seconds", None),
             "source_indices": sorted(getattr(x, "source_indices", ()) or ()),
             "source_observations": sorted(getattr(x, "source_observations", ()) or ()),
+            "priority_indices": sorted(getattr(x, "priority_indices", ()) or ()),
         }
     def evidence_record(x):
         e = evidence(x)

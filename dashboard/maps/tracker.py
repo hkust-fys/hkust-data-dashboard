@@ -77,6 +77,17 @@ class MarkerTracker:
                 continue
             endpoints = set()
             for track in tracks.values():
+                for endpoint in (
+                    getattr(track.estimate, "priority_indices", None) or ()
+                ):
+                    if isinstance(endpoint, int) and endpoint >= 0:
+                        endpoints.add(endpoint)
+                    elif (
+                        isinstance(endpoint, float)
+                        and endpoint.is_integer()
+                        and endpoint >= 0
+                    ):
+                        endpoints.add(int(endpoint))
                 for endpoint in getattr(track.estimate, "bracket", None) or ():
                     if isinstance(endpoint, int) and endpoint >= 0:
                         endpoints.add(endpoint)

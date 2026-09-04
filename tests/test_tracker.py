@@ -14,7 +14,7 @@ BASE_TIME = datetime(2026, 1, 1, tzinfo=UTC)
 
 def _candidate(position, *, gate=False, route="R", operator=Operator.KMB,
                bound="out", unreliable=False, scheduled=False, bracket=None,
-               boundary_age=None, arrival_at=None):
+               boundary_age=None, arrival_at=None, priority_indices=()):
     code = {Operator.KMB: "KMB", Operator.CITYBUS: "CTB", Operator.GMB: "GMB"}[operator]
     return BusEstimate(
         f"{route} destination", 22.3, 114.2, operator, 0.0,
@@ -27,6 +27,7 @@ def _candidate(position, *, gate=False, route="R", operator=Operator.KMB,
         bracket=bracket,
         boundary_age_seconds=boundary_age,
         eta_arrival_at=arrival_at,
+        priority_indices=frozenset(priority_indices),
     )
 
 
@@ -332,6 +333,21 @@ async def test_priority_poll_includes_route_terminus_with_marker_boundaries():
     await tracker.update(_snapshot(1), candidates, [_line(stops=6)])
     assert tracker.poll_priorities() == {
         ("KMB", "R", "out"): frozenset({1, 2, 5})
+    }
+
+
+@pytest.mark.asyncio
+async def test_priority_poll_covers_owned_zero_plateau_and_forward_rung():
+    tracker = MarkerTracker()
+    candidate = _candidate(
+        3.0,
+        bracket=(2.0, 3.0),
+        boundary_age=0,
+        priority_indices={3, 4, 5, 6},
+    )
+    await tracker.update(_snapshot(1), [candidate], [_line(stops=9)])
+    assert tracker.poll_priorities() == {
+        ("KMB", "R", "out"): frozenset({2, 3, 4, 5, 6, 8})
     }
 
 

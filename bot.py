@@ -64,11 +64,94 @@ def _setup_logging(level: str) -> None:
 # Data collection
 # --------------------------------------------------------------------------
 
+
+def _map_road_paths_from_results(
+    traffic_result: object,
+    roads: object,
+) -> tuple[list[list[tuple[float, float]]], list[list[tuple[float, float]]]]:
+    """Derive map overlays from an already-published provider snapshot."""
+    important_paths = road_policy.important_road_paths(roads)
+    if not (isinstance(traffic_result, tuple) and len(traffic_result) >= 3):
+        return [], important_paths
+    segments_near = getattr(roads, "segments_near", None)
+    if segments_near is None:
+        return [], important_paths
+    paths: list[list[tuple[float, float]]] = []
+    seen_paths: set[tuple[tuple[float, float], ...]] = set()
+    for incident in traffic_result[1] or []:
+        latitude = getattr(incident, "latitude", None)
+        longitude = getattr(incident, "longitude", None)
+        keys = traffic_provider.resolve_incident_road_keys(incident, roads)
+        has_coordinates = (
+            isinstance(latitude, (int, float))
+            and isinstance(longitude, (int, float))
+            and 22.0 <= latitude <= 23.0
+            and 113.5 <= longitude <= 114.7
+        )
+        if not has_coordinates:
+            # A malformed, partial, or out-of-range coordinate is an explicit
+            # source signal, not permission to guess a whole road. Only a
+            # completely coordinate-less notice may use the conservative
+            # short-road fallback.
+            if latitude is not None or longitude is not None:
+                continue
+            near_landmark = str(getattr(incident, "near_landmark", "") or "").strip()
+            between_landmark = str(
+                getattr(incident, "between_landmark", "") or ""
+            ).strip()
+            if near_landmark or between_landmark:
+                # A landmark-only notice may still name a specific short
+                # sub-road (for example, "Lung Cheung Road flyover").
+                keys = traffic_provider.resolve_incident_road_keys(
+                    incident, roads, prefer_refinement=True
+                )
+                if not keys:
+                    continue
+            latitude = longitude = None
+        if not keys:
+            continue
+        for path in segments_near(keys, latitude, longitude) or ():
+            normalized = tuple((float(lat), float(lon)) for lat, lon in path)
+            if len(normalized) >= 2 and normalized not in seen_paths:
+                seen_paths.add(normalized)
+                paths.append(list(normalized))
+    return paths, important_paths
+
+
+async def _fetch_traffic_map_from_results(
+    client: HttpClient,
+    settings: Settings,
+    results: dict[str, object],
+    tracker: object,
+) -> object:
+    """Render one map from retained inputs without joining provider network work."""
+    transit_result = results.get("transit")
+    groups = (
+        transit_result[0]
+        if isinstance(transit_result, tuple) and len(transit_result) == 3
+        else []
+    )
+    roads = results.get("tracked_roads")
+    if roads is None or isinstance(roads, Exception):
+        roads = tracked_roads_provider.fallback_roads()
+    affected_paths, important_paths = _map_road_paths_from_results(
+        results.get("traffic"), roads
+    )
+    return await maps.fetch_traffic_map(
+        client,
+        groups=groups,
+        cache_dir=settings.cache_dir,
+        affected_road_paths=affected_paths,
+        tracker=tracker,
+        important_road_paths=important_paths,
+    )
+
 async def collect_all(
     client: HttpClient,
     settings: Settings,
     on_result: Callable[[str, object], None] | None = None,
     tracker=None,
+    include_traffic_map: bool = True,
 ) -> dict[str, object]:
     """Fetch all provider groups concurrently; return raw results keyed by name.
 
@@ -81,7 +164,7 @@ async def collect_all(
 
     async def _tracked_roads():
         return await tracked_roads_provider.fetch_tracked_roads(
-            client, cache_dir=settings.cache_dir
+            client, cache_dir=settings.cache_dir, wait_for_refresh=False
         )
 
     async def _transit():
@@ -119,54 +202,7 @@ async def collect_all(
             )
         except Exception:  # noqa: BLE001
             roads = tracked_roads_provider.fallback_roads()
-        important_paths = road_policy.important_road_paths(roads)
-        if not (isinstance(traffic_result, tuple) and len(traffic_result) >= 3):
-            return [], important_paths
-        segments_near = getattr(roads, "segments_near", None)
-        if segments_near is None:
-            return [], important_paths
-        paths: list[list[tuple[float, float]]] = []
-        seen_paths: set[tuple[tuple[float, float], ...]] = set()
-        for incident in traffic_result[1] or []:
-            latitude = getattr(incident, "latitude", None)
-            longitude = getattr(incident, "longitude", None)
-            keys = traffic_provider.resolve_incident_road_keys(incident, roads)
-            has_coordinates = (
-                isinstance(latitude, (int, float))
-                and isinstance(longitude, (int, float))
-                and 22.0 <= latitude <= 23.0
-                and 113.5 <= longitude <= 114.7
-            )
-            if not has_coordinates:
-                # A malformed, partial, or out-of-range coordinate is an
-                # explicit source signal, not permission to guess a whole
-                # road. Only a completely coordinate-less notice may use the
-                # provider's conservative short-road fallback.
-                if latitude is not None or longitude is not None:
-                    continue
-                near_landmark = str(getattr(incident, "near_landmark", "") or "").strip()
-                between_landmark = str(
-                    getattr(incident, "between_landmark", "") or ""
-                ).strip()
-                if near_landmark or between_landmark:
-                    # A landmark-only notice may still name a specific short
-                    # sub-road (for example, "Lung Cheung Road flyover").
-                    # Permit the conservative whole-way fallback only for
-                    # that explicit refinement, never for the generic road.
-                    keys = traffic_provider.resolve_incident_road_keys(
-                        incident, roads, prefer_refinement=True
-                    )
-                    if not keys:
-                        continue
-                latitude = longitude = None
-            if not keys:
-                continue
-            for path in segments_near(keys, latitude, longitude) or ():
-                normalized = tuple((float(lat), float(lon)) for lat, lon in path)
-                if len(normalized) >= 2 and normalized not in seen_paths:
-                    seen_paths.add(normalized)
-                    paths.append(list(normalized))
-        return paths, important_paths
+        return _map_road_paths_from_results(traffic_result, roads)
 
     async def _traffic_map():
         # Transit ETA groups still drive retained estimated bus markers.
@@ -195,8 +231,9 @@ async def collect_all(
     ):
         tasks[name] = asyncio.create_task(coro)
 
-    # The map uses transit ETA groups to estimate bus positions.
-    tasks["traffic_map"] = asyncio.create_task(_traffic_map())
+    if include_traffic_map:
+        # One-shot callers retain the historical complete collection.
+        tasks["traffic_map"] = asyncio.create_task(_traffic_map())
 
     results: dict[str, object] = {}
     task_names = {task: name for name, task in tasks.items()}
@@ -803,6 +840,9 @@ class DashboardUpdater:
         self._last_payload_fingerprint: str | None = None
         self._snapshot: CollectionSnapshot | None = None
         self._collection_task: asyncio.Task | None = None
+        self._map_task: asyncio.Task | None = None
+        self._map_generation: int | None = None
+        self._independent_map_enabled = False
         self._collection_generation = 0
         self._last_alert_generation = 0
         self._last_queued_alert_generation = 0
@@ -988,6 +1028,13 @@ class DashboardUpdater:
             except Exception as exc:  # noqa: BLE001
                 log.warning("update tick failed: %s", exc)
             next_tick += self.settings.update_interval_seconds
+            # A slow provider or Discord edit can miss several presentation
+            # windows.  Skip those deadlines instead of replaying them as a
+            # zero-sleep catch-up burst; the next tick is the next real window.
+            now = time.monotonic()
+            if next_tick <= now:
+                interval = max(0.001, self.settings.update_interval_seconds)
+                next_tick = now + interval
             await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
 
     def _start_collection_if_idle(self) -> None:
@@ -1010,9 +1057,12 @@ class DashboardUpdater:
         # collectors from before snapshots continue to work; production's
         # ``collect_all`` always has the incremental callback.
         parameters = inspect.signature(collect_all).parameters
+        self._independent_map_enabled = "include_traffic_map" in parameters
         kwargs = {"on_result": publish} if "on_result" in parameters else {}
         if "tracker" in parameters:
             kwargs["tracker"] = self.marker_tracker
+        if self._independent_map_enabled:
+            kwargs["include_traffic_map"] = False
         if kwargs:
             collection = collect_all(self.client, self.settings, **kwargs)
         else:
@@ -1020,6 +1070,40 @@ class DashboardUpdater:
         task = asyncio.create_task(collection)
         self._collection_task = task
         task.add_done_callback(self._collection_finished)
+
+    def _start_map_if_idle(self) -> None:
+        if not self._running or self.client is None or not self._independent_map_enabled:
+            return
+        if self._map_task is not None:
+            if not self._map_task.done():
+                return
+            self._map_finished(self._map_task, self._map_generation)
+        results = dict(self._snapshot.results) if self._snapshot else {}
+        generation = self._collection_generation
+        self._map_generation = generation
+        self._map_task = asyncio.create_task(
+            _fetch_traffic_map_from_results(
+                self.client, self.settings, results, self.marker_tracker
+            )
+        )
+        self._map_task.add_done_callback(
+            lambda done, generation=generation: self._map_finished(done, generation)
+        )
+
+    def _map_finished(self, task: asyncio.Task, generation: int | None) -> None:
+        if self._map_task is not task:
+            return
+        self._map_task = None
+        self._map_generation = None
+        if task.cancelled():
+            return
+        try:
+            value = task.result()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("background map refresh failed: %s", type(exc).__name__)
+            value = exc
+        if generation is not None:
+            self._publish_provider_result(generation, "traffic_map", value)
 
     def _collection_finished(self, task: asyncio.Task) -> None:
         """Publish a completed collection without blocking the presenter."""
@@ -1089,6 +1173,8 @@ class DashboardUpdater:
         # The presenter is deliberately independent of provider latency.  It
         # starts the next refresh when idle then reads only a completed snapshot.
         self._start_collection_if_idle()
+        if self._independent_map_enabled:
+            self._start_map_if_idle()
         # Let an already-ready task publish its callback, without awaiting a
         # slow provider.  This also makes fast local/dry-run providers visible
         # on the first presentation.
@@ -1180,10 +1266,19 @@ class DashboardUpdater:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await collection_task
         self._collection_task = None
+        map_task = self._map_task
+        if map_task is not None and not map_task.done():
+            map_task.cancel()
+        if map_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await map_task
+        self._map_task = None
+        self._map_generation = None
         self.marker_tracker.clear()
         await maps.shutdown_gmaps_browser()
         await route_geometry_provider.shutdown_background_refreshes()
         await tracked_roads_provider.shutdown_background_refreshes()
+        await transit.shutdown_background_refreshes()
         if self.session is not None:
             await self.session.close()
             self.session = None
@@ -1275,6 +1370,7 @@ async def run_dev_webhook(settings: Settings) -> None:
             await maps.shutdown_gmaps_browser()
             await route_geometry_provider.shutdown_background_refreshes()
             await tracked_roads_provider.shutdown_background_refreshes()
+            await transit.shutdown_background_refreshes()
 
 
 async def run_dry_run(settings: Settings) -> None:
@@ -1316,6 +1412,7 @@ async def run_dry_run(settings: Settings) -> None:
             await maps.shutdown_gmaps_browser()
             await route_geometry_provider.shutdown_background_refreshes()
             await tracked_roads_provider.shutdown_background_refreshes()
+            await transit.shutdown_background_refreshes()
 
 
 # --------------------------------------------------------------------------

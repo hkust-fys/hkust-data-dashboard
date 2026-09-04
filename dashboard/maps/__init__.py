@@ -17,7 +17,12 @@ from dashboard.maps.renderer import (
 from dashboard.maps.tiles import capture_gmaps_base, shutdown_gmaps_browser
 from dashboard.maps.tracker import MarkerTracker
 from dashboard.models import EtaKind, RouteEtaGroup
-from dashboard.providers.route_geometry import Stop, fetch_route_geometry, select_probe_stops
+from dashboard.providers.route_geometry import (
+    ProbeStop,
+    Stop,
+    fetch_route_geometry,
+    select_probe_stops,
+)
 from dashboard.providers.transit import CTB_STOPS, GMB_STOPS, KMB_STOPS, fetch_probe_snapshot
 
 log = logging.getLogger(__name__)
@@ -195,15 +200,15 @@ async def fetch_traffic_map(
     # Disk-backed geometry is immediate; a cold cache is independently bounded
     # by the provider.  Start it alongside browser capture so routing trouble
     # can never delay launching the required Google Maps screenshot.
-    geometry_task = asyncio.create_task(fetch_route_geometry(client, cache_dir=cache_dir))
-    operation_tasks.append(geometry_task)
+    geometry_task = asyncio.create_task(
+        fetch_route_geometry(client, cache_dir=cache_dir, wait_for_refresh=False)
+    )
     base_image: object | None = None
     probe_task: asyncio.Task[object] | None = None
     try:
-        # Geometry determines the probe set, so it is the first dependency we
-        # await.  The browser capture remains in flight while a cold geometry
-        # cache is populated, and the probe sweep starts as soon as the lines
-        # are available rather than waiting for the screenshot.
+        # A warm geometry task can feed this frame, but a cold refresh must not
+        # hold up the capture/presenter.  It remains owned by the provider and
+        # is drained by provider shutdown before the shared session closes.
         try:
             geometry = await geometry_task
         except Exception as exc:  # noqa: BLE001
@@ -215,12 +220,39 @@ async def fetch_traffic_map(
                 str(spec["stop"]) for spec in KMB_STOPS
             } | {str(spec["stop"]) for spec in CTB_STOPS}
             mandatory |= {str(stop_id) for stop_id in GMB_STOPS}
-            probes = (select_probe_stops(route_lines, mandatory_stop_ids=mandatory)
+            baseline_probes = (select_probe_stops(
+                route_lines, mandatory_stop_ids=mandatory, max_anchors=4
+            )
                       if route_lines else [])
             priority_provider = getattr(tracker, "poll_priorities", None)
             priorities = priority_provider() if callable(priority_provider) else None
+            probes = list(baseline_probes)
+            seen = {(p.operator, p.route, p.bound, p.index) for p in probes}
+            for line in route_lines:
+                route_key = (line.operator, line.route, line.bound)
+                wanted = (priorities or {}).get(route_key, ())
+                for index in wanted:
+                    index = int(index)
+                    if not 0 <= index < len(line.stops):
+                        continue
+                    key = (line.operator, line.route, line.bound, index)
+                    if key in seen:
+                        continue
+                    template = next((p for p in baseline_probes
+                        if (p.operator, p.route, p.bound) == route_key), None)
+                    if template is None:
+                        continue
+                    probes.append(ProbeStop(
+                        line.operator, line.route, line.bound,
+                        line.stops[index].stop_id, template.route_id,
+                        template.sequence, index,
+                    ))
+                    seen.add(key)
             probe_task = asyncio.create_task(
-                fetch_probe_snapshot(client, probes, priorities=priorities)
+                fetch_probe_snapshot(
+                    client, probes, priorities=priorities, wait_for_refresh=False,
+                    generation_probes=baseline_probes,
+                )
             )
             operation_tasks.append(probe_task)
 

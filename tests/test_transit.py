@@ -34,6 +34,7 @@ def _reset_gmb_state(monkeypatch):
     transit._probe_group_rows.clear()  # noqa: SLF001
     transit._probe_route_published_versions.clear()  # noqa: SLF001
     monkeypatch.setattr(transit, "_probe_generation", 0)
+    monkeypatch.setattr(transit, "_probe_cold_cursor", 0)
     monkeypatch.setattr(transit, "_probe_priority_cursor", 0)
     monkeypatch.setattr(transit, "_probe_background_cursor", 0)
     monkeypatch.setattr(transit, "_gate_network_refresh_at", None)
@@ -317,6 +318,202 @@ async def test_priority_refresh_is_visible_before_next_complete_generation(monke
 
 
 @pytest.mark.asyncio
+async def test_supplemental_probe_churn_cannot_invalidate_sparse_baseline(monkeypatch):
+    now = s.utc()
+    route_key = ("CTB", "R", "outbound")
+
+    def probe(index):
+        return SimpleNamespace(
+            operator="CTB", route="R", bound="outbound", stop_id=f"s{index}",
+            route_id=1, sequence=1, index=index,
+        )
+
+    baseline = [probe(index) for index in (0, 3, 6, 9)]
+    supplemental = probe(4)
+
+    async def fetch(_client, selected):
+        return {"data": [{
+            "dir": "O",
+            "eta": (now + timedelta(minutes=selected.index + 1)).isoformat(),
+            "data_timestamp": now.isoformat(),
+        }]}
+
+    monkeypatch.setattr(transit, "_probe_wall_clock", lambda: now)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    first = await transit.fetch_probe_snapshot(
+        object(), baseline, max_per_cycle=4, generation_probes=baseline
+    )
+    assert len(first.complete_routes) == 1
+    generation = first.complete_routes[0].generation
+    assert first.complete_routes[0].observed_checkpoint_indices == {0, 3, 6, 9}
+
+    with_supplement = await transit.fetch_probe_snapshot(
+        object(), baseline + [supplemental], max_per_cycle=1,
+        priorities={route_key: {4}}, generation_probes=baseline,
+    )
+    assert with_supplement.complete_routes[0].generation == generation
+    assert with_supplement.complete_routes[0].observed_checkpoint_indices == {0, 3, 6, 9}
+    assert ("CTB", "R", "outbound", 4) in with_supplement.positioning_checkpoints
+
+    without_supplement = await transit.fetch_probe_snapshot(
+        object(), baseline, max_per_cycle=1, generation_probes=baseline
+    )
+    assert without_supplement.complete_routes[0].generation == generation
+
+
+@pytest.mark.asyncio
+async def test_realistic_cold_baseline_overflow_completes_within_two_cycles(monkeypatch):
+    probes = [
+        SimpleNamespace(
+            operator="CTB", route="R", bound="outbound",
+            stop_id=f"stop-{index:02d}", route_id=1, sequence=1, index=index,
+        )
+        for index in range(40)
+    ]
+    calls: list[str] = []
+
+    async def fetch(_client, selected):
+        calls.append(selected.stop_id)
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        object(), probes, 36, generation_probes=probes
+    )
+    assert len(calls) == 36
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        object(), probes, 36, generation_probes=probes
+    )
+
+    assert set(calls) == {f"stop-{index:02d}" for index in range(40)}
+    assert len(transit._probe_route_generations) == 1  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_large_active_marker_probe_set_rotates_within_two_cycles(monkeypatch):
+    route_key = ("CTB", "R", "outbound")
+
+    def probe(index):
+        return SimpleNamespace(
+            operator="CTB", route="R", bound="outbound", stop_id=f"s{index:03d}",
+            route_id=1, sequence=1, index=index,
+        )
+
+    baseline = [probe(index) for index in (0, 33, 66, 99)]
+    supplemental = [probe(index) for index in range(100, 145)]
+    calls: list[int] = []
+
+    async def fetch(_client, selected):
+        calls.append(selected.index)
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        object(), baseline, 36, generation_probes=baseline
+    )
+    calls.clear()
+    priorities = {route_key: {probe.index for probe in supplemental}}
+    active = baseline + supplemental
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        object(), active, 36, priorities, generation_probes=baseline
+    )
+    assert len(calls) == 36
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        object(), active, 36, priorities, generation_probes=baseline
+    )
+
+    assert {probe.index for probe in supplemental} <= set(calls)
+
+
+@pytest.mark.asyncio
+async def test_sustained_gmb_marker_probes_cannot_starve_sparse_discovery(monkeypatch):
+    route_key = ("GMB", "R", "seq-1")
+
+    def probe(index):
+        return SimpleNamespace(
+            operator="GMB", route="R", bound="seq-1", stop_id=f"s{index:02d}",
+            route_id=1, sequence=1, index=index,
+        )
+
+    baseline = [probe(index) for index in range(20)]
+    supplemental = [probe(index) for index in range(20, 40)]
+    calls: list[str] = []
+
+    async def fetch(_client, selected):
+        calls.append(selected.stop_id)
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        object(), baseline, 36, generation_probes=baseline
+    )
+    assert len(transit._probe_route_generations) == 1  # noqa: SLF001
+    calls.clear()
+
+    priorities = {route_key: {probe.index for probe in supplemental}}
+    active = baseline + supplemental
+    for _ in range(2):
+        await transit._refresh_probe_etas(  # noqa: SLF001
+            object(), active, 36, priorities, generation_probes=baseline
+        )
+
+    assert {probe.stop_id for probe in baseline} <= set(calls)
+    assert {probe.stop_id for probe in supplemental} <= set(calls)
+    assert len(calls) == 40
+
+
+@pytest.mark.asyncio
+async def test_mixed_operator_priority_ring_resumes_at_capped_gmb_group(monkeypatch):
+    def probe(operator, route, stop_id, index):
+        return SimpleNamespace(
+            operator=operator, route=route,
+            bound="seq-1" if operator == "GMB" else "outbound",
+            stop_id=stop_id, route_id=1, sequence=1, index=index,
+        )
+
+    baseline = [probe("GMB", "BASE", f"b{index}", index) for index in range(4)]
+    priority = (
+        [probe("CTB", "C", "ctb", 0)]
+        + [probe("GMB", "P", f"p{index}", index) for index in range(4)]
+        + [probe("KMB", "K", "kmb", 0)]
+    )
+    priorities = {
+        ("CTB", "C", "outbound"): {0},
+        ("GMB", "P", "seq-1"): {0, 1, 2, 3},
+        ("KMB", "K", "outbound"): {0},
+    }
+    calls: list[tuple[str, str]] = []
+
+    async def fetch(_client, selected):
+        calls.append((selected.operator, selected.stop_id))
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 4)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        object(), baseline, 10, generation_probes=baseline
+    )
+    calls.clear()
+
+    first_cycle = None
+    for cycle in range(2):
+        calls.clear()
+        await transit._refresh_probe_etas(  # noqa: SLF001
+            object(), baseline + priority, 10, priorities,
+            generation_probes=baseline,
+        )
+        selected_priority = {
+            stop for operator, stop in calls
+            if operator == "GMB" and stop.startswith("p")
+        }
+        if cycle == 0:
+            first_cycle = selected_priority
+        else:
+            assert selected_priority.isdisjoint(first_cycle)
+            assert first_cycle | selected_priority == {f"p{index}" for index in range(4)}
+
+
+@pytest.mark.asyncio
 async def test_sustained_gmb_priorities_reserve_rotating_background_capacity(monkeypatch):
     probes = [
         SimpleNamespace(
@@ -373,8 +570,8 @@ async def test_gmb_probe_cap_rotates_across_all_groups(monkeypatch):
     monkeypatch.setattr(transit, "_probe_cache", transit.ProbeEtaCache())
     monkeypatch.setattr(transit, "_probe_background_cursor", 0)
     monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
-    # Twenty GMB groups per cycle require three cycles to cover all 35.
-    for _ in range(3):
+    # The fair cold cursor covers the 35 groups in two capped cycles.
+    for _ in range(2):
         await transit.fetch_probe_etas(object(), probes)
 
     assert set(calls) == {f"stop-{index}" for index in range(35)}
@@ -568,6 +765,70 @@ async def test_probe_refresh_interval_serves_aged_cache(monkeypatch):
     assert calls == 1
     assert first[0].minutes == pytest.approx(4)
     assert second[0].minutes <= first[0].minutes
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_probe_refresh_publishes_for_a_later_map_frame(monkeypatch):
+    probe = SimpleNamespace(
+        operator="GMB", route="11", bound="seq-1", stop_id="stop",
+        route_id=1, sequence=1, index=0,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(_client, _probe):
+        started.set()
+        await release.wait()
+        return {"data": [{
+            "enabled": True, "route_id": 1, "route_seq": 1, "stop_seq": 1,
+            "eta": [{"diff": 4}],
+        }]}
+
+    monkeypatch.setattr(transit, "TRANSIT_NETWORK_REFRESH_SECONDS", 30.0)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    immediate = await transit.fetch_probe_snapshot(
+        object(), [probe], wait_for_refresh=False, generation_probes=[probe]
+    )
+    assert immediate.complete_routes == ()
+    await asyncio.wait_for(started.wait(), timeout=1)
+    refresh = transit._probe_refresh_task  # noqa: SLF001
+    assert refresh is not None and not refresh.done()
+
+    release.set()
+    await refresh
+    later = await transit.fetch_probe_snapshot(
+        object(), [probe], wait_for_refresh=False, generation_probes=[probe]
+    )
+    assert len(later.complete_routes) == 1
+    assert later.complete_routes[0].observed_checkpoint_indices == {0}
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_detached_probe_refresh(monkeypatch):
+    probe = SimpleNamespace(
+        operator="GMB", route="11", bound="seq-1", stop_id="stop",
+        route_id=1, sequence=1, index=0,
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fetch(_client, _probe):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit.fetch_probe_etas(object(), [probe], wait_for_refresh=False)
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await transit.shutdown_background_refreshes()
+
+    assert cancelled.is_set()
+    assert transit._probe_refresh_task is None  # noqa: SLF001
+    assert transit._probe_network_refresh_at is None  # noqa: SLF001
 
 
 @pytest.mark.asyncio

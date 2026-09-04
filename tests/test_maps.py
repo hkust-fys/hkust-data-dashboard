@@ -197,8 +197,9 @@ async def test_probe_selection_receives_verified_gate_ids_as_mandatory_anchors(m
     async def geometry(*_args, **_kwargs):
         return RouteGeometry(routes=[line])
 
-    def select(lines, *, mandatory_stop_ids):
+    def select(lines, *, mandatory_stop_ids, max_anchors):
         seen["ids"] = set(mandatory_stop_ids)
+        seen["max_anchors"] = max_anchors
         return []
 
     monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
@@ -207,6 +208,49 @@ async def test_probe_selection_receives_verified_gate_ids_as_mandatory_anchors(m
     monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
     await maps.fetch_traffic_map(object())
     assert {"B002CEF0DBC568F5", "003130", "20013011"} <= seen["ids"]
+    assert seen["max_anchors"] == 4
+
+
+@pytest.mark.asyncio
+async def test_active_priority_adds_supplement_without_changing_sparse_baseline(monkeypatch):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+
+    line = RouteLine(
+        "91",
+        "KMB",
+        "outbound",
+        [Stop(f"s{index}", f"Stop {index}", 22.33, 114.26 + index * 0.001)
+         for index in range(9)],
+    )
+    seen = {}
+
+    async def geometry(*_args, **_kwargs):
+        return RouteGeometry(routes=[line])
+
+    async def snapshot(_client, probes, **kwargs):
+        seen["probes"] = list(probes)
+        seen.update(kwargs)
+        return _probe_snapshot()
+
+    class Tracker:
+        def poll_priorities(self):
+            return {("KMB", "91", "outbound"): {4}}
+
+        async def update(self, _snapshot, estimates, _lines):
+            return estimates
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
+    monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", snapshot)
+    monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
+
+    await maps.fetch_traffic_map(object(), tracker=Tracker())
+
+    baseline = seen["generation_probes"]
+    assert [probe.index for probe in baseline] == [0, 3, 5, 8]
+    assert [probe.index for probe in seen["probes"]] == [0, 3, 5, 8, 4]
+    assert seen["wait_for_refresh"] is False
 
 
 @pytest.mark.asyncio

@@ -93,6 +93,17 @@ class MarkerTracker:
                         endpoints.add(endpoint)
                     elif isinstance(endpoint, float) and endpoint.is_integer() and endpoint >= 0:
                         endpoints.add(int(endpoint))
+                bracket = getattr(track.estimate, "bracket", None) or ()
+                if len(bracket) == 2:
+                    try:
+                        lower, upper = sorted((int(bracket[0]), int(bracket[1])))
+                    except (TypeError, ValueError):
+                        lower = upper = 0
+                    if upper - lower > 1:
+                        midpoint = (lower + upper) // 2
+                        endpoints.add(midpoint)
+                        if upper - lower > 2:
+                            endpoints.add(midpoint + 1)
             terminal = self._terminal_indices.get(key)
             if terminal is not None:
                 endpoints.add(terminal)

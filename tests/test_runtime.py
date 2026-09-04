@@ -5,6 +5,7 @@ operation after a failed provider."""
 
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -580,19 +581,23 @@ async def test_updater_stops_provider_refreshes_before_session_close(monkeypatch
     async def stop_roads():
         events.append("roads")
 
+    async def stop_transit():
+        events.append("transit")
+
     class Session:
         async def close(self):
             events.append("session")
 
     monkeypatch.setattr(bot_module.route_geometry_provider, "shutdown_background_refreshes", stop_geometry)
     monkeypatch.setattr(bot_module.tracked_roads_provider, "shutdown_background_refreshes", stop_roads)
+    monkeypatch.setattr(bot_module.transit, "shutdown_background_refreshes", stop_transit)
     monkeypatch.setattr(bot_module.maps, "shutdown_gmaps_browser", stop_browser)
     updater = DashboardUpdater(_fake_settings())
     updater.session = Session()
 
     await updater.stop()
 
-    assert events == ["browser", "geometry", "roads", "session"]
+    assert events == ["browser", "geometry", "roads", "transit", "session"]
 
 
 @pytest.mark.asyncio
@@ -639,10 +644,14 @@ async def test_one_shot_runners_cleanup_background_resources_on_failure(monkeypa
     async def stop_roads():
         events.append("roads")
 
+    async def stop_transit():
+        events.append("transit")
+
     monkeypatch.setattr(bot_module, "collect_all", fail_collect)
     monkeypatch.setattr(bot_module.maps, "shutdown_gmaps_browser", stop_browser)
     monkeypatch.setattr(bot_module.route_geometry_provider, "shutdown_background_refreshes", stop_geometry)
     monkeypatch.setattr(bot_module.tracked_roads_provider, "shutdown_background_refreshes", stop_roads)
+    monkeypatch.setattr(bot_module.transit, "shutdown_background_refreshes", stop_transit)
     settings = replace(
         _fake_settings(),
         dev_webhook="https://discord.com/api/webhooks/placeholder/token",
@@ -650,7 +659,7 @@ async def test_one_shot_runners_cleanup_background_resources_on_failure(monkeypa
 
     with pytest.raises(RuntimeError, match="collection failed"):
         await getattr(bot_module, runner)(settings)
-    assert events == ["browser", "geometry", "roads"]
+    assert events == ["browser", "geometry", "roads", "transit"]
 
 
 @pytest.mark.asyncio
@@ -693,6 +702,234 @@ async def test_presenter_does_not_wait_for_slow_background_collection(monkeypatc
     await asyncio.sleep(0)
     assert updater._snapshot is not None  # noqa: SLF001
     await updater.stop()
+
+
+@pytest.mark.asyncio
+async def test_independent_map_restarts_while_ordinary_collection_is_still_pending(
+    monkeypatch,
+):
+    import bot as bot_module
+
+    collection_started = asyncio.Event()
+    collection_release = asyncio.Event()
+    map_releases = [asyncio.Event(), asyncio.Event()]
+    map_started = [asyncio.Event(), asyncio.Event()]
+    collection_calls = 0
+    map_calls = 0
+    active_maps = 0
+    max_active_maps = 0
+
+    async def slow_collect(
+        _client, _settings, on_result=None, tracker=None,
+        include_traffic_map=True,
+    ):
+        nonlocal collection_calls
+        collection_calls += 1
+        assert include_traffic_map is False
+        collection_started.set()
+        await collection_release.wait()
+        return {}
+
+    async def map_from_results(_client, _settings, _results, _tracker):
+        nonlocal map_calls, active_maps, max_active_maps
+        index = map_calls
+        map_calls += 1
+        active_maps += 1
+        max_active_maps = max(max_active_maps, active_maps)
+        map_started[index].set()
+        try:
+            await map_releases[index].wait()
+            return (f"map-{index}".encode(), [])
+        finally:
+            active_maps -= 1
+
+    monkeypatch.setattr(bot_module, "collect_all", slow_collect)
+    monkeypatch.setattr(bot_module, "_fetch_traffic_map_from_results", map_from_results)
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater.client = object()
+
+    await updater._tick()  # noqa: SLF001
+    await asyncio.wait_for(collection_started.wait(), timeout=1)
+    await asyncio.wait_for(map_started[0].wait(), timeout=1)
+    map_releases[0].set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    await updater._tick()  # noqa: SLF001
+    await asyncio.wait_for(map_started[1].wait(), timeout=1)
+    assert collection_calls == 1
+    assert map_calls == 2
+    assert max_active_maps == 1
+
+    map_releases[1].set()
+    collection_release.set()
+    await updater.stop()
+
+
+@pytest.mark.asyncio
+async def test_independent_map_keeps_retained_traffic_and_important_road_overlays(
+    monkeypatch,
+):
+    import bot as bot_module
+
+    affected = [(22.33, 114.22), (22.34, 114.23)]
+    important = [[(22.35, 114.24), (22.36, 114.25)]]
+    incident = SimpleNamespace(
+        latitude=22.33, longitude=114.22,
+        near_landmark=None, between_landmark=None,
+    )
+
+    class Roads:
+        def segments_near(self, keys, latitude=None, longitude=None):
+            assert keys == ["road"]
+            assert (latitude, longitude) == (22.33, 114.22)
+            return [affected]
+
+    captured = {}
+
+    async def fetch_map(_client, **kwargs):
+        captured.update(kwargs)
+        return (b"map", [])
+
+    groups = s.route_groups()
+    monkeypatch.setattr(bot_module.maps, "fetch_traffic_map", fetch_map)
+    monkeypatch.setattr(
+        bot_module.traffic_provider, "resolve_incident_road_keys",
+        lambda *_args, **_kwargs: ["road"],
+    )
+    monkeypatch.setattr(
+        bot_module.road_policy, "important_road_paths", lambda _roads: important
+    )
+
+    await bot_module._fetch_traffic_map_from_results(  # noqa: SLF001
+        object(), _fake_settings(), {
+            "transit": (groups, s.utc(), []),
+            "traffic": ([], [incident], [], None),
+            "tracked_roads": Roads(),
+        }, object(),
+    )
+
+    assert captured["groups"] == groups
+    assert captured["affected_road_paths"] == [affected]
+    assert captured["important_road_paths"] == important
+
+
+@pytest.mark.asyncio
+async def test_old_independent_map_cannot_publish_as_a_newer_generation(monkeypatch):
+    import bot as bot_module
+
+    first_collection_done = asyncio.Event()
+    second_collection_started = asyncio.Event()
+    second_collection_release = asyncio.Event()
+    map_started = asyncio.Event()
+    map_release = asyncio.Event()
+    collection_calls = 0
+
+    async def collect(
+        _client, _settings, on_result=None, tracker=None,
+        include_traffic_map=True,
+    ):
+        nonlocal collection_calls
+        collection_calls += 1
+        assert on_result is not None
+        if collection_calls == 1:
+            on_result("weather", (None, [], None))
+            first_collection_done.set()
+            return {"weather": (None, [], None)}
+        on_result("traffic", ([], [], [], None))
+        second_collection_started.set()
+        await second_collection_release.wait()
+        return {"traffic": ([], [], [], None)}
+
+    async def old_map(_client, _settings, _results, _tracker):
+        map_started.set()
+        await map_release.wait()
+        return (b"old-generation-map", [])
+
+    monkeypatch.setattr(bot_module, "collect_all", collect)
+    monkeypatch.setattr(bot_module, "_fetch_traffic_map_from_results", old_map)
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater.client = object()
+
+    await updater._tick()  # noqa: SLF001
+    await asyncio.wait_for(first_collection_done.wait(), timeout=1)
+    await asyncio.wait_for(map_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await updater._tick()  # noqa: SLF001
+    await asyncio.wait_for(second_collection_started.wait(), timeout=1)
+    assert updater._snapshot.generation == 2  # noqa: SLF001
+
+    map_release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert "traffic_map" not in updater._snapshot.results  # noqa: SLF001
+
+    second_collection_release.set()
+    await updater.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_and_drains_independent_map(monkeypatch):
+    import bot as bot_module
+
+    map_started = asyncio.Event()
+    map_cancelled = asyncio.Event()
+
+    async def collect(
+        _client, _settings, on_result=None, tracker=None,
+        include_traffic_map=True,
+    ):
+        await asyncio.Event().wait()
+
+    async def blocked_map(_client, _settings, _results, _tracker):
+        map_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            map_cancelled.set()
+            raise
+
+    monkeypatch.setattr(bot_module, "collect_all", collect)
+    monkeypatch.setattr(bot_module, "_fetch_traffic_map_from_results", blocked_map)
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater.client = object()
+
+    await updater._tick()  # noqa: SLF001
+    await asyncio.wait_for(map_started.wait(), timeout=1)
+    await updater.stop()
+
+    assert map_cancelled.is_set()
+    assert updater._map_task is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_update_loop_skips_missed_deadlines_instead_of_bursting(monkeypatch):
+    import bot as bot_module
+
+    clock = [0.0]
+    sleeps: list[float] = []
+    updater = DashboardUpdater(replace(_fake_settings(), update_interval_seconds=10))
+    updater._running = True  # noqa: SLF001
+
+    async def slow_tick(_channel=None):
+        clock[0] += 25
+        updater._running = False  # noqa: SLF001
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(updater, "_tick", slow_tick)
+    monkeypatch.setattr(bot_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+
+    await updater._update_loop()  # noqa: SLF001
+
+    assert sleeps == [10]
 
 
 @pytest.mark.asyncio

@@ -159,10 +159,10 @@ def select_probe_stops(
 ) -> list[ProbeStop]:
     """Select deterministic official occurrences for each route.
 
-    Production's default selects every stop so presence/absence brackets are
-    observable. An explicit ``max_anchors`` retains the legacy sparse mode,
+    The live map explicitly selects four representative anchors per direction,
     protecting both termini and mandatory occurrences before filling evenly
-    spaced interior positions. The transit layer deduplicates fetch groups.
+    spaced interior positions. ``max_anchors=None`` retains the full sequence
+    for callers that need it; the transit layer deduplicates fetch groups.
     """
     required = {str(stop_id) for stop_id in mandatory_stop_ids}
     probes: list[ProbeStop] = []
@@ -171,8 +171,8 @@ def select_probe_stops(
         if not stops:
             continue
         spec = _spec_for_line(line)
-        # Production needs absence evidence at every official occurrence.
-        # Keep an explicit limit for sparse/backwards-compatible callers.
+        # ``None`` preserves the full-topology API; the live map supplies its
+        # fixed sparse limit explicitly.
         limit = len(stops) if max_anchors is None else max(1, int(max_anchors))
         chosen: list[int] = []
         def add(index: int, stops=stops, chosen=chosen) -> None:
@@ -759,7 +759,9 @@ def _finish_refresh(task: asyncio.Task[RouteGeometry], cache_dir: str) -> None:
         log.warning("background route geometry refresh failed: %s", type(exc).__name__)
 
 
-async def fetch_route_geometry(client: HttpClient, cache_dir: str = ".cache") -> RouteGeometry:
+async def fetch_route_geometry(
+    client: HttpClient, cache_dir: str = ".cache", *, wait_for_refresh: bool = True
+) -> RouteGeometry:
     """Return fresh/last-good geometry and refresh expired cache in background."""
     global _refresh_shutdown
     _refresh_shutdown = False
@@ -778,7 +780,16 @@ async def fetch_route_geometry(client: HttpClient, cache_dir: str = ".cache") ->
         return cached
     if time.monotonic() < _refresh_retry_after.get(cache_dir, 0):
         return RouteGeometry()
-    return await _refresh_route_geometry(client, cache_dir, None)
+    task = _refresh_tasks.get(cache_dir)
+    if task is None:
+        task = asyncio.create_task(_refresh_route_geometry(client, cache_dir, None))
+        _refresh_tasks[cache_dir] = task
+        task.add_done_callback(
+            lambda done, cache_dir=cache_dir: _finish_refresh(done, cache_dir)
+        )
+    if not wait_for_refresh:
+        return RouteGeometry()
+    return await asyncio.shield(task)
 
 
 async def shutdown_background_refreshes() -> None:

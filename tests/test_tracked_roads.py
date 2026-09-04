@@ -44,6 +44,11 @@ def test_build_overpass_query_unions_all_samples():
     assert ");\nout geom;" in query
 
 
+def test_build_overpass_query_uses_injected_http_budget():
+    query = build_overpass_query([(22.3, 114.2)], timeout_seconds=7.9)
+    assert "[timeout:7]" in query
+
+
 def _line(route, roads):
     stops = [Stop(f"{route}-{i}", name, 22.33 + i * 0.001, 114.26) for i, name in enumerate(roads)]
     return RouteLine(route, "KMB", "outbound", stops)
@@ -411,6 +416,62 @@ async def test_overpass_uses_plain_http_after_tls_failure_and_retries_it():
         ("https://overpass.kumi.systems/api/interpreter", 1),
         ("http://overpass-api.de/api/interpreter", 2),
     ]
+
+
+@pytest.mark.asyncio
+async def test_overpass_mirrors_share_one_total_timeout_budget():
+    calls: list[float] = []
+
+    class FakeClient:
+        async def post_form_json(self, _url, _data, timeout_seconds=None, attempts=None):
+            calls.append(timeout_seconds)
+            await asyncio.Event().wait()
+
+    with pytest.raises(TimeoutError, match="exceeded 0.0s budget"):
+        await asyncio.wait_for(
+            tracked_roads._fetch_overpass(  # noqa: SLF001
+                FakeClient(), "query", timeout_seconds=0.01
+            ),
+            timeout=0.5,
+        )
+
+    assert len(calls) == 1
+    assert 0 < calls[0] <= 0.01
+
+
+@pytest.mark.asyncio
+async def test_cold_tracked_roads_refresh_can_detach_from_presenter(monkeypatch, tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cache_dir = str(tmp_path)
+    refresh_calls = 0
+
+    async def refresh(_client, _cache_dir):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        started.set()
+        await release.wait()
+        return tracked_roads.fallback_roads()
+
+    monkeypatch.setattr(tracked_roads, "_load_disk_cache", lambda _cache_dir: None)
+    monkeypatch.setattr(tracked_roads, "_refresh_roads", refresh)
+    tracked_roads._refresh_retry_after.pop(cache_dir, None)
+
+    result = await tracked_roads.fetch_tracked_roads(
+        object(), cache_dir, wait_for_refresh=False
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert result.display_names
+    assert cache_dir in tracked_roads._refresh_tasks  # noqa: SLF001
+    waiter = asyncio.create_task(tracked_roads.fetch_tracked_roads(object(), cache_dir))
+    await asyncio.sleep(0)
+    assert refresh_calls == 1
+    assert not waiter.done()
+
+    release.set()
+    assert (await waiter).display_names
+    await asyncio.sleep(0)
+    assert cache_dir not in tracked_roads._refresh_tasks  # noqa: SLF001
 
 
 @pytest.mark.asyncio

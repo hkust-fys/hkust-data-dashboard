@@ -331,6 +331,40 @@ async def test_public_stops_include_bus_operators_and_exclude_gmb(monkeypatch, t
     assert all("gmb" not in stop.name for stop in result.stops)
 
 
+async def test_cold_geometry_refresh_can_detach_from_presenter(monkeypatch, tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cache_dir = str(tmp_path)
+    refresh_calls = 0
+
+    async def refresh(_client, _cache_dir, _cached):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        started.set()
+        await release.wait()
+        return RouteGeometry()
+
+    monkeypatch.setattr(route_geometry, "_load_disk_cache", lambda _cache_dir: None)
+    monkeypatch.setattr(route_geometry, "_refresh_route_geometry", refresh)
+    route_geometry._refresh_retry_after.pop(cache_dir, None)
+
+    immediate = await route_geometry.fetch_route_geometry(
+        object(), cache_dir, wait_for_refresh=False
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert immediate.routes == []
+    assert cache_dir in route_geometry._refresh_tasks  # noqa: SLF001
+    waiter = asyncio.create_task(route_geometry.fetch_route_geometry(object(), cache_dir))
+    await asyncio.sleep(0)
+    assert refresh_calls == 1
+    assert not waiter.done()
+
+    release.set()
+    assert (await waiter).routes == []
+    await asyncio.sleep(0)
+    assert cache_dir not in route_geometry._refresh_tasks  # noqa: SLF001
+
+
 async def test_cancelled_background_refresh_is_normal_shutdown(monkeypatch):
     task = asyncio.create_task(asyncio.sleep(60))
     route_geometry._refresh_tasks["cancel-test"] = task

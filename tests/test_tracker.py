@@ -337,6 +337,17 @@ async def test_priority_poll_includes_route_terminus_with_marker_boundaries():
 
 
 @pytest.mark.asyncio
+async def test_priority_poll_bisects_a_coarse_marker_bracket():
+    tracker = MarkerTracker()
+    candidates = [_candidate(4.5, bracket=(1.0, 8.0), boundary_age=0)]
+    await tracker.update(_snapshot(1), candidates, [_line(stops=10)])
+
+    assert tracker.poll_priorities() == {
+        ("KMB", "R", "out"): frozenset({1, 4, 5, 8, 9})
+    }
+
+
+@pytest.mark.asyncio
 async def test_priority_poll_covers_owned_zero_plateau_and_forward_rung():
     tracker = MarkerTracker()
     candidate = _candidate(

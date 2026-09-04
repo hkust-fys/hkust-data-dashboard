@@ -137,6 +137,25 @@ _gate_refresh_waiters = 0
 _probe_refresh_waiters = 0
 
 
+async def shutdown_background_refreshes() -> None:
+    """Cancel and drain shared gate/probe work before HTTP session shutdown."""
+    global _gate_refresh_task, _probe_refresh_task
+    global _gate_network_refresh_at, _probe_network_refresh_at
+    global _gate_refresh_waiters, _probe_refresh_waiters
+    tasks = [task for task in (_gate_refresh_task, _probe_refresh_task)
+             if task is not None and not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _gate_refresh_task = None
+    _probe_refresh_task = None
+    _gate_network_refresh_at = None
+    _probe_network_refresh_at = None
+    _gate_refresh_waiters = 0
+    _probe_refresh_waiters = 0
+
+
 # --------------------------------------------------------------------------
 # Parsing helpers
 # --------------------------------------------------------------------------
@@ -704,6 +723,7 @@ class ProbeEtaCache:
 _probe_cache = ProbeEtaCache()
 
 
+_probe_cold_cursor = 0
 _probe_priority_cursor = 0
 _probe_background_cursor = 0
 _probe_generation = 0
@@ -895,6 +915,9 @@ async def fetch_probe_etas(
     probes: Sequence[Any],
     max_per_cycle: int = 36,
     priorities=None,
+    *,
+    wait_for_refresh: bool = True,
+    generation_probes: Sequence[Any] | None = None,
 ) -> list[ProbeEta]:
     """Return cached probe observations, refreshing the network at most every 30s."""
     global _probe_network_refresh_at, _probe_refresh_task, _probe_refresh_waiters
@@ -908,9 +931,17 @@ async def fetch_probe_etas(
     if _probe_refresh_task is None or _probe_refresh_task.done():
         _probe_network_refresh_at = now_mono
         _probe_refresh_task = asyncio.create_task(
-            _refresh_probe_etas(client, probes, max_per_cycle, priorities)
+            _refresh_probe_etas(
+                client, probes, max_per_cycle, priorities,
+                generation_probes=generation_probes,
+            )
         )
+        _probe_refresh_task.add_done_callback(_finish_probe_refresh)
     task = _probe_refresh_task
+    if not wait_for_refresh:
+        # The shared task is intentionally detached from this presentation;
+        # its done callback below consumes failures and publishes cache rows.
+        return _collect_probe_cache(probes)
     _probe_refresh_waiters += 1
     waiter_registered = True
     try:
@@ -935,6 +966,22 @@ async def fetch_probe_etas(
             _probe_refresh_task = None
 
 
+def _finish_probe_refresh(task: asyncio.Task) -> None:
+    """Consume detached sweep failures without poisoning later presenters."""
+    global _probe_refresh_task, _probe_network_refresh_at
+    if task.cancelled():
+        if _probe_refresh_task is task:
+            _probe_refresh_task = None
+            _probe_network_refresh_at = None
+        return
+    try:
+        task.result()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("background probe refresh failed: %s", type(exc).__name__)
+    if _probe_refresh_task is task:
+        _probe_refresh_task = None
+
+
 def _collect_probe_cache(probes: Sequence[Any]) -> list[ProbeEta]:
     unique: dict[str, Any] = {}
     for probe in probes:
@@ -952,6 +999,8 @@ async def _refresh_probe_etas(
     probes: Sequence[Any],
     max_per_cycle: int = 36,
     priorities=None,
+    *,
+    generation_probes: Sequence[Any] | None = None,
 ) -> list[ProbeEta]:
     """Poll up to ``max_per_cycle`` fetch groups round-robin; cache results.
 
@@ -962,12 +1011,16 @@ async def _refresh_probe_etas(
     per cycle and the GMB sweep backs off for a cooldown when the host
     rate-limits (HTTP 403), serving last-good cache meanwhile.
     """
-    global _probe_priority_cursor, _probe_background_cursor, _probe_generation
+    global _probe_cold_cursor, _probe_priority_cursor, _probe_background_cursor
+    global _probe_generation
     if not probes:
         return []
     unique: dict[str, Any] = {}
     for probe in probes:
         unique.setdefault(_probe_cache_key(probe), probe)
+    baseline_keys = {
+        _probe_cache_key(probe) for probe in (generation_probes or probes)
+    }
 
     # Fetch-group table: one raw request serves every probe in its bucket.
     groups: dict[str, list[Any]] = {}
@@ -987,8 +1040,14 @@ async def _refresh_probe_etas(
             route_list = routes.setdefault(route_key, [])
             if key not in route_list:
                 route_list.append(key)
+    baseline_routes: dict[tuple[str, str, str], list[str]] = {}
+    for probe in (generation_probes or probes):
+        route_key = (probe.operator, probe.route, probe.bound)
+        group_key = _fetch_group_key(probe)
+        if group_key not in baseline_routes.setdefault(route_key, []):
+            baseline_routes[route_key].append(group_key)
     for route_key, published_groups in tuple(_probe_route_published_versions.items()):
-        current_groups = set(routes.get(route_key, ()))
+        current_groups = set(baseline_routes.get(route_key, ()))
         if current_groups != set(published_groups):
             _probe_route_published_versions.pop(route_key, None)
             _probe_route_generations.pop(route_key, None)
@@ -1011,8 +1070,7 @@ async def _refresh_probe_etas(
     # Stage individual fetch groups in a bounded round-robin. Publications are
     # assembled below only after every group has advanced since publication.
     selected_groups: list[str] = []
-    selected_priority: list[str] = []
-    selected_background: list[str] = []
+    selected_set: set[str] = set()
     used_gmb = 0
     priority_groups = []
     priority_indices = priorities or {}
@@ -1027,43 +1085,91 @@ async def _refresh_probe_etas(
                 break
         if is_priority:
             priority_groups.append(group_key)
-    background_groups = [key for key in group_keys if key not in priority_groups]
-    priority_start = _probe_priority_cursor % len(priority_groups) if priority_groups else 0
-    background_start = _probe_background_cursor % len(background_groups) if background_groups else 0
-    reserve = min(len(background_groups), max(1, cycle_budget // 4)) if cycle_budget else 0
-    gmb_background_reserve = min(
-        sum(key.startswith("GMB:") for key in background_groups),
-        max(1, GMB_GROUPS_PER_CYCLE // 4),
+    baseline_group_keys = {key for values in baseline_routes.values() for key in values}
+    background_groups = [
+        key for key in group_keys
+        if key not in priority_groups and key in baseline_group_keys
+    ]
+    # During bootstrap, complete every route's fixed baseline as quickly as
+    # the per-cycle budgets allow. Once published, active frontiers lead and
+    # remaining capacity refreshes the baseline for lifecycle changes.
+    cold_groups = [
+        key for key in group_keys
+        if any(route_key not in _probe_route_published_versions for route_key in baseline_routes
+               if key in baseline_routes[route_key])
+    ]
+    def select_ring(
+        ring: list[str],
+        cursor: int,
+        *,
+        total_limit: int = cycle_budget,
+        gmb_limit: int = GMB_GROUPS_PER_CYCLE,
+    ) -> int:
+        """Select one fair pass and return the slot after its last useful item."""
+        nonlocal used_gmb
+        if not ring:
+            return 0
+        start = cursor % len(ring)
+        next_cursor = start
+        deferred_cursor: int | None = None
+        for offset in range(len(ring)):
+            if len(selected_groups) >= min(cycle_budget, total_limit):
+                break
+            index = (start + offset) % len(ring)
+            key = ring[index]
+            if key in selected_set:
+                # A higher-priority ring already satisfied this request.
+                next_cursor = (index + 1) % len(ring)
+                continue
+            if key not in selectable_keys:
+                if key.startswith("GMB:") and deferred_cursor is None:
+                    deferred_cursor = index
+                continue
+            is_gmb = key.startswith("GMB:")
+            if is_gmb and used_gmb >= min(GMB_GROUPS_PER_CYCLE, gmb_limit):
+                if deferred_cursor is None:
+                    deferred_cursor = index
+                continue
+            selected_groups.append(key)
+            selected_set.add(key)
+            used_gmb += int(is_gmb)
+            next_cursor = (index + 1) % len(ring)
+        # A later non-GMB selection must not hide the first GMB item deferred
+        # by this ring's cap; resume there on the next source cycle.
+        return deferred_cursor if deferred_cursor is not None else next_cursor
+
+    # A cold route has no trustworthy marker cardinality yet. Complete those
+    # sparse baselines first, then spend the same sweep on current marker
+    # boundaries/midpoints. Once bootstrapped, reserve half of the outstanding
+    # sparse lifecycle ring so sustained marker traffic cannot hide a new bus;
+    # both rings therefore clear within two cycles when their union fits.
+    _probe_cold_cursor = select_ring(cold_groups, _probe_cold_cursor)
+    remaining_background = [
+        key for key in background_groups
+        if key not in selected_set and key in selectable_keys
+    ]
+    background_reserve = min(
+        cycle_budget, (len(remaining_background) + 1) // 2
     )
-    priority_gmb_limit = max(0, GMB_GROUPS_PER_CYCLE - gmb_background_reserve)
-    for key in (priority_groups[priority_start:] + priority_groups[:priority_start]):
-        if key not in selectable_keys or len(selected_priority) >= max(0, cycle_budget - reserve):
-            continue
-        if key.startswith("GMB:") and used_gmb >= priority_gmb_limit:
-            continue
-        selected_priority.append(key)
-        used_gmb += int(key.startswith("GMB:"))
-    for key in (background_groups[background_start:] + background_groups[:background_start]):
-        if key not in selectable_keys or len(selected_background) >= reserve:
-            continue
-        if key.startswith("GMB:") and used_gmb >= GMB_GROUPS_PER_CYCLE:
-            continue
-        selected_background.append(key)
-        used_gmb += int(key.startswith("GMB:"))
-    remaining = cycle_budget - len(selected_priority) - len(selected_background)
-    for key in (background_groups[background_start:] + background_groups[:background_start]):
-        if key in selected_background or key not in selectable_keys or remaining <= 0:
-            continue
-        if key.startswith("GMB:") and used_gmb >= GMB_GROUPS_PER_CYCLE:
-            continue
-        selected_background.append(key)
-        used_gmb += int(key.startswith("GMB:"))
-        remaining -= 1
-    selected_groups = selected_priority + selected_background
     if priority_groups:
-        _probe_priority_cursor = (priority_start + len(selected_priority)) % len(priority_groups)
-    if background_groups:
-        _probe_background_cursor = (background_start + len(selected_background)) % len(background_groups)
+        background_reserve = min(background_reserve, max(0, cycle_budget - 1))
+    gmb_background = sum(key.startswith("GMB:") for key in remaining_background)
+    gmb_background_reserve = min(
+        GMB_GROUPS_PER_CYCLE, (gmb_background + 1) // 2
+    )
+    if any(key.startswith("GMB:") for key in priority_groups):
+        gmb_background_reserve = min(
+            gmb_background_reserve, max(0, GMB_GROUPS_PER_CYCLE - 1)
+        )
+    _probe_priority_cursor = select_ring(
+        priority_groups,
+        _probe_priority_cursor,
+        total_limit=max(0, cycle_budget - background_reserve),
+        gmb_limit=max(0, GMB_GROUPS_PER_CYCLE - gmb_background_reserve),
+    )
+    _probe_background_cursor = select_ring(
+        background_groups, _probe_background_cursor
+    )
     if not selected_groups:
         return [
             eta
@@ -1136,10 +1242,14 @@ async def _refresh_probe_etas(
     # complete generation.
     collected_at = _probe_wall_clock()
     published_monotonic = _probe_mono_clock()
-    selected_routes = sorted({route_key for key in selected_groups for route_key in routes
-                              if key in routes[route_key]})
+    generation_groups = {
+        route_key: set(group_keys)
+        for route_key, group_keys in baseline_routes.items()
+    }
+    selected_routes = sorted({route_key for key in selected_groups for route_key in generation_groups
+                              if key in generation_groups[route_key]})
     for route_key in selected_routes:
-        route_groups = routes[route_key]
+        route_groups = generation_groups[route_key]
         if not all(key in _probe_group_versions for key in route_groups):
             continue
         previous = _probe_route_published_versions.get(route_key, {})
@@ -1148,7 +1258,8 @@ async def _refresh_probe_etas(
             continue
         route_probes = tuple(
             probe for probe in unique.values()
-            if (probe.operator, probe.route, probe.bound) == route_key
+            if ((probe.operator, probe.route, probe.bound) == route_key
+                and _probe_cache_key(probe) in baseline_keys)
         )
         rows = tuple(eta for probe in route_probes
                      for eta in (_probe_cache.get(_probe_cache_key(probe)) or ()))
@@ -1189,10 +1300,14 @@ async def fetch_probe_snapshot(
     probes: Sequence[Any],
     max_per_cycle: int = 36,
     priorities=None,
+    *,
+    wait_for_refresh: bool = True,
+    generation_probes: Sequence[Any] | None = None,
 ) -> ProbeEtaSnapshot:
     """Fetch probes and expose only atomically complete route generations."""
     await fetch_probe_etas(client, probes, max_per_cycle=max_per_cycle,
-                           priorities=priorities)
+                           priorities=priorities, wait_for_refresh=wait_for_refresh,
+                           generation_probes=generation_probes)
     collected_at = _probe_wall_clock()
     monotonic_at = _probe_mono_clock()
     for stale_key, stale_generation in tuple(_probe_route_generations.items()):
@@ -1207,7 +1322,10 @@ async def fetch_probe_snapshot(
         tuple[str, str, str], tuple[frozenset[tuple[Any, ...]], frozenset[str]]
     ] = {}
     for route_key in requested:
-        route_probes = [p for p in probes if (p.operator, p.route, p.bound) == route_key]
+        route_probes = [
+            p for p in (generation_probes or probes)
+            if (p.operator, p.route, p.bound) == route_key
+        ]
         requested_topology[route_key] = (
             frozenset(_probe_topology_key(p) for p in route_probes),
             frozenset(_fetch_group_key(p) for p in route_probes),

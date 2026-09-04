@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 ROADS_TTL_SECONDS = 12 * 3600.0
 ROADS_CACHE_VERSION = 4
 ROADS_CACHE_NAME = "tracked-roads.json"
-OVERPASS_TIMEOUT_SECONDS = 180.0
+OVERPASS_TIMEOUT_SECONDS = 10.0
 OVERPASS_ATTEMPTS = 1
 OVERPASS_HTTP_FALLBACK_ATTEMPTS = 2
 ROADS_FAILURE_COOLDOWN_SECONDS = 30 * 60.0
@@ -288,13 +288,16 @@ def _sample_path(
     return out
 
 
-def build_overpass_query(points: list[tuple[float, float]]) -> str:
+def build_overpass_query(
+    points: list[tuple[float, float]], timeout_seconds: float = 10.0
+) -> str:
     """One union query returning geometry of named highways near all samples."""
     clauses = "\n".join(
         f'  way(around:{MATCH_RADIUS_METRES:.0f},{lat:.6f},{lon:.6f})["highway"]["name"];'
         for lat, lon in points
     )
-    return f"[out:json][timeout:120];\n(\n{clauses}\n);\nout geom;"
+    timeout = max(1, int(timeout_seconds))
+    return f"[out:json][timeout:{timeout}];\n(\n{clauses}\n);\nout geom;"
 
 
 def parse_overpass_roads(raw: dict) -> list[str]:
@@ -714,39 +717,48 @@ def _is_tls_failure(exc: BaseException) -> bool:
     return isinstance(exc, aiohttp.ClientConnectorCertificateError)
 
 
-async def _fetch_overpass(client: HttpClient, query: str) -> dict:
+async def _fetch_overpass(
+    client: HttpClient, query: str, timeout_seconds: float | None = None
+) -> dict:
     """Query Overpass mirrors in order; HTTP is a certificate-only escape hatch.
 
     The plain-HTTP mirror is never contacted unless an HTTPS mirror has already
     reported a real TLS certificate failure, and even then it is retried once so
     that a single dropped connection does not discard the whole refresh.
     """
+    budget = float(timeout_seconds or getattr(client, "timeout_seconds", OVERPASS_TIMEOUT_SECONDS))
     saw_tls_failure = False
     last_error: Exception | None = None
-    for url in OVERPASS_URLS:
-        if _is_plain_http(url) and not saw_tls_failure:
-            log.info("skipping plain-HTTP Overpass fallback: no TLS certificate failure seen")
-            continue
-        try:
-            return await client.post_form_json(
-                url,
-                {"data": query},
-                timeout_seconds=OVERPASS_TIMEOUT_SECONDS,
-                attempts=(
-                    OVERPASS_HTTP_FALLBACK_ATTEMPTS if _is_plain_http(url) else OVERPASS_ATTEMPTS
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if _is_tls_failure(exc):
-                saw_tls_failure = True
-                log.warning(
-                    "Overpass TLS certificate failure reported by %s; "
-                    "plain-HTTP fallback is now authorised",
-                    url.split("/")[2],
-                )
-            else:
-                log.warning("Overpass %s failed: %s", url.split("/")[2], type(exc).__name__)
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(max(0.001, budget)):
+            for url in OVERPASS_URLS:
+                if _is_plain_http(url) and not saw_tls_failure:
+                    log.info("skipping plain-HTTP Overpass fallback: no TLS certificate failure seen")
+                    continue
+                try:
+                    remaining = max(0.001, budget - (time.monotonic() - started))
+                    return await client.post_form_json(
+                        url,
+                        {"data": query},
+                        timeout_seconds=remaining,
+                        attempts=(
+                            OVERPASS_HTTP_FALLBACK_ATTEMPTS if _is_plain_http(url) else OVERPASS_ATTEMPTS
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    if _is_tls_failure(exc):
+                        saw_tls_failure = True
+                        log.warning(
+                            "Overpass TLS certificate failure reported by %s; "
+                            "plain-HTTP fallback is now authorised",
+                            url.split("/")[2],
+                        )
+                    else:
+                        log.warning("Overpass %s failed: %s", url.split("/")[2], type(exc).__name__)
+    except TimeoutError as exc:
+        raise TimeoutError(f"Overpass refresh exceeded {budget:.1f}s budget") from exc
     assert last_error is not None
     raise last_error
 
@@ -768,7 +780,8 @@ async def _refresh_roads(client: HttpClient, cache_dir: str) -> TrackedRoads:
         for line in lines
         for point in _sample_path(line.path)
     ]
-    raw = await _fetch_overpass(client, build_overpass_query(samples))
+    budget = float(getattr(client, "timeout_seconds", OVERPASS_TIMEOUT_SECONDS))
+    raw = await _fetch_overpass(client, build_overpass_query(samples, budget), budget)
     ways = collect_way_roads(raw)
     if not ways:
         raise RuntimeError("Overpass returned no named road geometry")
@@ -819,7 +832,7 @@ def _finish_refresh(task: asyncio.Task[TrackedRoads], cache_dir: str) -> None:
 
 
 async def fetch_tracked_roads(
-    client: HttpClient, cache_dir: str = ".cache"
+    client: HttpClient, cache_dir: str = ".cache", *, wait_for_refresh: bool = True
 ) -> TrackedRoads:
     """Return fresh/last-good tracked roads, refreshing expired data in background.
 
@@ -841,8 +854,15 @@ async def fetch_tracked_roads(
         return cached
     if time.monotonic() < _refresh_retry_after.get(cache_dir, 0):
         return _fallback_roads()
+    task = _refresh_tasks.get(cache_dir)
+    if task is None:
+        task = asyncio.create_task(_refresh_roads(client, cache_dir))
+        _refresh_tasks[cache_dir] = task
+        task.add_done_callback(lambda done: _finish_refresh(done, cache_dir))
+    if not wait_for_refresh:
+        return cached or _fallback_roads()
     try:
-        return await _refresh_roads(client, cache_dir)
+        return await asyncio.shield(task)
     except Exception as exc:  # noqa: BLE001
         _refresh_retry_after[cache_dir] = (
             time.monotonic() + ROADS_FAILURE_COOLDOWN_SECONDS

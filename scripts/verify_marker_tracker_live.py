@@ -215,6 +215,29 @@ def _source_observation_signature(evidence):
     )
 
 
+def _duplicate_candidate_observation_issues(record, key):
+    """Reject one current ETA observation feeding multiple marker candidates."""
+    owners = {}
+    issues = []
+    for candidate_index, evidence in enumerate(
+        record.get("candidate_evidence", {}).get(key, ())
+    ):
+        signature = _source_observation_signature(evidence) or ()
+        for observation in signature:
+            other = owners.get(observation)
+            if other is not None and other != candidate_index:
+                issues.append({
+                    "kind": "duplicate_candidate_observation",
+                    "route": key,
+                    "candidate_index": candidate_index,
+                    "other_candidate_index": other,
+                    "source_observation": observation,
+                })
+            else:
+                owners[observation] = candidate_index
+    return issues
+
+
 def _spacing_provenance_comparable(record, key, tracks, candidates):
     """Check whether current candidate/track positions have a safe bijection."""
     candidate_evidence = record.get("candidate_evidence", {}).get(key)
@@ -328,6 +351,7 @@ def compare_adjacent(old, new, state=None):
     keys = set(old_tracks) | set(new_tracks) | set(old.get("generations", {})) | set(new.get("generations", {}))
     for key in keys:
         a, b = old_tracks.get(key, {}), new_tracks.get(key, {})
+        issues.extend(_duplicate_candidate_observation_issues(new, key))
         signatures = {}
         source_signatures = {}
         for track in b:

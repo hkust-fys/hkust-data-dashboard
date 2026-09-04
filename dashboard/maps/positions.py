@@ -87,6 +87,10 @@ class BusEstimate:
 
 
 MINUTES_PER_STOP = 2.0
+# Exact timestamps can lead the rounded departure state by a few seconds.
+# Keep a narrow grace window so a gate-confirmed vehicle is not hidden at the
+# instant it leaves, while a genuinely future terminus ETA remains decisive.
+TERMINUS_DEPARTURE_GRACE_MINUTES = 0.5
 GATE_DOWNSTREAM_DRIFT_MINUTES = 15.0
 GATE_UPSTREAM_DRIFT_MINUTES = 25.0
 GATE_PASSAGE_SKEW_MINUTES = 3.0
@@ -568,6 +572,8 @@ def _plan_gate_associations(
                 and int(probe_inputs[probe_input].index)
                 - float(probe_inputs[probe_input].minutes) / MINUTES_PER_STOP
                 < 0
+                and float(probe_inputs[probe_input].minutes)
+                > TERMINUS_DEPARTURE_GRACE_MINUTES
                 for probe_input in assigned_probe_inputs
             )
             has_departed_probe = any(
@@ -581,11 +587,19 @@ def _plan_gate_associations(
                 int(gate_row.index)
                 - float(gate_row.minutes) / MINUTES_PER_STOP
             )
-            departed = gate_position >= 0 or (
-                gate_index > 0
-                and gate_row.kind is not EtaKind.SCHEDULED
-                and not future_at_origin
-                and has_departed_probe
+            # A matched positive ETA at stop zero is direct evidence that this
+            # journey has not left its terminus.  It must outrank the coarse
+            # two-minutes-per-stop projection from a downstream gate: that
+            # projection can become nonnegative several minutes before the
+            # published origin departure and otherwise creates a premature
+            # marker at the terminus.
+            departed = not future_at_origin and (
+                gate_position >= 0
+                or (
+                    gate_index > 0
+                    and gate_row.kind is not EtaKind.SCHEDULED
+                    and has_departed_probe
+                )
             )
             if departed:
                 departed_gate_inputs.add(gate_input)

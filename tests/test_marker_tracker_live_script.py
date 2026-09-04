@@ -149,6 +149,28 @@ def test_reused_source_ladder_is_duplicate_even_when_eta_timestamp_changed():
     assert {duplicate["track_id"], duplicate["other_track_id"]} == {1, 2}
 
 
+def test_reused_current_eta_observation_is_a_hard_failure():
+    record = provenance_frame((1.0, 2.0), (1.0, 2.0))
+    evidence = record["candidate_evidence"][KEY]
+    evidence[0]["source_observations"] = [["probe", 42]]
+    evidence[1]["source_observations"] = [
+        ["probe", 42],
+        ["probe", 43],
+    ]
+
+    issues, _checks = compare_adjacent(record, record)
+
+    duplicate = next(
+        issue for issue in issues
+        if issue["kind"] == "duplicate_candidate_observation"
+    )
+    assert {
+        duplicate["candidate_index"],
+        duplicate["other_candidate_index"],
+    } == {0, 1}
+    assert duplicate["source_observation"] == ("probe", 42)
+
+
 def test_matching_provenance_still_reports_real_spacing_error():
     old = provenance_frame((1.0, 5.0), (1.0, 5.0))
     bad = provenance_frame((1.0, 2.0), (1.0, 5.0))

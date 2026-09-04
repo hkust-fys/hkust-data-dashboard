@@ -662,6 +662,28 @@ def test_undeparted_gate_row_absorbs_later_scheduled_ladder():
     assert estimates == []
 
 
+def test_future_origin_vetoes_nonnegative_coarse_gate_position():
+    """A downstream projection cannot launch a journey before stop-zero ETA."""
+    line = _line("GMB", "11", "seq-1", stop_count=20)
+    estimates = estimate_bus_positions(
+        [
+            Probe("GMB", "11", "seq-1", 0, 5, EtaKind.SCHEDULED),
+            Probe("GMB", "11", "seq-1", 1, 7, EtaKind.SCHEDULED),
+        ],
+        [line],
+        authoritative_etas=[
+            # 6 - 11/2 = 0.5: the old coarse gate rule called this departed,
+            # despite the same ETA instance still being five minutes from its
+            # route-origin departure.
+            AuthoritativeProbe(
+                "GMB", "11", "seq-1", 6, 11, EtaKind.SCHEDULED
+            )
+        ],
+    )
+
+    assert estimates == []
+
+
 def test_gate_anchor_reconciles_variable_downstream_travel_times():
     """One later-stop row per gate journey remains exactly three vehicles."""
     line = _line("GMB", "12", "seq-2", stop_count=23)

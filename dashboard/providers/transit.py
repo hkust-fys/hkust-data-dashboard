@@ -683,11 +683,11 @@ class ProbeEtaCache:
         self._clock = clock
         self._wall_clock = wall_clock or _probe_wall_clock
         self._max_entries = max(1, int(max_entries))
-        self._store: dict[str, tuple[float, list[ProbeEta]]] = {}
+        self._store: dict[str, tuple[float, list[ProbeEta], int]] = {}
 
     def _sweep(self, now: float) -> None:
         expired = [
-            key for key, (stored, _rows) in self._store.items()
+            key for key, (stored, _rows, _revision) in self._store.items()
             if self._ttl > 0 and now - stored >= self._ttl
         ]
         for key in expired:
@@ -707,16 +707,26 @@ class ProbeEtaCache:
         # decide whether a boundary is fresh enough to move a marker.
         return [replace(eta, cache_age_seconds=age_seconds) for eta in entry[1]]
 
+    def revision(self, key: str) -> int:
+        """Return the exact response revision, including an empty response."""
+        entry = self._store.get(key)
+        return int(entry[2]) if entry is not None else 0
+
     def age_seconds(self, key: str) -> float | None:
         entry = self._store.get(key)
         if entry is None:
             return None
         return max(0.0, self._clock() - entry[0])
 
-    def set(self, key: str, value: list[ProbeEta]) -> None:
+    def set(self, key: str, value: list[ProbeEta], *, revision: int | None = None) -> None:
         now = self._clock()
         self._sweep(now)
-        self._store[key] = (now, list(value))
+        if revision is None:
+            revision = max(
+                (int(getattr(row, "refresh_generation", 0) or 0) for row in value),
+                default=0,
+            )
+        self._store[key] = (now, list(value), int(revision or 0))
         self._sweep(now)
 
 
@@ -1221,7 +1231,7 @@ async def _refresh_probe_etas(
                 replace(row, refresh_generation=group_generation)
                 for row in _parse_probe_etas(probe, raw, now)
             ]
-            _probe_cache.set(key, parsed)
+            _probe_cache.set(key, parsed, revision=group_generation)
             refreshed_rows[key] = tuple(parsed)
             group_rows.extend(parsed)
         _probe_group_versions[group_key] = group_generation
@@ -1374,6 +1384,7 @@ async def fetch_probe_snapshot(
                 bound=str(probe.bound), stop_id=str(probe.stop_id),
                 index=int(probe.index), minutes=None,
                 cache_age_seconds=float(_probe_cache.age_seconds(key) or 0.0),
+                refresh_generation=_probe_cache.revision(key),
             ))
     return ProbeEtaSnapshot(
         routes=tuple(routes), collected_at=collected_at,

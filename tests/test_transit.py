@@ -106,6 +106,13 @@ def test_probe_cache_defensively_copies_source_rows():
     assert cache.get("probe")[0].minutes == 5
 
 
+def test_probe_cache_retains_revision_for_successful_empty_response():
+    cache = transit.ProbeEtaCache(clock=lambda: 100.0)
+    cache.set("shared-stop", [], revision=41)
+    assert cache.get("shared-stop") == []
+    assert cache.revision("shared-stop") == 41
+
+
 def test_probe_generation_public_shape_is_small_and_topology_is_canonical():
     assert {field.name for field in fields(transit.ProbeRouteGeneration)} == {
         "route_key", "rows", "generation", "collected_at",

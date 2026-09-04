@@ -1,6 +1,8 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.verify_marker_tracker_live import (
     _json_safe_record,
     check_minute_baselines,
@@ -238,10 +240,11 @@ def test_near_tie_is_strict_for_identity_order_crossing():
 
 
 def evidence_frame(pos=(3.5, 7.5), *, age=1.0, eta=(1, 1), brackets=((3, 4), (7, 8)),
-                   eta_offsets=(None, None)):
+                   eta_offsets=(None, None), revisions=None):
     tracks = [SimpleNamespace(operator="KMB", route="A", bound="in", position=p, track_id=i + 1,
                                bracket=brackets[i], eta_minutes=eta[i], eta_arrival_at=None,
                                bracket_eta_offsets=eta_offsets[i], boundary_age_seconds=age,
+                               boundary_revision=(revisions[i] if revisions is not None else None),
                                source_indices=(
                                    tuple(int(x) for x in brackets[i])
                                    if eta_offsets[i] is not None
@@ -278,6 +281,58 @@ def test_stale_or_unchanged_motion_is_rejected_and_hold_passes():
     assert any(x["kind"] == "backward_without_eta_evidence" for x in compare_adjacent(old, stale)[0])
     assert any(x["kind"] == "movement_without_eta_evidence" for x in compare_adjacent(old, unchanged)[0])
     assert compare_adjacent(old, evidence_frame())[0] == []
+
+
+def test_delayed_versioned_motion_uses_both_consumed_boundary_revisions():
+    old = evidence_frame(age=1.0, revisions=((10, 20), (30, 40)))
+    current = evidence_frame(
+        pos=(3.0, 7.0), age=24.0, eta=(2, 2),
+        revisions=((11, 21), (31, 41)),
+    )
+    assert not compare_adjacent(old, current)[0]
+
+
+def test_versioned_motion_rejects_replay_and_partial_endpoint_refresh():
+    old = evidence_frame(age=1.0, revisions=((10, 20), (30, 40)))
+    replay = evidence_frame(
+        pos=(3.0, 7.0), age=24.0, eta=(2, 2),
+        revisions=((10, 20), (30, 40)),
+    )
+    partial = evidence_frame(
+        pos=(3.0, 7.0), age=24.0, eta=(2, 2),
+        revisions=((11, 20), (31, 41)),
+    )
+    for current in (replay, partial):
+        assert {issue["kind"] for issue in compare_adjacent(old, current)[0]} >= {
+            "backward_without_eta_evidence"
+        }
+
+
+def test_malformed_versioned_boundary_is_rejected_as_direct_evidence():
+    record = evidence_frame(age=30.0, revisions=((10, 20), (30, 40)))
+    record["track_evidence"][KEY][1]["boundary_revision"] = (11,)
+    issues, _ = compare_adjacent(record, record)
+    assert any(issue["kind"] == "invalid_bracket_evidence" for issue in issues)
+
+
+@pytest.mark.parametrize("age", (None, -1.0, float("nan"), "not-a-number"))
+def test_revisioned_motion_rejects_invalid_boundary_age(age):
+    old = evidence_frame(age=1.0, revisions=((10, 20), (30, 40)))
+    current = evidence_frame(
+        pos=(3.0, 7.0), age=age, eta=(2, 2),
+        revisions=((11, 21), (31, 41)),
+    )
+    assert any(
+        issue["kind"] in {"backward_without_eta_evidence", "movement_without_eta_evidence"}
+        for issue in compare_adjacent(old, current)[0]
+    )
+
+
+def test_frame_records_boundary_revisions():
+    estimate = item(2.0, 1)
+    estimate.boundary_revision = (7, 9)
+    record = frame_record(SimpleNamespace(complete_routes=()), [estimate], [estimate])
+    assert record["track_evidence"][KEY][1]["boundary_revision"] == (7, 9)
 
 
 def test_minute_baseline_allows_fresh_eta_snap_but_rejects_stale_snap():

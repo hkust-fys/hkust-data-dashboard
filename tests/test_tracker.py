@@ -14,7 +14,8 @@ BASE_TIME = datetime(2026, 1, 1, tzinfo=UTC)
 
 def _candidate(position, *, gate=False, route="R", operator=Operator.KMB,
                bound="out", unreliable=False, scheduled=False, bracket=None,
-               boundary_age=None, arrival_at=None, priority_indices=()):
+               boundary_age=None, arrival_at=None, priority_indices=(),
+               boundary_revision=None):
     code = {Operator.KMB: "KMB", Operator.CITYBUS: "CTB", Operator.GMB: "GMB"}[operator]
     return BusEstimate(
         f"{route} destination", 22.3, 114.2, operator, 0.0,
@@ -26,6 +27,7 @@ def _candidate(position, *, gate=False, route="R", operator=Operator.KMB,
         )}),
         bracket=bracket,
         boundary_age_seconds=boundary_age,
+        boundary_revision=boundary_revision,
         eta_arrival_at=arrival_at,
         priority_indices=frozenset(priority_indices),
     )
@@ -44,6 +46,36 @@ def _omitted(collected_at):
 def _line(*, stops=3, route="R", bound="out", operator="KMB"):
     return SimpleNamespace(operator=operator, route=route, bound=bound,
                            stops=tuple(range(stops)))
+
+
+@pytest.mark.asyncio
+async def test_new_boundary_revision_moves_after_delayed_render_and_replay_does_not():
+    tracker = MarkerTracker()
+    first = _candidate(5.5, bracket=(5, 6), boundary_age=30,
+                       boundary_revision=(10, 10))
+    await tracker.update(_snapshot(1, first and [first]), [first], [_line(stops=10)])
+
+    delayed = _candidate(7.5, bracket=(7, 8), boundary_age=30,
+                         boundary_revision=(11, 11))
+    moved = await tracker.update(_snapshot(1), [delayed], [_line(stops=10)])
+    assert moved[0].position == pytest.approx(7.5)
+
+    replay = _candidate(8.0, bracket=(7, 8), boundary_age=0,
+                        boundary_revision=(11, 11))
+    held = await tracker.update(_snapshot(1), [replay], [_line(stops=10)])
+    assert held[0].position == pytest.approx(7.5)
+
+
+@pytest.mark.asyncio
+async def test_one_sided_boundary_revision_is_not_actionable():
+    tracker = MarkerTracker()
+    initial = _candidate(5.5, bracket=(5, 6), boundary_age=0,
+                         boundary_revision=(20, 20))
+    await tracker.update(_snapshot(1, [initial]), [initial], [_line(stops=10)])
+    partial = _candidate(6.5, bracket=(6, 7), boundary_age=0,
+                         boundary_revision=(21, 20))
+    held = await tracker.update(_snapshot(1), [partial], [_line(stops=10)])
+    assert held[0].position == pytest.approx(5.5)
 
 
 @pytest.mark.asyncio

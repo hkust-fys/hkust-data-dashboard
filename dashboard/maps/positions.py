@@ -76,6 +76,10 @@ class BusEstimate:
     eta_arrival_at: object | None = None
     bracket_initial_eta: float | None = None
     boundary_age_seconds: float | None = None
+    # Refresh revisions of the two physical boundary observations.  Unlike
+    # cache age this is stable across delayed rendering and prevents replaying
+    # the same evidence with a different derived position.
+    boundary_revision: tuple[int, int] | None = None
     # Signed ETA offsets at the lower/upper bracket observations when the
     # physical boundary is a due-to-future timestamp crossing.
     bracket_eta_offsets: tuple[float, float] | None = None
@@ -1477,6 +1481,7 @@ def estimate_bus_positions(
             eta_minutes = None
             eta_arrival_at = None
             boundary_age_seconds = None
+            boundary_revision = None
             bracket_eta_offsets = None
             priority_indices = frozenset()
             observed = observed_by_route.get((operator_name, route, bound))
@@ -1562,6 +1567,17 @@ def estimate_bus_positions(
                         lower_ages.append(present_age)
                     if lower_ages:
                         boundary_age_seconds = max(present_age, min(lower_ages))
+                    # Every boundary needs an independently refreshed endpoint;
+                    # successful-empty rows are retained in probe_inputs and
+                    # therefore participate here even though they have no ETA.
+                    def _row_revision(row):
+                        try:
+                            revision = int(getattr(row, "refresh_generation", 0) or 0)
+                        except (TypeError, ValueError):
+                            return 0
+                        return revision if revision > 0 else 0
+
+                    selected_lower = None
                     if zero_indices:
                         lower_rows = [
                             row
@@ -1613,6 +1629,39 @@ def estimate_bus_positions(
                         position = boundary_index - min(
                             1.0, max(0.0, eta_minutes / MINUTES_PER_STOP)
                         )
+                    if lower_index == boundary_index:
+                        selected_lower = selected_eta
+                    elif selected_lower is None:
+                        endpoint_rows = [
+                            row for row in probe_inputs
+                            if (str(getattr(row, "operator", "")),
+                                str(getattr(row, "route", "")),
+                                str(getattr(row, "bound", "")))
+                            == (operator_name, route, bound)
+                            and int(getattr(row, "index", -1)) == lower_index
+                        ]
+                        selected_lower = min(
+                            endpoint_rows,
+                            key=lambda row: float(
+                                getattr(row, "cache_age_seconds", 0.0) or 0.0
+                            ),
+                            default=None,
+                        )
+                    selected_lower_revision = _row_revision(selected_lower)
+                    selected_upper_revision = _row_revision(selected_eta)
+                    selected_lower_age = float(
+                        getattr(selected_lower, "cache_age_seconds", 0.0) or 0.0
+                    ) if selected_lower is not None else None
+                    if selected_lower_age is not None:
+                        boundary_age_seconds = max(present_age, selected_lower_age)
+                    endpoint_revisions = (selected_lower_revision, selected_upper_revision)
+                    if all(endpoint_revisions):
+                        boundary_revision = endpoint_revisions
+                    elif any(
+                        int(getattr(row, "refresh_generation", 0) or 0) > 0
+                        for row in probe_inputs
+                    ):
+                        boundary_revision = (0, 0)
                 if bracket is not None:
                     position = min(max(position, bracket[0]), bracket[1])
             render_section = min(math.floor(position), stops_count - 2)
@@ -1647,6 +1696,7 @@ def estimate_bus_positions(
                     eta_arrival_at=eta_arrival_at,
                     bracket_initial_eta=eta_minutes,
                     boundary_age_seconds=boundary_age_seconds,
+                    boundary_revision=boundary_revision,
                     bracket_eta_offsets=bracket_eta_offsets,
                     priority_indices=priority_indices,
                 )

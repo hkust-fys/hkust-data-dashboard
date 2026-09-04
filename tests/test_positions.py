@@ -30,6 +30,7 @@ class Probe:
         kind=None,
         cache_age_seconds=None,
         signed_minutes=None,
+        refresh_generation=0,
     ):
         self.operator = operator
         self.route = route
@@ -40,6 +41,7 @@ class Probe:
         self.kind = kind or EtaKind.REALTIME
         self.cache_age_seconds = cache_age_seconds
         self.signed_minutes = signed_minutes
+        self.refresh_generation = refresh_generation
 
 
 class AuthoritativeProbe(Probe):
@@ -1408,6 +1410,22 @@ def test_all_stop_boundary_controls_proportion_and_ignores_unrelated_cache_age()
     assert estimates[0].eta_minutes == 1
     assert estimates[0].boundary_age_seconds == 1
     assert estimates[0].priority_indices == frozenset({3, 4})
+
+
+def test_boundary_revision_includes_empty_lower_endpoint():
+    line = _line(stop_count=7)
+    rows = [
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=38,
+              refresh_generation=101),
+        Probe("KMB", "X", "outbound", 3, 1, cache_age_seconds=8.4,
+              refresh_generation=102),
+    ]
+    estimates = estimate_bus_positions(
+        rows, [line],
+        observed_checkpoint_indices={("KMB", "X", "outbound"): range(7)},
+    )
+    assert len(estimates) == 1
+    assert estimates[0].boundary_revision == (101, 102)
 
 
 def test_priority_indices_cover_full_zero_plateau_and_next_positive_stop():

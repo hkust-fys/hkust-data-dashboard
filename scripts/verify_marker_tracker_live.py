@@ -99,6 +99,7 @@ def frame_record(
             "eta_minutes": getattr(x, "eta_minutes", None),
             "eta_arrival_at": arrival.isoformat() if hasattr(arrival, "isoformat") else arrival,
             "boundary_age_seconds": getattr(x, "boundary_age_seconds", None),
+            "boundary_revision": getattr(x, "boundary_revision", None),
             "bracket_eta_offsets": getattr(x, "bracket_eta_offsets", None),
             "source_indices": sorted(getattr(x, "source_indices", ()) or ()),
             "source_observations": sorted(getattr(x, "source_observations", ()) or ()),
@@ -211,6 +212,41 @@ def _provenance_signature(evidence):
     )
 
 
+def _boundary_revision(evidence):
+    """Normalize a complete pair of provider endpoint revisions."""
+    if not isinstance(evidence, dict):
+        return None
+    value = evidence.get("boundary_revision")
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    try:
+        revision = (int(value[0]), int(value[1]))
+    except (TypeError, ValueError):
+        return None
+    return revision if all(item > 0 for item in revision) else None
+
+
+def _boundary_age(evidence):
+    """Return a tracker-compatible nonnegative finite boundary age."""
+    if not isinstance(evidence, dict):
+        return None
+    try:
+        age = float(evidence.get("boundary_age_seconds"))
+    except (TypeError, ValueError):
+        return None
+    return age if isfinite(age) and age >= 0.0 else None
+
+
+def _boundary_evidence_attempted(evidence):
+    """Whether a bracket claims fresh or revisioned boundary evidence."""
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("boundary_revision") is not None:
+        return True
+    age = _boundary_age(evidence)
+    return age is not None and age <= TRACKER_BOUNDARY_FRESH_SECONDS
+
+
 def _source_observation_signature(evidence):
     """Return the estimator ladder claimed by one displayed marker."""
     if not isinstance(evidence, dict):
@@ -273,6 +309,21 @@ def _eta_allows_motion(old, new, key, track):
     fields = ("bracket", "bracket_eta_offsets", "eta_minutes", "eta_arrival_at",
               "source_indices", "source_observations")
     changed = tuple(after.get(k) for k in fields) != tuple(before.get(k) for k in fields)
+    after_revision = _boundary_revision(after)
+    before_revision = _boundary_revision(before)
+    if after.get("boundary_revision") is not None:
+        # A revision identifies consumed endpoint responses.  Both endpoints
+        # must advance; this rejects replayed and one-sided/partial refreshes,
+        # even when the resulting estimate is observed several seconds later.
+        return (
+            changed
+            and after_revision is not None
+            and _boundary_age(after) is not None
+            and (before_revision is None
+                 or all(a > b for a, b in zip(after_revision, before_revision)))
+        )
+    if before_revision is not None:
+        return False
     age = after.get("boundary_age_seconds")
     return changed and isinstance(age, (int, float)) and 0 <= age <= TRACKER_BOUNDARY_FRESH_SECONDS
 
@@ -298,15 +349,19 @@ def _direct_bracket_evidence(record, key, track, position):
     observed = {
         int(index) for index in record.get("observed_checkpoints", {}).get(key, ())
     }
-    age = evidence.get("boundary_age_seconds")
+    revision = _boundary_revision(evidence)
+    raw_revision = evidence.get("boundary_revision")
     eta = evidence.get("eta_minutes")
     eta_offsets = evidence.get("bracket_eta_offsets")
     if (
         len(bracket) != 2
         or not sources
-        or not isinstance(age, (int, float))
-        or not 0 <= age <= TRACKER_BOUNDARY_FRESH_SECONDS
         or not isinstance(eta, (int, float))
+        or (raw_revision is not None and (revision is None or _boundary_age(evidence) is None))
+        or (raw_revision is None and (
+            _boundary_age(evidence) is None
+            or _boundary_age(evidence) > TRACKER_BOUNDARY_FRESH_SECONDS
+        ))
     ):
         return False
     lower, upper = map(float, bracket)
@@ -486,21 +541,13 @@ def compare_adjacent(old, new, state=None):
         invalid_fresh = [
             track
             for track, position in b.items()
-            if len(
-                new.get("track_evidence", {})
-                .get(key, {})
-                .get(track, {})
-                .get("bracket")
-                or ()
-            ) == 2
-            and isinstance(
-                new["track_evidence"][key][track].get("boundary_age_seconds"),
-                (int, float),
+            if (
+                len(new.get("track_evidence", {}).get(key, {}).get(track, {}).get("bracket") or ()) == 2
+                and _boundary_evidence_attempted(
+                    new.get("track_evidence", {}).get(key, {}).get(track, {})
+                )
+                and not _direct_bracket_evidence(new, key, track, position)
             )
-            and 0
-            <= new["track_evidence"][key][track]["boundary_age_seconds"]
-            <= TRACKER_BOUNDARY_FRESH_SECONDS
-            and not _direct_bracket_evidence(new, key, track, position)
         ]
         for track in invalid_fresh:
             issues.append({

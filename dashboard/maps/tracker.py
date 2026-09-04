@@ -22,6 +22,7 @@ class _Track:
     generation: int
     last_evidence_at: float = 0.0
     boundary_observed_at: float | None = None
+    boundary_revision: tuple[int, int] | None = None
 
 
 def _key(item):
@@ -190,6 +191,7 @@ class MarkerTracker:
                     track.generation = generation
                     track.last_evidence_at = now
                     track.boundary_observed_at = _boundary_observed_at(candidate, now)
+                    track.boundary_revision = _candidate_revision(candidate)
                 births = []
                 for index, candidate in enumerate(rows):
                     if index in used:
@@ -205,6 +207,7 @@ class MarkerTracker:
                         generation=generation,
                         last_evidence_at=now,
                         boundary_observed_at=_boundary_observed_at(candidate, now),
+                        boundary_revision=_candidate_revision(candidate),
                     ))
                 matched_old = {old_index for old_index, _ in pairs}
                 # A complete all-stop generation is the lifecycle authority.
@@ -225,11 +228,20 @@ class MarkerTracker:
                 fresh_rows = [
                     candidate for candidate in rows
                     if _fresh_bracket_position(candidate) is not None
+                    and any(_candidate_actionable(candidate, track) for track in old)
                 ]
-                pairs = _ordered_pairs(old, fresh_rows)
+                pairs = _ordered_pairs(
+                    old, fresh_rows,
+                    compatible=lambda track, candidate: _candidate_actionable(
+                        candidate, track
+                    ),
+                )
                 proposed_positions = {
-                    old_index: _fresh_bracket_position(fresh_rows[new_index])
+                    old_index: _bracket_position(
+                        old[old_index], fresh_rows[new_index]
+                    )
                     for old_index, new_index in pairs
+                    if _bracket_position(old[old_index], fresh_rows[new_index]) is not None
                 }
                 accepted_updates = _select_ordered_updates(
                     old, proposed_positions
@@ -244,6 +256,7 @@ class MarkerTracker:
                                              operator_code=key[0])
                     track.last_evidence_at = now
                     track.boundary_observed_at = _boundary_observed_at(candidate, now)
+                    track.boundary_revision = _candidate_revision(candidate)
             self._bound()
 
         output = []
@@ -388,7 +401,7 @@ def _merge_tracks(old, new):
     return merged
 
 
-def _ordered_pairs(old, new):
+def _ordered_pairs(old, new, compatible=None):
     # Score an ordered alignment by retained cardinality first, then by ETA-
     # anchor presence continuity. ETA timestamps can drift by tens of seconds
     # between provider generations, while an unbracketed turnover candidate
@@ -411,7 +424,9 @@ def _ordered_pairs(old, new):
                 except (TypeError, ValueError):
                     anchor_distance = 0.0
             distance = abs(old[i - 1].position - float(new[j - 1].position or 0.0))
-            if distance <= MATCH_DISTANCE:
+            if distance <= MATCH_DISTANCE and (
+                compatible is None or compatible(old[i - 1], new[j - 1])
+            ):
                 previous = dp[i - 1][j - 1]
                 overlap = bool(
                     old[i - 1].estimate.source_observations
@@ -439,7 +454,8 @@ def _ordered_pairs(old, new):
 
 def _bracket_position(track, candidate):
     """Use only a freshly observed boundary to reposition a marker."""
-    del track
+    if not _candidate_actionable(candidate, track):
+        return None
     return _fresh_bracket_position(candidate)
 
 
@@ -447,17 +463,57 @@ def _fresh_bracket_position(candidate):
     bracket = getattr(candidate, "bracket", None)
     if not bracket:
         return None
-    lower, upper = map(float, bracket)
-    age = getattr(candidate, "boundary_age_seconds", None)
-    if age is None:
+    try:
+        lower, upper = map(float, bracket)
+    except (TypeError, ValueError):
         return None
+    if not isfinite(lower) or not isfinite(upper) or lower > upper:
+        return None
+    age = getattr(candidate, "boundary_age_seconds", None)
     try:
         age = float(age)
     except (TypeError, ValueError):
         return None
-    if not isfinite(age) or age < 0.0 or age > 5.0:
+    if not isfinite(age) or age < 0.0:
+        return None
+    # Provider revisions are durable evidence; render delay must not turn
+    # otherwise valid observations into synthetic motion or a held marker.
+    if _candidate_revision(candidate) is not None:
+        position = float(getattr(candidate, "position", lower) or lower)
+        if not isfinite(position):
+            return None
+        return min(upper, max(lower, position))
+    if age > 5.0:
         return None
     return min(upper, max(lower, float(candidate.position or lower)))
+
+
+def _candidate_revision(candidate):
+    value = getattr(candidate, "boundary_revision", None)
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    try:
+        revision = (int(value[0]), int(value[1]))
+    except (TypeError, ValueError):
+        return None
+    return revision if all(item > 0 for item in revision) else None
+
+
+def _candidate_actionable(candidate, track):
+    """Require unseen complete boundary evidence in production snapshots."""
+    raw_revision = getattr(candidate, "boundary_revision", None)
+    revision = _candidate_revision(candidate)
+    if raw_revision is not None and revision is None:
+        return False
+    previous = track.boundary_revision
+    if revision is not None:
+        if previous is None:
+            return True
+        # Both physical endpoints must advance; this rejects one-sided stale
+        # snapshots and ensures a cached replay cannot move a marker.
+        return revision[0] > previous[0] and revision[1] > previous[1]
+    # Hand-built/legacy estimates have no stable provider revision.
+    return previous is None
 
 
 def _select_ordered_updates(old, proposed_positions):

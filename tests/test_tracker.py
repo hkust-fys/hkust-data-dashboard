@@ -46,7 +46,7 @@ def _line(*, stops=3, route="R", bound="out", operator="KMB"):
 
 
 @pytest.mark.asyncio
-async def test_first_generation_seed_and_unchanged_generation_ages_stably():
+async def test_unchanged_generation_without_fresh_boundary_holds_stably():
     tracker = MarkerTracker()
     first = await tracker.update(_snapshot(1), [_candidate(2.0)])
     second = await tracker.update(
@@ -54,22 +54,20 @@ async def test_first_generation_seed_and_unchanged_generation_ages_stably():
     )
     assert len(first) == len(second) == 1
     assert first[0].track_id == second[0].track_id
-    assert second[0].position == pytest.approx(2.5, abs=0.2)
+    assert second[0].position == pytest.approx(2.0)
 
 
 @pytest.mark.asyncio
-async def test_complete_empty_first_miss_coasts_once_then_second_miss_removes():
+async def test_complete_empty_generation_removes_immediately():
     tracker = MarkerTracker()
     visible = await tracker.update(_snapshot(1), [_candidate(2.0)])
-    coast = await tracker.update(_snapshot(2), [])
-    gone = await tracker.update(_snapshot(3), [])
-    assert len(visible) == len(coast) == 1
-    assert coast[0].track_id == visible[0].track_id
+    gone = await tracker.update(_snapshot(2), [])
+    assert len(visible) == 1
     assert gone == []
 
 
 @pytest.mark.asyncio
-async def test_omitted_or_partial_routes_coast_without_changing_cardinality():
+async def test_omitted_or_partial_routes_hold_without_changing_cardinality():
     tracker = MarkerTracker()
     a, b = ("KMB", "A", "out"), ("KMB", "B", "out")
     seeded = await tracker.update(
@@ -83,18 +81,101 @@ async def test_omitted_or_partial_routes_coast_without_changing_cardinality():
 
 
 @pytest.mark.asyncio
-async def test_two_hit_birth_and_reliability_gate():
+async def test_complete_generation_births_follow_eta_population_immediately():
     tracker = MarkerTracker()
     await tracker.update(_snapshot(1), [_candidate(1.0)])
-    assert len(await tracker.update(_snapshot(2), [_candidate(1.0), _candidate(4.0)])) == 1
-    assert len(await tracker.update(_snapshot(3), [_candidate(1.1), _candidate(4.1)])) == 2
+    assert len(await tracker.update(
+        _snapshot(2), [_candidate(1.0), _candidate(4.0)]
+    )) == 2
 
     reliable = MarkerTracker()
     assert len(await reliable.update(_snapshot(1), [_candidate(2.0, gate=True)])) == 1
     unreliable = MarkerTracker()
     tentative = _candidate(2.0, unreliable=True)
-    assert await unreliable.update(_snapshot(1), [tentative]) == []
-    assert len(await unreliable.update(_snapshot(2), [tentative])) == 1
+    assert len(await unreliable.update(_snapshot(1), [tentative])) == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_generation_drops_unmatched_stale_bracket_ghost():
+    tracker = MarkerTracker()
+    first = await tracker.update(
+        _snapshot(1),
+        [
+            _candidate(1.5, bracket=(1.0, 2.0), boundary_age=0),
+            _candidate(2.5, bracket=(2.0, 3.0), boundary_age=0),
+            _candidate(5.5, bracket=(5.0, 6.0), boundary_age=0),
+        ],
+    )
+    current = await tracker.update(
+        _snapshot(2, collected_at=BASE_TIME + timedelta(seconds=60)),
+        [
+            _candidate(1.7, bracket=(1.0, 2.0), boundary_age=30),
+            _candidate(2.7, bracket=(2.0, 3.0), boundary_age=30),
+        ],
+    )
+    assert len(current) == 2
+    assert [marker.track_id for marker in current] == [
+        first[0].track_id,
+        first[1].track_id,
+    ]
+    assert [marker.position for marker in current] == [1.5, 2.5]
+
+
+@pytest.mark.asyncio
+async def test_unbracketed_gate_refresh_cannot_move_or_coast_track():
+    tracker = MarkerTracker()
+    first = await tracker.update(
+        _snapshot(1),
+        [_candidate(8.0, gate=True, bracket=(7.0, 8.0), boundary_age=0)],
+    )
+    refreshed = await tracker.update(
+        _snapshot(1, collected_at=BASE_TIME + timedelta(seconds=30)),
+        [_candidate(9.256, gate=True)],
+    )
+    omitted = await tracker.update(
+        _omitted(BASE_TIME + timedelta(seconds=120)), []
+    )
+    assert refreshed[0].track_id == omitted[0].track_id == first[0].track_id
+    assert refreshed[0].position == omitted[0].position == first[0].position
+    assert refreshed[0].bracket == omitted[0].bracket == (7.0, 8.0)
+    assert refreshed[0].boundary_age_seconds == pytest.approx(30.0)
+    assert omitted[0].boundary_age_seconds == pytest.approx(120.0)
+
+
+@pytest.mark.asyncio
+async def test_same_generation_fresh_boundaries_are_not_starved_by_stale_candidates():
+    tracker = MarkerTracker()
+    initial = [
+        _candidate(6.5, bracket=(6.0, 7.0), boundary_age=0,
+                   arrival_at=BASE_TIME + timedelta(seconds=100)),
+        _candidate(7.90, bracket=(7.0, 8.0), boundary_age=0,
+                   arrival_at=BASE_TIME + timedelta(seconds=0)),
+        _candidate(7.93, bracket=(7.0, 8.0), boundary_age=0,
+                   arrival_at=BASE_TIME + timedelta(seconds=3)),
+    ]
+    first = await tracker.update(_snapshot(1), initial)
+    refreshed = [
+        _candidate(6.6, bracket=(6.0, 7.0), boundary_age=0,
+                   arrival_at=BASE_TIME + timedelta(seconds=100)),
+        _candidate(7.16, bracket=(7.0, 8.0), boundary_age=0,
+                   arrival_at=BASE_TIME + timedelta(seconds=120)),
+        _candidate(8.0, bracket=(7.0, 8.0), boundary_age=0,
+                   arrival_at=BASE_TIME + timedelta(seconds=0)),
+        _candidate(8.2, bracket=(8.0, 9.0), boundary_age=30,
+                   arrival_at=BASE_TIME + timedelta(seconds=3)),
+    ]
+    current = await tracker.update(
+        _snapshot(1, collected_at=BASE_TIME + timedelta(seconds=30)), refreshed
+    )
+
+    assert [marker.track_id for marker in current] == [
+        marker.track_id for marker in first
+    ]
+    assert [marker.position for marker in current] == pytest.approx(
+        [6.6, 7.16, 8.0]
+    )
+    assert all(marker.boundary_age_seconds == pytest.approx(0.0)
+               for marker in current)
 
 
 @pytest.mark.asyncio
@@ -187,7 +268,7 @@ async def test_omitted_route_at_ttl_mid_route_retains():
     await tracker.update(_snapshot(1, [_candidate(1.0)]), [_candidate(1.0)], [line])
     retained = await tracker.update(_omitted(BASE_TIME + timedelta(seconds=240)), [], [line])
     assert len(retained) == 1
-    assert retained[0].position == pytest.approx(3.0)
+    assert retained[0].position == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio
@@ -223,11 +304,10 @@ async def test_configurable_track_bound_and_route_line_clamp():
 
 
 @pytest.mark.asyncio
-async def test_scheduled_first_generation_is_tentative_then_confirms():
+async def test_scheduled_first_complete_generation_is_visible():
     tracker = MarkerTracker()
     scheduled = _candidate(2.0, scheduled=True)
-    assert await tracker.update(_snapshot(1), [scheduled]) == []
-    visible = await tracker.update(_snapshot(2), [scheduled])
+    visible = await tracker.update(_snapshot(1), [scheduled])
     assert len(visible) == 1
 
 
@@ -406,7 +486,7 @@ async def test_tied_component_preserves_strict_predecessor_and_successor_boundar
          _candidate(12.0, bracket=(11.0, 12.0), boundary_age=None),
          _candidate(12.0, bracket=(11.0, 12.0), boundary_age=None)],
     )
-    assert [marker.position for marker in updated] == [10.0, 10.0, 10.0]
+    assert [marker.position for marker in updated] == [9.0, 10.0, 10.0]
     assert [marker.track_id for marker in updated] == [initial[0].track_id,
                                                         initial[1].track_id,
                                                         initial[2].track_id]
@@ -475,18 +555,14 @@ async def test_same_generation_correction_preserves_original_tie_chain_boundarie
 
 
 @pytest.mark.asyncio
-async def test_omitted_route_preserves_phased_tie_split_and_strict_neighbor():
+async def test_omitted_route_holds_tie_and_strict_neighbor():
     tracker = MarkerTracker()
     initial = await tracker.update(
         _snapshot(1),
         [_candidate(9.0), _candidate(10.0), _candidate(10.0)],
     )
-    key = ("KMB", "R", "out")
-    tied_track = tracker._routes[key][initial[1].track_id]
-    tied_track.phase -= 60.0
     omitted = await tracker.update(
         _omitted(BASE_TIME + timedelta(seconds=60)), []
     )
     by_id = {marker.track_id: marker.position for marker in omitted}
-    assert by_id[initial[0].track_id] <= by_id[initial[2].track_id]
-    assert by_id[initial[2].track_id] < by_id[initial[1].track_id]
+    assert [by_id[marker.track_id] for marker in initial] == [9.0, 10.0, 10.0]

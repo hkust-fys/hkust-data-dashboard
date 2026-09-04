@@ -11,8 +11,6 @@ from dashboard.maps.positions import reproject_estimate
 MAX_ROUTES = 64
 MAX_TRACKS_PER_ROUTE = 128
 MATCH_DISTANCE = 3.5
-SECONDS_PER_STOP = 120.0
-SMOOTHING_ALPHA = 0.35
 MAX_PRIORITY_ENDPOINTS_PER_ROUTE = 32
 
 
@@ -20,13 +18,10 @@ MAX_PRIORITY_ENDPOINTS_PER_ROUTE = 32
 class _Track:
     track_id: int
     estimate: object
-    phase: float
     position: float
     generation: int
-    hits: int = 1
-    misses: int = 0
-    confirmed: bool = True
     last_evidence_at: float = 0.0
+    boundary_observed_at: float | None = None
 
 
 def _key(item):
@@ -124,7 +119,7 @@ class MarkerTracker:
         for key in sorted(keys):
             if key in route_terminals:
                 self._terminal_indices[key] = route_terminals[key]
-            rows = sorted(grouped.get(key, ()), key=lambda item: float(item.position or 0.0))
+            rows = sorted(grouped.get(key, ()), key=_candidate_sort_key)
             generation = getattr(complete.get(key), "generation", None)
             tracks = self._routes.get(key)
             if tracks is None:
@@ -145,66 +140,58 @@ class MarkerTracker:
                 }
                 self._predict(old, now, route_lines)
                 pairs = _ordered_pairs(old, rows)
+                proposed_positions = {
+                    old_index: position
+                    for old_index, new_index in pairs
+                    if (position := _bracket_position(
+                        old[old_index], rows[new_index]
+                    )) is not None
+                }
+                accepted_updates = _select_ordered_updates(
+                    old, proposed_positions
+                )
                 used = set()
                 for old_index, new_index in pairs:
                     track = old[old_index]
                     candidate = rows[new_index]
                     used.add(new_index)
-                    candidate_bracket = getattr(candidate, "bracket", None)
-                    bracket_position = _bracket_position(track, candidate)
-                    if candidate_bracket is not None and bracket_position is None:
-                        # Complete lifecycle evidence can advance generation,
-                        # but stale positioning evidence must hold the track.
-                        _hold_track(track, now, held_positions[track.track_id])
+                    if old_index not in accepted_updates:
+                        # Complete lifecycle evidence can confirm an identity,
+                        # but stale, unbracketed, or order-crossing positioning
+                        # evidence must retain the last exact boundary.
+                        _hold_track(track, held_positions[track.track_id])
                         track.generation = generation
-                        track.hits += 1
-                        track.misses = 0
-                        track.confirmed = track.confirmed or track.hits >= 2
                         track.last_evidence_at = now
                         continue
-                    if candidate_bracket is None and not _authoritative_evidence(candidate):
-                        # A complete generation may confirm that this identity
-                        # still exists, but incomplete probe geometry cannot
-                        # replace the last real positioning boundary.
-                        _hold_track(track, now, held_positions[track.track_id])
-                        track.generation = generation
-                        track.hits += 1
-                        track.misses = 0
-                        track.confirmed = track.confirmed or track.hits >= 2
-                        track.last_evidence_at = now
-                        continue
-                    target_phase = now - float(candidate.position or track.position) * SECONDS_PER_STOP
-                    track.phase += SMOOTHING_ALPHA * (target_phase - track.phase)
-                    track.position = (bracket_position if bracket_position is not None
-                                      else max(track.position, (now - track.phase) / SECONDS_PER_STOP))
+                    track.position = proposed_positions[old_index]
                     track.estimate = replace(candidate, track_id=track.track_id, operator_code=key[0])
                     track.generation = generation
                     track.last_evidence_at = now
-                    track.hits += 1
-                    track.misses = 0
-                    track.confirmed = track.confirmed or track.hits >= 2
-                matched_ids = {old[index].track_id for index, _ in pairs}
+                    track.boundary_observed_at = _boundary_observed_at(candidate, now)
                 births = []
                 for index, candidate in enumerate(rows):
                     if index in used:
                         continue
                     track_id = self._next_id
                     self._next_id += 1
-                    births.append(_Track(track_id,
-                        replace(candidate, track_id=track_id, operator_code=key[0]),
-                        now - float(candidate.position or 0.0) * SECONDS_PER_STOP,
-                        float(candidate.position or 0.0),
-                        generation,
-                        confirmed=(_reliable(candidate) or (old_generation is None and not _tentative(candidate))),
+                    births.append(_Track(
+                        track_id=track_id,
+                        estimate=replace(
+                            candidate, track_id=track_id, operator_code=key[0]
+                        ),
+                        position=float(candidate.position or 0.0),
+                        generation=generation,
                         last_evidence_at=now,
+                        boundary_observed_at=_boundary_observed_at(candidate, now),
                     ))
-                for track_id, track in list(tracks.items()):
-                    if track.generation != generation and track_id not in matched_ids:
-                        track.misses += 1
-                        if track.misses >= 2:
-                            tracks.pop(track_id, None)
-                old_survivors = [track for track in old
-                                 if track.track_id in tracks]
+                matched_old = {old_index for old_index, _ in pairs}
+                # A complete all-stop generation is the lifecycle authority.
+                # Keeping an unmatched prior track for another generation
+                # renders a ghost alongside the replacement ETA instance.
+                old_survivors = [
+                    track for index, track in enumerate(old)
+                    if index in matched_old
+                ]
                 merged = _merge_tracks(old_survivors, births)
                 tracks.clear()
                 tracks.update((track.track_id, track) for track in merged)
@@ -213,24 +200,28 @@ class MarkerTracker:
                 # rows. Refresh matched tracks, but never alter cardinality
                 # until a newer complete generation arrives.
                 old = list(tracks.values())
-                pairs = _ordered_pairs(old, rows)
+                fresh_rows = [
+                    candidate for candidate in rows
+                    if _fresh_bracket_position(candidate) is not None
+                ]
+                pairs = _ordered_pairs(old, fresh_rows)
+                proposed_positions = {
+                    old_index: _fresh_bracket_position(fresh_rows[new_index])
+                    for old_index, new_index in pairs
+                }
+                accepted_updates = _select_ordered_updates(
+                    old, proposed_positions
+                )
                 for old_index, new_index in pairs:
-                    track = old[old_index]
-                    candidate = rows[new_index]
-                    position = _bracket_position(track, candidate)
-                    if (
-                        position is None
-                        and getattr(candidate, "bracket", None) is None
-                        and _authoritative_evidence(candidate)
-                    ):
-                        position = float(candidate.position or track.position)
-                    if position is None:
+                    if old_index not in accepted_updates:
                         continue
-                    track.position = position
+                    track = old[old_index]
+                    candidate = fresh_rows[new_index]
+                    track.position = proposed_positions[old_index]
                     track.estimate = replace(candidate, track_id=track.track_id,
                                              operator_code=key[0])
                     track.last_evidence_at = now
-                    track.misses = 0
+                    track.boundary_observed_at = _boundary_observed_at(candidate, now)
             self._bound()
 
         output = []
@@ -255,9 +246,8 @@ class MarkerTracker:
                         self._generations.pop(key, None)
                         self._terminal_indices.pop(key, None)
             output.extend(
-                replace(track.estimate, track_id=track.track_id, operator_code=key[0])
+                _output_estimate(track, key[0], now)
                 for track in ordered
-                if track.confirmed
             )
         return output
 
@@ -265,10 +255,11 @@ class MarkerTracker:
         maximum = _route_max(track.estimate, route_lines)
         if maximum == inf:
             return False
-        raw_position = max(track.position, (now - track.phase) / SECONDS_PER_STOP)
-        return raw_position >= maximum and now - track.last_evidence_at >= self.evidence_ttl_seconds
+        return (track.position >= maximum
+                and now - track.last_evidence_at >= self.evidence_ttl_seconds)
 
     def _predict(self, tracks, now, route_lines, split_ties=()):
+        del now
         split_ties = dict(split_ties)
         input_positions = [track.position for track in tracks]
         components = [
@@ -277,12 +268,10 @@ class MarkerTracker:
         ]
         positions = []
         for track in tracks:
-            # Bracketed estimates move only when a fresh boundary poll updates
-            # them.  Cached ETA age must never become synthetic motion.
-            if getattr(track.estimate, "bracket", None) is not None:
-                position = track.position
-            else:
-                position = max(track.position, (now - track.phase) / SECONDS_PER_STOP)
+            # Every estimate holds until a fresh two-sided boundary poll
+            # updates it. Cached ETA age and wall time are identity metadata,
+            # never synthetic marker motion.
+            position = track.position
             maximum = _route_max(track.estimate, route_lines)
             if maximum != inf:
                 position = min(position, maximum)
@@ -314,7 +303,9 @@ class MarkerTracker:
 
     @staticmethod
     def _sort_tracks(tracks):
-        return dict(sorted(tracks.items(), key=lambda item: (item[1].position, item[0])))
+        # Python's sort is stable, so a strict prior ordering remains intact
+        # when two identities collapse to the same position.
+        return dict(sorted(tracks.items(), key=lambda item: item[1].position))
 
     def _bound(self):
         for key in sorted(self._routes):
@@ -337,6 +328,17 @@ def _group(items):
     for item in items:
         grouped.setdefault(_key(item), []).append(item)
     return grouped
+
+
+def _candidate_sort_key(item):
+    """Keep equal-position departures in stable ETA order."""
+    arrival = getattr(item, "eta_arrival_at", None)
+    try:
+        arrival_key = _timestamp(arrival) if arrival is not None else inf
+    except (TypeError, ValueError, OverflowError):
+        arrival_key = inf
+    observations = tuple(sorted(getattr(item, "source_observations", ()) or ()))
+    return (float(getattr(item, "position", 0.0) or 0.0), arrival_key, observations)
 
 
 def _tie_components(tracks):
@@ -401,6 +403,11 @@ def _ordered_pairs(old, new):
 
 def _bracket_position(track, candidate):
     """Use only a freshly observed boundary to reposition a marker."""
+    del track
+    return _fresh_bracket_position(candidate)
+
+
+def _fresh_bracket_position(candidate):
     bracket = getattr(candidate, "bracket", None)
     if not bracket:
         return None
@@ -417,35 +424,108 @@ def _bracket_position(track, candidate):
     return min(upper, max(lower, float(candidate.position or lower)))
 
 
-def _hold_track(track, now, position):
+def _select_ordered_updates(old, proposed_positions):
+    """Keep the largest exact-update subset that cannot reorder identities.
+
+    Tracks tied at the prior position are one unordered component and may
+    split when fresh evidence distinguishes them. Distinct prior-position
+    components retain their global order. Rejected proposals keep both their
+    old position and old evidence instead of relabelling an adjusted point as
+    the fresh ETA-proportionate position.
+    """
+    if not proposed_positions:
+        return set()
+
+    components = []
+    for index, track in enumerate(old):
+        if not components or old[components[-1][0]].position != track.position:
+            components.append([index])
+        else:
+            components[-1].append(index)
+
+    def score(value):
+        count, movement, selected = value
+        return (-count, movement, selected)
+
+    component_options = []
+    for component in components:
+        states = {None: (0, 0.0, ())}
+        for index in component:
+            choices = [(float(old[index].position), False)]
+            if index in proposed_positions:
+                choices.append((float(proposed_positions[index]), True))
+            next_states = {}
+            for bounds, value in states.items():
+                for position, selected in choices:
+                    lower = position if bounds is None else min(bounds[0], position)
+                    upper = position if bounds is None else max(bounds[1], position)
+                    candidate = (
+                        value[0] + int(selected),
+                        value[1] + (
+                            abs(position - float(old[index].position))
+                            if selected else 0.0
+                        ),
+                        value[2] + ((index,) if selected else ()),
+                    )
+                    key = (lower, upper)
+                    if key not in next_states or score(candidate) < score(next_states[key]):
+                        next_states[key] = candidate
+            states = next_states
+        component_options.append([
+            (bounds[0], bounds[1], value)
+            for bounds, value in states.items()
+        ])
+
+    states = {None: (0, 0.0, ())}
+    for options in component_options:
+        next_states = {}
+        for previous_upper, previous in states.items():
+            for lower, upper, option in options:
+                if previous_upper is not None and previous_upper > lower:
+                    continue
+                candidate = (
+                    previous[0] + option[0],
+                    previous[1] + option[1],
+                    previous[2] + option[2],
+                )
+                if upper not in next_states or score(candidate) < score(next_states[upper]):
+                    next_states[upper] = candidate
+        states = next_states
+
+    best = min(states.values(), key=score)
+    return set(best[2])
+
+
+def _boundary_observed_at(candidate, now):
+    age = getattr(candidate, "boundary_age_seconds", None)
+    try:
+        age = float(age)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(age) or age < 0.0:
+        return None
+    return now - age
+
+
+def _output_estimate(track, operator_code, now):
+    age = None
+    if track.boundary_observed_at is not None:
+        age = max(0.0, now - track.boundary_observed_at)
+    return replace(
+        track.estimate,
+        track_id=track.track_id,
+        operator_code=operator_code,
+        boundary_age_seconds=age,
+    )
+
+
+def _hold_track(track, position):
     """Keep a generation-confirmed track fixed until fresh evidence arrives."""
     track.position = position
-    track.phase = now - position * SECONDS_PER_STOP
 
 
 def _timestamp(value):
     return float(value.timestamp()) if hasattr(value, "timestamp") else float(value)
-
-
-def _reliable(candidate):
-    return not bool(getattr(candidate, "unreliable", False)) and any(
-        str(kind).lower() in {"gate", "authoritative"}
-        for kind, _ in candidate.source_observations
-    )
-
-
-def _authoritative_evidence(candidate):
-    return any(
-        str(kind).lower() in {"gate", "authoritative"}
-        for kind, _ in getattr(candidate, "source_observations", ())
-    )
-
-
-def _tentative(candidate):
-    if bool(getattr(candidate, "unreliable", False)):
-        return True
-    return any(str(kind).lower() in {"scheduled", "schedule"}
-               for kind, _ in candidate.source_observations)
 
 
 def _positive_int(value, name):

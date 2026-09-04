@@ -8,6 +8,7 @@ import json
 import sys
 from collections import Counter
 from datetime import UTC, datetime
+from math import isfinite
 from pathlib import Path
 
 import aiohttp
@@ -82,11 +83,19 @@ def _tracks(items):
     return {k: sorted(v, key=lambda z: z[1]) for k, v in out.items()}
 
 
-def frame_record(snapshot, candidates, tracked, route_max=None, timestamp=None):
+def frame_record(
+    snapshot,
+    candidates,
+    tracked,
+    route_max=None,
+    timestamp=None,
+    priorities=None,
+):
     def evidence(x):
         arrival = getattr(x, "eta_arrival_at", None)
         return {
             "bracket": getattr(x, "bracket", None),
+            "unreliable": bool(getattr(x, "unreliable", False)),
             "eta_minutes": getattr(x, "eta_minutes", None),
             "eta_arrival_at": arrival.isoformat() if hasattr(arrival, "isoformat") else arrival,
             "boundary_age_seconds": getattr(x, "boundary_age_seconds", None),
@@ -96,6 +105,19 @@ def frame_record(snapshot, candidates, tracked, route_max=None, timestamp=None):
     def evidence_record(x):
         e = evidence(x)
         return {"position": float(getattr(x, "position", 0)), **e}
+    checkpoint_ages = {}
+    positioning_rows = getattr(snapshot, "positioning_rows", None)
+    for row in positioning_rows if positioning_rows is not None else ():
+        try:
+            index = int(row.index)
+            age = float(row.cache_age_seconds)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not isfinite(age) or age < 0:
+            continue
+        key = route_key(row)
+        by_index = checkpoint_ages.setdefault(key, {})
+        by_index[index] = max(age, by_index.get(index, 0.0))
     return {
         "utc": timestamp or datetime.now(UTC).isoformat(),
         "generations": {
@@ -113,6 +135,11 @@ def frame_record(snapshot, candidates, tracked, route_max=None, timestamp=None):
                                 for key in {route_key(x) for x in tracked})
         },
         "observed_checkpoints": _observed_checkpoint_map(snapshot),
+        "priority_checkpoints": {
+            tuple(key): sorted(int(index) for index in indices)
+            for key, indices in (priorities or {}).items()
+        },
+        "checkpoint_ages": checkpoint_ages,
         "route_max": route_max or {},
     }
 
@@ -258,11 +285,22 @@ def compare_adjacent(old, new, state=None):
     """Check only observed facts; omissions never manufacture a generation."""
     state = _evidence_state(state)
     if old is None:
+        initial_issues = []
         for key, generation in new.get("generations", {}).items():
             state["last_generation_by_route"][key] = generation[0]
             state["latest_complete_collected_at"][key] = generation[1]
+            candidate_count = len(new.get("candidates", {}).get(key, ()))
+            track_count = len(new.get("tracks", {}).get(key, ()))
+            if candidate_count != track_count:
+                initial_issues.append({
+                    "kind": "cardinality_mismatch_at_complete_generation",
+                    "route": key,
+                    "candidate_count": candidate_count,
+                    "track_count": track_count,
+                })
         # The first complete frame is valid direct spacing evidence.
-        return compare_adjacent(new, new, state)
+        issues, checks = compare_adjacent(new, new, state)
+        return initial_issues + issues, checks
     for key, generation in old.get("generations", {}).items():
         state["last_generation_by_route"].setdefault(key, generation[0])
         state["latest_complete_collected_at"].setdefault(key, generation[1])
@@ -277,6 +315,24 @@ def compare_adjacent(old, new, state=None):
     keys = set(old_tracks) | set(new_tracks) | set(old.get("generations", {})) | set(new.get("generations", {}))
     for key in keys:
         a, b = old_tracks.get(key, {}), new_tracks.get(key, {})
+        signatures = {}
+        for track in b:
+            route_evidence = new.get("track_evidence", {}).get(key, {})
+            track_evidence = route_evidence.get(
+                track, route_evidence.get(str(track))
+            )
+            signature = _provenance_signature(track_evidence)
+            if signature is None:
+                continue
+            if signature in signatures:
+                issues.append({
+                    "kind": "duplicate_track_evidence",
+                    "route": key,
+                    "track_id": track,
+                    "other_track_id": signatures[signature],
+                })
+            else:
+                signatures[signature] = track
         current_generation = new.get("generations", {}).get(key)
         last_generation = state["last_generation_by_route"].get(key)
         generation_changed = bool(current_generation and last_generation is not None
@@ -286,6 +342,14 @@ def compare_adjacent(old, new, state=None):
             if last_generation is None or generation_changed:
                 state["last_generation_by_route"][key] = current_generation[0]
                 state["latest_complete_collected_at"][key] = current_generation[1]
+                candidate_count = len(new.get("candidates", {}).get(key, ()))
+                if candidate_count != len(b):
+                    issues.append({
+                        "kind": "cardinality_mismatch_at_complete_generation",
+                        "route": key,
+                        "candidate_count": candidate_count,
+                        "track_count": len(b),
+                    })
             else:
                 if set(a) != set(b):
                     issues.append({"kind": "identity_change_without_generation", "route": key})
@@ -408,6 +472,26 @@ def check_minute_baselines(baselines, current, *, max_baselines=256, evidence_st
     for identity, baseline in list(baselines.items()):
         stamp, pos, frame = baseline[:3]
         baseline_generation = baseline[3] if len(baseline) > 3 else frame.get("generations", {}).get(identity[0], (None,))[0]
+        current_position = dict(current.get("tracks", {}).get(identity[0], ())).get(
+            identity[1]
+        )
+        if (
+            current_position is not None
+            and current_position + POSITION_EPSILON < pos
+            and _eta_allows_motion(frame, current, identity[0], identity[1])
+        ):
+            # A fresh ETA correction is an allowed backward snap. Start the
+            # minute window at that evidence event so a later cached frame
+            # cannot misreport the already-attributed correction as new
+            # unexplained motion. Ordinary generation refreshes do not reset
+            # surviving route/track baselines.
+            baselines[identity] = (
+                current["utc"],
+                current_position,
+                current,
+                effective_generations.get(identity[0], baseline_generation),
+            )
+            continue
         if (
             datetime.fromisoformat(current["utc"]) - datetime.fromisoformat(stamp)
         ).total_seconds() >= OBSERVATION_SPAN:
@@ -494,7 +578,10 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
                     for name in failed or ()
                     if FAILED_OPERATOR_CODES.get(name, name) in requested_operators
                 )
-                snap = await fetch_probe_snapshot(client, probes, priorities=tracker.poll_priorities())
+                priorities = tracker.poll_priorities()
+                snap = await fetch_probe_snapshot(
+                    client, probes, priorities=priorities
+                )
                 seen.update(tuple(x.route_key) for x in snap.complete_routes)
                 for item in snap.complete_routes:
                     fresh[tuple(item.route_key)] = item.collected_at
@@ -515,6 +602,7 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
                     cand,
                     tracked,
                     {route_key(x): max(0, len(getattr(x, "stops", ())) - 1) for x in lines},
+                    priorities=priorities,
                 )
                 iss, g = compare_adjacent(previous, cur, evidence)
                 spacing_count += g

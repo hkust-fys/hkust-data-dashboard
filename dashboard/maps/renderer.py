@@ -1196,7 +1196,7 @@ def _draw_bus_route_marker(
                 row_color = tuple(int(c + (255 - c) * 0.55) for c in row_color)
             row_colors.append(row_color + (255,))
         draw.rounded_rectangle(placement.rect, radius=radius, fill=row_colors[0])
-        for index, (text, _operator, row_unreliable) in enumerate(placement.rows):
+        for index, (text, operator, row_unreliable) in enumerate(placement.rows):
             row_top = top + index * row_height
             row_bottom = top + (index + 1) * row_height
             if index:
@@ -1218,7 +1218,11 @@ def _draw_bus_route_marker(
                     )
             draw.text(
                 (text_origin(text, left, right), row_top + metrics.px(2)), text,
-                fill=(25, 25, 25, 255) if row_unreliable else (255, 255, 255, 255),
+                fill=(
+                    (25, 25, 25, 255)
+                    if row_unreliable or operator is Operator.CITYBUS
+                    else (255, 255, 255, 255)
+                ),
                 font=font,
             )
         _draw_grouped_bus_outline(draw, placement.rect, placement.rows, metrics)
@@ -1248,7 +1252,11 @@ def _draw_bus_route_marker(
             placement.rect, radius=metrics.integer(4), fill=color + (245,),
             outline=(20, 20, 20, 255), width=metrics.integer(1)
         )
-        text_fill = (255, 255, 255, 255)
+        text_fill = (
+            (25, 25, 25, 255)
+            if placement.operator is Operator.CITYBUS
+            else (255, 255, 255, 255)
+        )
     if phase != "label":
         _draw_colored_bus_arrow(
             draw, (anchor_x, anchor_y), placement.heading, [color], metrics

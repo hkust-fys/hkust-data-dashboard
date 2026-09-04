@@ -726,6 +726,51 @@ def test_bus_estimate_has_operator_colored_arrow_separate_from_label():
     assert not hasattr(renderer, "_draw_bus_label_pointer")
 
 
+def test_citybus_live_text_is_dark_in_singleton_and_grouped_labels():
+    class RecordingDraw:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.text_fills = []
+
+        def text(self, *args, **kwargs):
+            self.text_fills.append(kwargs.get("fill"))
+            return self.wrapped.text(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    canvas = Image.new("RGBA", (220, 100), (120, 120, 120, 255))
+    draw = RecordingDraw(renderer.ImageDraw.Draw(canvas))
+    font = renderer._font(13)
+    renderer._draw_bus_route_marker(
+        draw,
+        renderer.LabelPlacement(
+            "792M TKO", (20, 15, 100, 35), (60, 25),
+            Operator.CITYBUS, 0,
+        ),
+        renderer.OPERATOR_COLORS[Operator.CITYBUS],
+        font,
+        phase="label",
+    )
+    renderer._draw_bus_route_marker(
+        draw,
+        renderer.LabelPlacement(
+            "792M/91", (110, 15, 205, 55), (155, 35), Operator.CITYBUS, 0,
+            False,
+            (("792M TKO", Operator.CITYBUS, False),
+             ("91 Diamond Hill", Operator.KMB, False)),
+        ),
+        renderer.OPERATOR_COLORS[Operator.CITYBUS],
+        font,
+        phase="label",
+    )
+    assert draw.text_fills == [
+        (25, 25, 25, 255),
+        (25, 25, 25, 255),
+        (255, 255, 255, 255),
+    ]
+
+
 def test_mixed_operator_arrow_contains_each_operator_color():
     canvas = Image.new("RGBA", (80, 80), (120, 120, 120, 255))
     draw = renderer.ImageDraw.Draw(canvas)

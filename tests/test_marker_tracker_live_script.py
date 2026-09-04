@@ -38,6 +38,24 @@ def test_identity_and_cardinality_require_generation():
     }
 
 
+def test_complete_generation_requires_exact_candidate_cardinality():
+    initial = frame(1, ((1, 2.0), (2, 3.0)), (2.0,))
+    initial_issues, _ = compare_adjacent(None, initial)
+    mismatch = next(
+        issue for issue in initial_issues
+        if issue["kind"] == "cardinality_mismatch_at_complete_generation"
+    )
+    assert (mismatch["candidate_count"], mismatch["track_count"]) == (1, 2)
+
+    old = frame(1, ((1, 2.0),), (2.0,))
+    current = frame(2, ((1, 2.0), (2, 3.0)), (2.0,))
+    issues, _ = compare_adjacent(old, current, {})
+    assert any(
+        issue["kind"] == "cardinality_mismatch_at_complete_generation"
+        for issue in issues
+    )
+
+
 def test_spacing_requires_equal_complete_cardinality():
     old = frame(1, ((1, 1.0), (2, 5.0)), (1.0, 5.0))
     bad = frame(1, ((1, 1.0), (2, 2.0)), (1.0, 5.0))
@@ -99,6 +117,19 @@ def test_spacing_provenance_uses_duplicate_multisets():
     issues, checks = compare_adjacent(old, different, state)
     assert not any(x["kind"] == "spacing_mismatch" for x in issues)
     assert checks == 0 and state["gap_inconclusive"][KEY] == 1
+
+
+def test_duplicate_track_evidence_is_a_hard_failure():
+    same = ((1, (1, 2), (3,)), (1, (1, 2), (3,)))
+    duplicated = provenance_frame(
+        (1.0, 1.0), (1.0, 1.0), provenance=same
+    )
+    issues, _checks = compare_adjacent(duplicated, duplicated)
+    duplicate = next(
+        issue for issue in issues
+        if issue["kind"] == "duplicate_track_evidence"
+    )
+    assert {duplicate["track_id"], duplicate["other_track_id"]} == {1, 2}
 
 
 def test_matching_provenance_still_reports_real_spacing_error():
@@ -217,6 +248,34 @@ def test_minute_baseline_allows_fresh_eta_snap_but_rejects_stale_snap():
     }
 
 
+def test_minute_baseline_restarts_at_intermediate_fresh_backward_snap():
+    initial = evidence_frame()
+    corrected = evidence_frame(pos=(3.0, 7.0), eta=(2, 2), age=1.0)
+    corrected["utc"] = "2026-01-01T00:00:30+00:00"
+    cached = evidence_frame(pos=(3.0, 7.0), eta=(2, 2), age=31.0)
+    cached["utc"] = "2026-01-01T00:01:00+00:00"
+    later = evidence_frame(pos=(3.0, 7.0), eta=(2, 2), age=61.0)
+    later["utc"] = "2026-01-01T00:01:30+00:00"
+    state = {"last_generation_by_route": {KEY: 1}, "minute_checks": {}}
+    baselines = {
+        (KEY, track_id): (initial["utc"], position, initial, 1)
+        for track_id, position in initial["tracks"][KEY]
+    }
+
+    baselines, issues, checks = check_minute_baselines(
+        baselines, corrected, evidence_state=state
+    )
+    assert issues == [] and checks == 0
+    baselines, issues, checks = check_minute_baselines(
+        baselines, cached, evidence_state=state
+    )
+    assert issues == [] and checks == 0
+    _baselines, issues, checks = check_minute_baselines(
+        baselines, later, evidence_state=state
+    )
+    assert issues == [] and checks == 2
+
+
 def test_bracket_qualification_rejects_marker_outside_its_boundary():
     invalid = evidence_frame(pos=(2.5, 7.5))
     state = {}
@@ -276,6 +335,37 @@ def test_json_safe_counters_and_global_pass_threshold():
     assert _json_safe_record({"counters": state})["counters"]["gap_checks"]["KMB/A/in"] == 1
     assert _json_safe_record({"seen": frozenset({2, 1})})["seen"] == [1, 2]
     assert evaluate_run({KEY, ("KMB", "B", "in")}, {KEY}, True, {KEY: 1}, {KEY: 1}, 0) == 2
+
+
+def test_frame_evidence_records_scheduled_marker_reliability():
+    scheduled = item(2.0, 1)
+    scheduled.unreliable = True
+    record = frame_record(
+        SimpleNamespace(complete_routes=()), [scheduled], [scheduled], {KEY: 20.0}
+    )
+    assert record["candidate_evidence"][KEY][0]["unreliable"] is True
+    assert record["track_evidence"][KEY][1]["unreliable"] is True
+
+
+def test_frame_records_requested_priorities_and_checkpoint_cache_ages():
+    rows = (
+        SimpleNamespace(
+            operator="KMB", route="A", bound="in", index=2,
+            cache_age_seconds=3.5,
+        ),
+        SimpleNamespace(
+            operator="KMB", route="A", bound="in", index=3,
+            cache_age_seconds=7.0,
+        ),
+    )
+    record = frame_record(
+        SimpleNamespace(complete_routes=(), positioning_rows=rows),
+        [],
+        [],
+        priorities={KEY: {2, 3}},
+    )
+    assert record["priority_checkpoints"][KEY] == [2, 3]
+    assert record["checkpoint_ages"][KEY] == {2: 3.5, 3: 7.0}
 
 
 def test_each_requested_route_needs_active_track_and_direct_evidence():

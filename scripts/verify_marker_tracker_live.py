@@ -99,6 +99,7 @@ def frame_record(
             "eta_minutes": getattr(x, "eta_minutes", None),
             "eta_arrival_at": arrival.isoformat() if hasattr(arrival, "isoformat") else arrival,
             "boundary_age_seconds": getattr(x, "boundary_age_seconds", None),
+            "bracket_eta_offsets": getattr(x, "bracket_eta_offsets", None),
             "source_indices": sorted(getattr(x, "source_indices", ()) or ()),
             "source_observations": sorted(getattr(x, "source_observations", ()) or ()),
             "priority_indices": sorted(getattr(x, "priority_indices", ()) or ()),
@@ -199,8 +200,15 @@ def _provenance_signature(evidence):
         tuple(item) if isinstance(item, (list, tuple)) else item
         for item in (source_observations or ())
     )
-    return (tuple(bracket) if bracket is not None else None, eta_minutes,
-            eta_arrival_at, tuple(source_indices or ()), observations)
+    bracket_eta_offsets = evidence.get("bracket_eta_offsets")
+    return (
+        tuple(bracket) if bracket is not None else None,
+        tuple(bracket_eta_offsets) if bracket_eta_offsets is not None else None,
+        eta_minutes,
+        eta_arrival_at,
+        tuple(source_indices or ()),
+        observations,
+    )
 
 
 def _source_observation_signature(evidence):
@@ -262,7 +270,8 @@ def _spacing_provenance_comparable(record, key, tracks, candidates):
 def _eta_allows_motion(old, new, key, track):
     before = old.get("track_evidence", {}).get(key, {}).get(track, {})
     after = new.get("track_evidence", {}).get(key, {}).get(track, {})
-    fields = ("bracket", "eta_minutes", "eta_arrival_at", "source_indices", "source_observations")
+    fields = ("bracket", "bracket_eta_offsets", "eta_minutes", "eta_arrival_at",
+              "source_indices", "source_observations")
     changed = tuple(after.get(k) for k in fields) != tuple(before.get(k) for k in fields)
     age = after.get("boundary_age_seconds")
     return changed and isinstance(age, (int, float)) and 0 <= age <= TRACKER_BOUNDARY_FRESH_SECONDS
@@ -291,6 +300,7 @@ def _direct_bracket_evidence(record, key, track, position):
     }
     age = evidence.get("boundary_age_seconds")
     eta = evidence.get("eta_minutes")
+    eta_offsets = evidence.get("bracket_eta_offsets")
     if (
         len(bracket) != 2
         or not sources
@@ -300,6 +310,26 @@ def _direct_bracket_evidence(record, key, track, position):
     ):
         return False
     lower, upper = map(float, bracket)
+    if eta_offsets is not None:
+        if (
+            len(eta_offsets) != 2
+            or int(lower) not in sources
+            or int(upper) not in sources
+        ):
+            return False
+        lower_eta, upper_eta = map(float, eta_offsets)
+        if lower == upper:
+            expected = lower
+        elif lower_eta <= 0 < upper_eta:
+            expected = lower + (upper - lower) * (
+                -lower_eta / (upper_eta - lower_eta)
+            )
+        else:
+            return False
+        return (
+            lower <= position <= upper
+            and abs(position - expected) <= POSITION_EPSILON
+        )
     first_present = min(sources)
     if upper != float(first_present):
         return False

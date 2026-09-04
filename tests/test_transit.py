@@ -246,6 +246,24 @@ def test_probe_parser_preserves_absolute_eta_and_observation_times():
     assert rows[0].observed_at == observed
 
 
+def test_probe_parser_preserves_negative_eta_offset_while_countdown_stays_zero():
+    now = s.utc()
+    probe = SimpleNamespace(
+        operator="KMB", route="91M", bound="outbound", stop_id="stop", index=7,
+    )
+    arrival = now - timedelta(seconds=36)
+    rows = transit._parse_probe_etas(
+        probe,
+        {"data": [{"route": "91M", "dir": "O", "service_type": 1,
+                   "seq": 8, "eta": arrival.isoformat()}]},
+        now,
+    )
+
+    assert len(rows) == 1
+    assert rows[0].minutes == 0
+    assert rows[0].signed_minutes == pytest.approx(-0.6)
+
+
 def test_kmb_route_eta_parser_filters_by_one_based_sequence():
     now = s.utc()
     probe = SimpleNamespace(

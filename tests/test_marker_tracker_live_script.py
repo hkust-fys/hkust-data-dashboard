@@ -237,10 +237,16 @@ def test_near_tie_is_strict_for_identity_order_crossing():
     assert any(issue["kind"] == "identity_order_crossing" for issue in issues)
 
 
-def evidence_frame(pos=(3.5, 7.5), *, age=1.0, eta=(1, 1), brackets=((3, 4), (7, 8))):
+def evidence_frame(pos=(3.5, 7.5), *, age=1.0, eta=(1, 1), brackets=((3, 4), (7, 8)),
+                   eta_offsets=(None, None)):
     tracks = [SimpleNamespace(operator="KMB", route="A", bound="in", position=p, track_id=i + 1,
-                              bracket=brackets[i], eta_minutes=eta[i], eta_arrival_at=None,
-                              boundary_age_seconds=age, source_indices=(int(brackets[i][1]),))
+                               bracket=brackets[i], eta_minutes=eta[i], eta_arrival_at=None,
+                               bracket_eta_offsets=eta_offsets[i], boundary_age_seconds=age,
+                               source_indices=(
+                                   tuple(int(x) for x in brackets[i])
+                                   if eta_offsets[i] is not None
+                                   else (int(brackets[i][1]),)
+                               ))
               for i, p in enumerate(pos)]
     candidates = [SimpleNamespace(operator="KMB", route="A", bound="in", position=p,
                                   bracket=brackets[i], eta_minutes=eta[i], boundary_age_seconds=age)
@@ -322,6 +328,17 @@ def test_bracket_qualification_rejects_marker_outside_its_boundary():
     assert any(issue["kind"] == "invalid_bracket_evidence" for issue in issues)
     assert state.get("bracket_checks", {}).get(KEY, 0) == 0
     assert state["bracket_inconclusive"][KEY] == 1
+
+
+def test_bracket_qualification_accepts_due_future_timestamp_interpolation():
+    crossing = evidence_frame(
+        pos=(3.75, 7.5),
+        eta_offsets=((-0.6, 0.2), None),
+    )
+    state = {}
+    issues, _ = compare_adjacent(crossing, crossing, state)
+    assert not issues
+    assert state["bracket_checks"][KEY] == 1
 
 
 def test_checkpoint_set_is_grouped():

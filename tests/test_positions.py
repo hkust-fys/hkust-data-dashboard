@@ -1,5 +1,7 @@
 """Estimated bus position tests: ladder-collapsed vehicle reconstruction."""
 
+import pytest
+
 from dashboard.maps.marker_audit import audit_marker_positions
 from dashboard.maps.positions import (
     BusEstimate,
@@ -27,6 +29,7 @@ class Probe:
         minutes,
         kind=None,
         cache_age_seconds=None,
+        signed_minutes=None,
     ):
         self.operator = operator
         self.route = route
@@ -36,6 +39,7 @@ class Probe:
         self.stop_id = "S"
         self.kind = kind or EtaKind.REALTIME
         self.cache_age_seconds = cache_age_seconds
+        self.signed_minutes = signed_minutes
 
 
 class AuthoritativeProbe(Probe):
@@ -1424,11 +1428,38 @@ def test_priority_indices_cover_full_zero_plateau_and_next_positive_stop():
     )
 
     assert len(estimates) == 1
-    assert estimates[0].bracket == (2.0, 3.0)
-    # Zero minutes has no evidence for passing stop 3, so rendering stays at
-    # the upstream edge of the zero plateau rather than jumping into it.
-    assert estimates[0].position == 3.0
+    assert estimates[0].bracket == (5.0, 6.0)
+    # Internal zero is a clamped due/overdue ETA. The last zero and first
+    # positive ETA form the physical frontier, even without signed metadata.
+    assert estimates[0].position == 5.0
     assert estimates[0].priority_indices == frozenset({3, 4, 5, 6})
+
+
+def test_due_future_frontier_interpolates_preserved_signed_eta_offsets():
+    line = _line(stop_count=7)
+    rows = [
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0),
+        Probe(
+            "KMB", "X", "outbound", 3, 0,
+            cache_age_seconds=0, signed_minutes=-0.6,
+        ),
+        Probe(
+            "KMB", "X", "outbound", 4, 0.2,
+            cache_age_seconds=0, signed_minutes=0.2,
+        ),
+        Probe("KMB", "X", "outbound", 5, 2.2, cache_age_seconds=0),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={("KMB", "X", "outbound"): range(7)},
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].bracket == (3.0, 4.0)
+    assert estimates[0].bracket_eta_offsets == pytest.approx((-0.6, 0.2))
+    assert estimates[0].position == pytest.approx(3.75)
 
 
 def test_consecutive_empty_stops_then_downstream_observation_forms_one_boundary_marker():

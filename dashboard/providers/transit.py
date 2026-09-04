@@ -142,7 +142,7 @@ _probe_refresh_waiters = 0
 # --------------------------------------------------------------------------
 
 
-def _precise_minutes_until(iso: str | None, now: datetime) -> float | None:
+def _signed_minutes_until(iso: str | None, now: datetime) -> float | None:
     if not iso:
         return None
     try:
@@ -151,8 +151,12 @@ def _precise_minutes_until(iso: str | None, now: datetime) -> float | None:
         return None
     if eta.tzinfo is None:
         eta = eta.replace(tzinfo=UTC)
-    diff = (eta - now).total_seconds() / 60
-    return max(0.0, diff)
+    return (eta - now).total_seconds() / 60
+
+
+def _precise_minutes_until(iso: str | None, now: datetime) -> float | None:
+    diff = _signed_minutes_until(iso, now)
+    return max(0.0, diff) if diff is not None else None
 
 
 def _minutes_until(iso: str | None, now: datetime) -> int | None:
@@ -551,6 +555,10 @@ class ProbeEta:
     arrival_at: datetime | None = None
     observed_at: datetime | None = None
     refresh_generation: int = 0
+    # Exact ETA offset at the network observation. ``minutes`` remains
+    # nonnegative for countdown compatibility, while this value preserves a
+    # slightly overdue ETA so positioning can find a due/future crossing.
+    signed_minutes: float | None = None
 
 
 @dataclass(frozen=True)
@@ -775,9 +783,10 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
             entry_dir = str(entry.get("dir") or "")[:1].lower()
             if entry_dir and entry_dir != probe.bound[:1].lower():
                 continue
-            minutes = _precise_minutes_until(entry.get("eta"), now)
-            if minutes is None:
+            signed_minutes = _signed_minutes_until(entry.get("eta"), now)
+            if signed_minutes is None:
                 continue
+            minutes = max(0.0, signed_minutes)
             out.append(
                 ProbeEta(
                     operator=probe.operator,
@@ -790,6 +799,7 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
                     arrival_at=_parse_iso(entry.get("eta"))
                     or now + timedelta(minutes=minutes),
                     observed_at=_parse_iso(entry.get("data_timestamp")) or now,
+                    signed_minutes=signed_minutes,
                 )
             )
         return out
@@ -803,9 +813,10 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
             eta_iso = entry.get("eta")
             if not eta_iso:
                 continue
-            minutes = _precise_minutes_until(eta_iso, now)
-            if minutes is None:
+            signed_minutes = _signed_minutes_until(eta_iso, now)
+            if signed_minutes is None:
                 continue
+            minutes = max(0.0, signed_minutes)
             out.append(
                 ProbeEta(
                     operator=probe.operator,
@@ -818,6 +829,7 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
                     arrival_at=_parse_iso(eta_iso)
                     or now + timedelta(minutes=minutes),
                     observed_at=_parse_iso(entry.get("data_timestamp")) or now,
+                    signed_minutes=signed_minutes,
                 )
             )
         return out
@@ -848,13 +860,16 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
             # GMB supplies an exact arrival timestamp alongside rounded
             # integer `diff`.  The timestamp keeps staggered stop probes on a
             # common clock and reduces false ladder splits at minute edges.
-            minutes = _precise_minutes_until(eta.get("timestamp"), now)
-            if minutes is None:
+            signed_minutes = _signed_minutes_until(eta.get("timestamp"), now)
+            if signed_minutes is None:
                 diff = eta.get("diff")
                 try:
                     minutes = float(diff) if diff is not None else None
                 except (TypeError, ValueError):
                     minutes = None
+                signed_minutes = minutes
+            else:
+                minutes = max(0.0, signed_minutes)
             if minutes is None or minutes < last:
                 continue
             last = minutes
@@ -869,6 +884,7 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
                     kind=_gmb_kind(eta.get("remarks_en") or ""),
                     arrival_at=_parse_iso(eta.get("timestamp")),
                     observed_at=_parse_iso((raw or {}).get("generated_timestamp")) or now,
+                    signed_minutes=signed_minutes,
                 )
             )
     return out

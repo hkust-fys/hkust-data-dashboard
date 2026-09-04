@@ -76,11 +76,13 @@ class BusEstimate:
     eta_arrival_at: object | None = None
     bracket_initial_eta: float | None = None
     boundary_age_seconds: float | None = None
+    # Signed ETA offsets at the lower/upper bracket observations when the
+    # physical boundary is a due-to-future timestamp crossing.
+    bracket_eta_offsets: tuple[float, float] | None = None
     # Stop occurrences whose current rows form the useful refresh frontier for
-    # this exact ETA instance: every due/zero rung plus the first positive rung
-    # after it.  MarkerTracker combines these with the physical bracket and
-    # terminus so a zero plateau advances promptly without sharing evidence
-    # between simultaneous vehicles.
+    # this exact ETA instance: every due/zero rung plus the first future rung.
+    # MarkerTracker combines these with the physical bracket and terminus so a
+    # zero plateau advances promptly without sharing evidence between vehicles.
     priority_indices: frozenset[int] = frozenset()
 
     @property
@@ -1475,6 +1477,7 @@ def estimate_bus_positions(
             eta_minutes = None
             eta_arrival_at = None
             boundary_age_seconds = None
+            bracket_eta_offsets = None
             priority_indices = frozenset()
             observed = observed_by_route.get((operator_name, route, bound))
             if observed is not None and provenance:
@@ -1501,6 +1504,7 @@ def estimate_bus_positions(
                     if float(row.minutes) > 0
                 })
                 refresh_frontier = set(zero_indices)
+                next_positive = None
                 if zero_indices:
                     next_positive = next(
                         (
@@ -1518,12 +1522,19 @@ def estimate_bus_positions(
                     # observation when the first rung becomes due or vanishes.
                     refresh_frontier.update(positive_indices[:2])
                 priority_indices = frozenset(refresh_frontier)
+                boundary_index = first_present
+                if zero_indices:
+                    due_index = zero_indices[-1]
+                    boundary_index = (
+                        next_positive if next_positive is not None else due_index
+                    )
+                    bracket = (float(due_index), float(boundary_index))
                 present_rows = [row for row in source_rows
                                 if (str(getattr(row, "operator", "")),
                                     str(getattr(row, "route", "")),
                                     str(getattr(row, "bound", "")))
                                 == (operator_name, route, bound)
-                                and int(getattr(row, "index", -1)) == first_present]
+                                and int(getattr(row, "index", -1)) == boundary_index]
                 if bracket is not None and present_rows:
                     selected_eta = min(
                         present_rows,
@@ -1534,29 +1545,74 @@ def estimate_bus_positions(
                     )
                     eta_minutes = float(selected_eta.minutes)
                     eta_arrival_at = getattr(selected_eta, "arrival_at", None)
-                    absent_index = int(bracket[0]) if bracket else first_present
+                    lower_index = int(bracket[0]) if bracket else boundary_index
                     present_age = float(
                         getattr(selected_eta, "cache_age_seconds", 0.0) or 0.0
                     )
-                    absent_ages = [
+                    lower_ages = [
                         float(getattr(row, "cache_age_seconds", 0.0) or 0.0)
                         for row in probe_inputs
                         if (str(getattr(row, "operator", "")),
                             str(getattr(row, "route", "")),
                             str(getattr(row, "bound", "")))
                         == (operator_name, route, bound)
-                        if int(getattr(row, "index", -1)) == absent_index
+                        if int(getattr(row, "index", -1)) == lower_index
                     ]
-                    if absent_index == first_present:
-                        absent_ages.append(present_age)
-                    if absent_ages:
-                        boundary_age_seconds = max(present_age, min(absent_ages))
-                    # The first stop which sees this ETA instance is the
-                    # physical upper boundary.  Its source ETA supplies the
-                    # requested proportion within the preceding stop span.
-                    position = first_present - min(
-                        1.0, max(0.0, eta_minutes / MINUTES_PER_STOP)
-                    )
+                    if lower_index == boundary_index:
+                        lower_ages.append(present_age)
+                    if lower_ages:
+                        boundary_age_seconds = max(present_age, min(lower_ages))
+                    if zero_indices:
+                        lower_rows = [
+                            row
+                            for row in source_rows
+                            if int(getattr(row, "index", -1)) == lower_index
+                        ]
+                        selected_lower = min(
+                            lower_rows,
+                            key=lambda row: (
+                                float(
+                                    getattr(row, "cache_age_seconds", 0.0) or 0.0
+                                ),
+                                abs(
+                                    float(
+                                        getattr(row, "signed_minutes", None)
+                                        if getattr(row, "signed_minutes", None)
+                                        is not None
+                                        else row.minutes
+                                    )
+                                ),
+                            ),
+                        )
+                        lower_eta = float(
+                            getattr(selected_lower, "signed_minutes", None)
+                            if getattr(selected_lower, "signed_minutes", None)
+                            is not None
+                            else selected_lower.minutes
+                        )
+                        upper_eta = float(
+                            getattr(selected_eta, "signed_minutes", None)
+                            if getattr(selected_eta, "signed_minutes", None)
+                            is not None
+                            else selected_eta.minutes
+                        )
+                        bracket_eta_offsets = (lower_eta, upper_eta)
+                        if lower_index == boundary_index:
+                            position = float(lower_index)
+                        elif lower_eta <= 0 < upper_eta:
+                            fraction = min(
+                                1.0,
+                                max(0.0, -lower_eta / (upper_eta - lower_eta)),
+                            )
+                            position = lower_index + (
+                                boundary_index - lower_index
+                            ) * fraction
+                    else:
+                        # With no due row, the first stop which sees this ETA
+                        # remains the physical upper boundary.
+                        position = boundary_index - min(
+                            1.0, max(0.0, eta_minutes / MINUTES_PER_STOP)
+                        )
                 if bracket is not None:
                     position = min(max(position, bracket[0]), bracket[1])
             render_section = min(math.floor(position), stops_count - 2)
@@ -1591,6 +1647,7 @@ def estimate_bus_positions(
                     eta_arrival_at=eta_arrival_at,
                     bracket_initial_eta=eta_minutes,
                     boundary_age_seconds=boundary_age_seconds,
+                    bracket_eta_offsets=bracket_eta_offsets,
                     priority_indices=priority_indices,
                 )
             )

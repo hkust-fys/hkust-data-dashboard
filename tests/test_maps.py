@@ -120,6 +120,35 @@ async def test_probe_failure_still_renders_google_base(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fetch_traffic_map_forwards_important_road_paths(monkeypatch):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+
+    path = [(22.33, 114.22), (22.34, 114.23)]
+    captured: dict[str, object] = {}
+
+    async def geometry(*_args, **_kwargs):
+        return RouteGeometry()
+
+    async def probes(*_args, **_kwargs):
+        return _probe_snapshot()
+
+    def render(*args, **_kwargs):
+        captured["important_road_paths"] = args[6]
+        return b"rendered"
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
+    monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", probes)
+    monkeypatch.setattr(maps, "render_map", render)
+
+    image, _ = await maps.fetch_traffic_map(object(), important_road_paths=[path])
+
+    assert image == b"rendered"
+    assert captured["important_road_paths"] == [path]
+
+
+@pytest.mark.asyncio
 async def test_marker_audit_failure_never_blocks_a_rendered_frame(monkeypatch, caplog):
     import dashboard.maps as maps
     from dashboard.providers.route_geometry import RouteGeometry
@@ -1258,13 +1287,112 @@ def test_grouped_label_also_avoids_traffic_colored_candidate():
     assert traffic.overlap(placement.rect)[0] == 0
 
 
+def test_single_label_prioritizes_zero_important_road_overlap_over_google_traffic():
+    canvas = Image.new("RGBA", (360, 140), "white")
+    important_mask = Image.new("L", canvas.size, 0)
+    traffic_mask = Image.new("L", canvas.size, 0)
+    renderer.ImageDraw.Draw(important_mask).rectangle((0, 0, 179, 139), fill=255)
+    renderer.ImageDraw.Draw(traffic_mask).rectangle((181, 0, 359, 139), fill=255)
+    important = renderer.TrafficOccupancy(important_mask)
+    traffic = renderer.TrafficOccupancy(traffic_mask)
+    marker = renderer.BusMarker(("91 Diamond Hill",), 180, 70, Operator.KMB, 0)
+
+    placement = renderer._layout_bus_labels(
+        [marker],
+        renderer.ImageDraw.Draw(canvas),
+        renderer._font(13),
+        canvas.size,
+        traffic=traffic,
+        important_roads=important,
+    )[0]
+
+    assert placement.rect[0] >= 190
+    assert important.overlap(placement.rect)[0] == 0
+    assert traffic.overlap(placement.rect)[0] > 0
+
+
+def test_grouped_label_prioritizes_zero_important_road_overlap_over_google_traffic():
+    canvas = Image.new("RGBA", (420, 180), "white")
+    important_mask = Image.new("L", canvas.size, 0)
+    traffic_mask = Image.new("L", canvas.size, 0)
+    renderer.ImageDraw.Draw(important_mask).rectangle((0, 0, 209, 179), fill=255)
+    renderer.ImageDraw.Draw(traffic_mask).rectangle((211, 0, 419, 179), fill=255)
+    important = renderer.TrafficOccupancy(important_mask)
+    traffic = renderer.TrafficOccupancy(traffic_mask)
+    markers = [
+        renderer.BusMarker(("91 Diamond Hill",), 210, 90, Operator.KMB, 0),
+        renderer.BusMarker(("11 Choi Hung",), 213, 90, Operator.GMB, 0),
+    ]
+
+    placement = renderer._layout_bus_labels(
+        markers,
+        renderer.ImageDraw.Draw(canvas),
+        renderer._font(13),
+        canvas.size,
+        traffic=traffic,
+        important_roads=important,
+    )[0]
+
+    assert len(placement.rows) == 2
+    assert placement.rect[0] >= 220
+    assert important.overlap(placement.rect)[0] == 0
+    assert traffic.overlap(placement.rect)[0] > 0
+
+
+def test_grouped_relaxed_grid_bounds_important_road_cost_and_stays_local():
+    class FixedWidthDraw:
+        def textlength(self, _text, font=None):
+            del font
+            return 60.0
+
+    size = (480, 180)
+    anchor = (80, 90)
+    markers = [
+        renderer.BusMarker(("91 Diamond Hill",), *anchor, Operator.KMB, 0),
+        renderer.BusMarker(("11 Choi Hung",), anchor[0] + 3, anchor[1], Operator.GMB, 0),
+    ]
+    important_mask = Image.new("L", size, 0)
+    renderer.ImageDraw.Draw(important_mask).rectangle((0, 0, 300, size[1] - 1), fill=255)
+    important = renderer.TrafficOccupancy(important_mask)
+    occupied = [(0, 0, *size)]
+
+    # The full-canvas obstacle rejects every collision-safe initial, spiral,
+    # and grid candidate, forcing the grouped-label relaxed grid. Its fixed
+    # metrics expose an arrow-safe, zero-road-overlap candidate far away.
+    distant_clear_slot = (302.0, 68.0, 370.0, 104.0)
+    assert important.overlap(distant_clear_slot)[0] == 0
+    assert not renderer._rects_overlap(
+        distant_clear_slot, renderer._arrow_footprint(anchor), padding=0
+    )
+
+    placement = renderer._layout_bus_labels(
+        markers,
+        FixedWidthDraw(),
+        renderer._font(13),
+        size,
+        occupied,
+        important_roads=important,
+    )[0]
+
+    center = (
+        (placement.rect[0] + placement.rect[2]) / 2,
+        (placement.rect[1] + placement.rect[3]) / 2,
+    )
+    assert len(placement.rows) == 2
+    assert renderer._rects_overlap(placement.rect, occupied[0])
+    assert important.overlap(placement.rect)[0] > 0
+    assert math.hypot(center[0] - anchor[0], center[1] - anchor[1]) < 100
+
+
 def test_unavoidable_traffic_keeps_bus_label_local_and_bounded():
     canvas = Image.new("RGBA", (180, 90), "white")
     traffic = renderer.TrafficOccupancy(Image.new("L", canvas.size, 255))
+    important = renderer.TrafficOccupancy(Image.new("L", canvas.size, 255))
     marker = renderer.BusMarker(("792M TKO",), 90, 45, Operator.GMB, 0)
     placement = renderer._layout_bus_labels(
         [marker], renderer.ImageDraw.Draw(canvas), renderer._font(13), canvas.size,
         traffic=traffic,
+        important_roads=important,
     )[0]
     left, top, right, bottom = placement.rect
     assert 0 <= left < right <= canvas.width
@@ -1272,6 +1400,80 @@ def test_unavoidable_traffic_keeps_bus_label_local_and_bounded():
     assert (top + bottom) / 2 == pytest.approx(marker.y)
     assert min(abs(right - marker.x), abs(left - marker.x)) <= 11
     assert traffic.overlap(placement.rect)[0] > 0
+    assert important.overlap(placement.rect)[0] > 0
+
+
+def test_important_road_corridor_mask_is_cached_and_scaled():
+    renderer._clear_renderer_caches()
+    path = ((
+        (renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON - 0.002),
+        (renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON + 0.002),
+    ),)
+    full_metrics = renderer.RenderMetrics(1.0)
+    full = renderer._cached_important_road_occupancy(
+        path,
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM,
+        (renderer.MAP_WIDTH, renderer.MAP_HEIGHT),
+        full_metrics,
+    )
+    again = renderer._cached_important_road_occupancy(
+        path,
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM,
+        (renderer.MAP_WIDTH, renderer.MAP_HEIGHT),
+        full_metrics,
+    )
+    small_metrics = renderer.RenderMetrics(0.75)
+    small = renderer._cached_important_road_occupancy(
+        path,
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM + math.log2(small_metrics.scale),
+        (renderer.MIN_MAP_WIDTH, renderer.MIN_MAP_HEIGHT),
+        small_metrics,
+    )
+
+    assert full is again
+    assert full is not None and full.width == renderer.MAP_WIDTH
+    assert small is not None and small.width == renderer.MIN_MAP_WIDTH
+    full_x, full_y = renderer.project(
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM,
+        (renderer.MAP_WIDTH, renderer.MAP_HEIGHT),
+    )
+    small_x, small_y = renderer.project(
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_LAT,
+        renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM + math.log2(small_metrics.scale),
+        (renderer.MIN_MAP_WIDTH, renderer.MIN_MAP_HEIGHT),
+    )
+    full_rows = sum(
+        bool(full.overlap((full_x, y, full_x + 1, y + 1))[0])
+        for y in range(full.height)
+    )
+    small_rows = sum(
+        bool(small.overlap((small_x, y, small_x + 1, y + 1))[0])
+        for y in range(small.height)
+    )
+    assert full_y == pytest.approx(renderer.MAP_HEIGHT / 2)
+    assert small_y == pytest.approx(renderer.MIN_MAP_HEIGHT / 2)
+    assert full_rows == renderer.RenderMetrics(1.0).integer(
+        renderer.IMPORTANT_ROAD_CORRIDOR_WIDTH
+    )
+    assert small_rows == renderer.RenderMetrics(0.75).integer(
+        renderer.IMPORTANT_ROAD_CORRIDOR_WIDTH
+    )
+    stats = renderer._renderer_cache_stats()
+    assert stats["important_road_hits"] == 1
+    assert stats["important_road_misses"] == 2
 
 
 def _synthetic_route_mask(
@@ -2015,9 +2217,16 @@ def test_native_fallback_scales_projection_with_resized_base(tmp_path, monkeypat
 
     def fake_once(
         estimates, cache_dir, public_stops=(), route_lines=(), base_image=None,
-        affected_road_paths=(),
+        affected_road_paths=(), important_road_paths=(),
     ):
-        del estimates, cache_dir, public_stops, route_lines, affected_road_paths
+        del (
+            estimates,
+            cache_dir,
+            public_stops,
+            route_lines,
+            affected_road_paths,
+            important_road_paths,
+        )
         scale = base_image.width / renderer.MAP_WIDTH
         zoom = renderer.BASE_MAP_ZOOM + math.log2(scale)
         calls.append((base_image.size, renderer.project(
@@ -2060,9 +2269,16 @@ def test_native_fallback_rerenders_authored_overlays_without_resizing_composite(
 
     def fake_once(
         estimates, cache_dir, public_stops=(), route_lines=(), base_image=None,
-        affected_road_paths=(),
+        affected_road_paths=(), important_road_paths=(),
     ):
-        del estimates, cache_dir, public_stops, route_lines, affected_road_paths
+        del (
+            estimates,
+            cache_dir,
+            public_stops,
+            route_lines,
+            affected_road_paths,
+            important_road_paths,
+        )
         render_sizes.append(base_image.size)
         if len(render_sizes) < 4:
             raise renderer._OversizedMapError("map WebP exceeds 100 KB at native resolution")
@@ -2112,16 +2328,19 @@ def test_generators_survive_native_candidate_retries(tmp_path, monkeypatch):
     stop = Stop("gate", "HKUST", 22.33336, 114.262881)
     line = RouteLine("91", "KMB", "outbound", [stop])
     path = [(22.333, 114.250), (22.334, 114.251)]
+    important_path = [(22.335, 114.252), (22.336, 114.253)]
     seen = []
 
     def fake_once(
         estimates, cache_dir, public_stops=(), route_lines=(), base_image=None,
-        affected_road_paths=(),
+        affected_road_paths=(), important_road_paths=(),
     ):
         del cache_dir
         seen.append((
             list(estimates), list(public_stops), list(route_lines),
-            [list(item) for item in affected_road_paths], base_image.size,
+            [list(item) for item in affected_road_paths],
+            [list(item) for item in important_road_paths],
+            base_image.size,
         ))
         if len(seen) == 1:
             raise renderer._OversizedMapError("map WebP exceeds 100 KB at native resolution")
@@ -2134,13 +2353,15 @@ def test_generators_survive_native_candidate_retries(tmp_path, monkeypatch):
         route_lines=(item for item in [line]),
         base_image=Image.new("RGB", (960, 540), "white"),
         affected_road_paths=((point for point in path) for _ in range(1)),
+        important_road_paths=((point for point in important_path) for _ in range(1)),
     ) == b"done"
     assert len(seen) == 2
-    for estimates, stops, lines, paths, _size in seen:
+    for estimates, stops, lines, paths, important_paths, _size in seen:
         assert estimates == [estimate]
         assert stops == [stop]
         assert lines == [line]
         assert paths == [path]
+        assert important_paths == [important_path]
 
 
 def test_scaled_authored_metrics_cover_fonts_arrows_and_traffic(tmp_path, monkeypatch):

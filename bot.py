@@ -29,7 +29,7 @@ from dataclasses import dataclass, replace
 import discord
 from dotenv import load_dotenv
 
-from dashboard import maps
+from dashboard import maps, road_policy
 from dashboard.config import ConfigError, Settings
 from dashboard.http import HttpClient
 from dashboard.models import (
@@ -51,6 +51,7 @@ from dashboard.runtime import startup_preflight
 
 log = logging.getLogger(__name__)
 DASHBOARD_MESSAGE_MARKER = "HKUST Campus Dashboard"
+TRACKED_ROADS_WAIT_SECONDS = 5.0
 
 def _setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -95,29 +96,35 @@ async def collect_all(
         # curated seed rather than delaying TD news.
         try:
             roads = await asyncio.wait_for(
-                asyncio.shield(tasks["tracked_roads"]), timeout=5
+                asyncio.shield(tasks["tracked_roads"]),
+                timeout=TRACKED_ROADS_WAIT_SECONDS,
             )
         except Exception:  # noqa: BLE001
             roads = tracked_roads_provider.fallback_roads()
         return await traffic_provider.fetch_traffic_data(client, roads)
 
-    async def _affected_road_paths() -> list[list[tuple[float, float]]]:
-        """Return anchored OSM segments for current TD traffic notices."""
+    async def _map_road_paths() -> tuple[
+        list[list[tuple[float, float]]],
+        list[list[tuple[float, float]]],
+    ]:
+        """Return affected segments and full important-road OSM corridors."""
         try:
             traffic_result = await tasks["traffic"]
         except Exception:  # noqa: BLE001
-            return []
-        if not (isinstance(traffic_result, tuple) and len(traffic_result) >= 3):
-            return []
+            traffic_result = None
         try:
             roads = await asyncio.wait_for(
-                asyncio.shield(tasks["tracked_roads"]), timeout=5
+                asyncio.shield(tasks["tracked_roads"]),
+                timeout=TRACKED_ROADS_WAIT_SECONDS,
             )
         except Exception:  # noqa: BLE001
             roads = tracked_roads_provider.fallback_roads()
+        important_paths = road_policy.important_road_paths(roads)
+        if not (isinstance(traffic_result, tuple) and len(traffic_result) >= 3):
+            return [], important_paths
         segments_near = getattr(roads, "segments_near", None)
         if segments_near is None:
-            return []
+            return [], important_paths
         paths: list[list[tuple[float, float]]] = []
         seen_paths: set[tuple[tuple[float, float], ...]] = set()
         for incident in traffic_result[1] or []:
@@ -159,7 +166,7 @@ async def collect_all(
                 if len(normalized) >= 2 and normalized not in seen_paths:
                     seen_paths.add(normalized)
                     paths.append(list(normalized))
-        return paths
+        return paths, important_paths
 
     async def _traffic_map():
         # Transit ETA groups still drive retained estimated bus markers.
@@ -170,13 +177,14 @@ async def collect_all(
                 groups = transit_result[0]
         except Exception as exc:  # noqa: BLE001
             log.warning("traffic map: transit groups unavailable: %s", exc)
-        affected_paths = await _affected_road_paths()
+        affected_paths, important_paths = await _map_road_paths()
         return await maps.fetch_traffic_map(
             client,
             groups=groups,
             cache_dir=settings.cache_dir,
             affected_road_paths=affected_paths,
             tracker=tracker,
+            important_road_paths=important_paths,
         )
 
     for name, coro in (

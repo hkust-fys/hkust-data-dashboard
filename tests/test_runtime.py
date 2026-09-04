@@ -806,6 +806,63 @@ async def test_collect_all_cancellation_awaits_provider_children(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_collect_all_reuses_tracked_roads_after_timeout_for_important_paths(
+    monkeypatch,
+):
+    """One consumer timing out must not cancel geometry needed by the map."""
+    import bot as bot_module
+    from dashboard.providers import tracked_roads as tracked_roads_provider
+    from dashboard.providers.tracked_roads import TrackedRoads
+
+    cwb_path = ((22.33, 114.22), (22.34, 114.23))
+    new_cwb_path = ((22.32, 114.21), (22.33, 114.22))
+    unrelated_path = ((22.31, 114.20), (22.32, 114.21))
+    roads_table = TrackedRoads(
+        paths={
+            "clear water bay road": (cwb_path,),
+            "new clear water bay road": (new_cwb_path,),
+            "lung cheung road": (unrelated_path,),
+        }
+    )
+    roads_started = asyncio.Event()
+    release_roads = asyncio.Event()
+    captured: dict[str, object] = {}
+
+    async def roads(*_args, **_kwargs):
+        roads_started.set()
+        await release_roads.wait()
+        return roads_table
+
+    async def transit(*_args, **_kwargs):
+        return ([], None, [])
+
+    async def weather(*_args, **_kwargs):
+        return (None, [], None)
+
+    async def traffic(_client, matched_roads):
+        assert matched_roads is not roads_table
+        release_roads.set()
+        await asyncio.sleep(0)
+        return ([], [], [], None)
+
+    async def traffic_map(*_args, **kwargs):
+        captured.update(kwargs)
+        return (b"map", [])
+
+    monkeypatch.setattr(bot_module, "TRACKED_ROADS_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(tracked_roads_provider, "fetch_tracked_roads", roads)
+    monkeypatch.setattr(bot_module.transit, "fetch_transit_etas", transit)
+    monkeypatch.setattr(bot_module.weather_provider, "fetch_weather_conditions", weather)
+    monkeypatch.setattr(bot_module.traffic_provider, "fetch_traffic_data", traffic)
+    monkeypatch.setattr(bot_module.maps, "fetch_traffic_map", traffic_map)
+
+    await asyncio.wait_for(bot_module.collect_all(object(), _fake_settings()), timeout=1)
+
+    assert roads_started.is_set()
+    assert captured["important_road_paths"] == [list(cwb_path), list(new_cwb_path)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("latitude", "longitude", "near_landmark", "between_landmark", "expected_anchor"),
     [
@@ -870,6 +927,7 @@ async def test_collect_all_passes_only_anchored_affected_road_segments(
 
     await bot_module.collect_all(object(), _fake_settings())
 
+    assert captured["important_road_paths"] == []
     if expected_anchor == "skip":
         assert calls == []
         assert captured["affected_road_paths"] == []

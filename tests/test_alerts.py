@@ -1,5 +1,6 @@
 """Alert monitor tests: transition detection, escalation wording, pings."""
 
+from dashboard import road_policy
 from dashboard.alerts import (
     CRITICAL_WARNING_CODES,
     ROAD_ALERT_COOLDOWN_SECONDS,
@@ -225,6 +226,23 @@ def test_congestion_alerts_watch_only_two_clear_water_bay_roads():
     assert mon.update([], [other]) == []
 
 
+def test_alerts_read_the_central_important_road_policy(monkeypatch):
+    monkeypatch.setattr(
+        road_policy, "IMPORTANT_ROAD_KEYS", frozenset({"lung cheung road"})
+    )
+    mon = AlertMonitor()
+    mon.update([], [])
+    important = _status("Lung Cheung Road", SpeedBand.RED, speed=10)
+    ordinary = _status("Clear Water Bay Road", SpeedBand.RED, speed=10)
+
+    mon.update([], [important, ordinary])
+    events = mon.update([], [important, ordinary])
+
+    assert len(events) == 1
+    assert "Lung Cheung Road" in events[0].text
+    assert events[0].ping
+
+
 def test_congestion_alert_names_affected_routes():
     from dashboard.providers.route_geometry import RouteLine
     from dashboard.providers.tracked_roads import build_tracked_roads
@@ -325,7 +343,6 @@ def test_priority_road_traffic_news_pings_only_when_new():
 
 
 def test_direction_only_parenthetical_does_not_feed_incident_alert_keys(monkeypatch):
-    import dashboard.alerts as alerts_module
     from dashboard.providers.tracked_roads import TrackedRoads
 
     names = {
@@ -350,7 +367,7 @@ def test_direction_only_parenthetical_does_not_feed_incident_alert_keys(monkeypa
         direction="",
         status="active",
     )
-    monkeypatch.setattr(alerts_module, "WATCHED_ALERT_ROADS", frozenset(names))
+    monkeypatch.setattr(road_policy, "IMPORTANT_ROAD_KEYS", frozenset(names))
 
     assert AlertMonitor(roads=roads)._incident_road_keys(incident) == set()
 

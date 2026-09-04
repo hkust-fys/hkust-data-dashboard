@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from dashboard import road_policy
 from dashboard.models import Roadwork, TrafficCorridorStatus, TrafficIncident, WeatherWarning
 from dashboard.providers.traffic import resolve_incident_road_keys
 
@@ -36,9 +37,6 @@ CRITICAL_WARNING_CODES: frozenset[str] = frozenset(
 CONGESTION_RED_TICKS_REQUIRED = 2
 ROAD_ALERT_COOLDOWN_SECONDS = 60 * 60.0
 DISCORD_MESSAGE_CONTENT_LIMIT = 2_000
-WATCHED_ALERT_ROADS: frozenset[str] = frozenset(
-    {"clear water bay road", "new clear water bay road"}
-)
 
 def _family_of(code: str) -> str:
     """Group related warning codes so escalations read as upgrades:
@@ -90,7 +88,7 @@ class AlertMonitor:
 
     def _claim_road_alert(self, road_keys: set[str]) -> bool:
         """Claim one shared one-hour role-alert window for the matched roads."""
-        watched = WATCHED_ALERT_ROADS.intersection(road_keys)
+        watched = road_policy.IMPORTANT_ROAD_KEYS.intersection(road_keys)
         if not watched:
             return False
         if not self._initialized:
@@ -174,9 +172,9 @@ class AlertMonitor:
         keys = resolve_incident_road_keys(
             incident,
             self.roads,
-            explicit_fallback_keys=WATCHED_ALERT_ROADS,
+            explicit_fallback_keys=road_policy.IMPORTANT_ROAD_KEYS,
         )
-        return WATCHED_ALERT_ROADS.intersection(keys)
+        return road_policy.IMPORTANT_ROAD_KEYS.intersection(keys)
 
     @staticmethod
     def _roadwork_key(roadwork: Roadwork) -> str:
@@ -232,7 +230,7 @@ class AlertMonitor:
 
         for name, status in current_reds.items():
             road_key = name.casefold().strip()
-            if road_key not in WATCHED_ALERT_ROADS:
+            if road_key not in road_policy.IMPORTANT_ROAD_KEYS:
                 continue
             streak = state.red_streaks.get(name, 0) + 1
             state.red_streaks[name] = streak

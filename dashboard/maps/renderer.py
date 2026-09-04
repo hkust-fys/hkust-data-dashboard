@@ -6,6 +6,7 @@ import hashlib
 import io
 import math
 import os
+import struct
 from array import array
 from collections import OrderedDict
 from collections.abc import Iterable
@@ -109,17 +110,22 @@ class _OversizedMapError(ValueError):
 
 
 _TRAFFIC_CACHE_LIMIT = 4
+_IMPORTANT_ROAD_CACHE_LIMIT = 4
 _QUALITY_CACHE_LIMIT = 8
 _QUALITY_HEADROOM_BYTES = 85_000
 _QUALITY_PROBE_INTERVAL = 8
 _QUALITY_LEVELS = (82, 78, 74, 70, 65, 60)
 _renderer_cache_lock = RLock()
 _traffic_cache: OrderedDict[tuple[int, int, bytes], TrafficOccupancy] = OrderedDict()
+_important_road_cache: OrderedDict[tuple[object, ...], TrafficOccupancy] = OrderedDict()
 _quality_cache: OrderedDict[tuple[int, int], dict[str, int]] = OrderedDict()
 _cache_counters = {
     "traffic_hits": 0,
     "traffic_misses": 0,
     "traffic_evictions": 0,
+    "important_road_hits": 0,
+    "important_road_misses": 0,
+    "important_road_evictions": 0,
     "quality_hint_hits": 0,
     "quality_probes": 0,
     "quality_encodes": 0,
@@ -131,6 +137,7 @@ def _renderer_cache_stats(reset: bool = False) -> dict[str, int]:
     with _renderer_cache_lock:
         result = dict(_cache_counters)
         result["traffic_entries"] = len(_traffic_cache)
+        result["important_road_entries"] = len(_important_road_cache)
         result["quality_entries"] = len(_quality_cache)
         if reset:
             for key in _cache_counters:
@@ -142,6 +149,7 @@ def _clear_renderer_caches() -> None:
     """Clear bounded renderer caches; intended for deterministic tests."""
     with _renderer_cache_lock:
         _traffic_cache.clear()
+        _important_road_cache.clear()
         _quality_cache.clear()
         for key in _cache_counters:
             _cache_counters[key] = 0
@@ -163,8 +171,10 @@ class TrafficOccupancy:
         self.width, self.height = mask.size
         self.stride = self.width + 1
         self.integral = self._build_integral(mask)
-        self.route_integral = self._build_integral(
-            route_mask if route_mask is not None else mask
+        self.route_integral = (
+            self._build_integral(route_mask)
+            if route_mask is not None
+            else self.integral
         )
 
     def _build_integral(self, mask: Image.Image) -> array:
@@ -371,6 +381,123 @@ def _cached_traffic_occupancy(
         while len(_traffic_cache) > _TRAFFIC_CACHE_LIMIT:
             _traffic_cache.popitem(last=False)
             _cache_counters["traffic_evictions"] += 1
+    return computed
+
+
+IMPORTANT_ROAD_CORRIDOR_WIDTH = 14.0
+
+
+def _normalize_important_road_paths(
+    paths: Iterable[Iterable[tuple[float, float]]],
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+    """Materialize valid corridor paths once so native-size retries are safe."""
+    normalized: list[tuple[tuple[float, float], ...]] = []
+    seen: set[tuple[tuple[float, float], ...]] = set()
+    for raw_path in paths:
+        points: list[tuple[float, float]] = []
+        try:
+            for raw_latitude, raw_longitude in raw_path:
+                latitude = float(raw_latitude)
+                longitude = float(raw_longitude)
+                if not (
+                    math.isfinite(latitude)
+                    and math.isfinite(longitude)
+                    and -90.0 <= latitude <= 90.0
+                    and -180.0 <= longitude <= 180.0
+                ):
+                    points = []
+                    break
+                points.append((latitude, longitude))
+        except (TypeError, ValueError):
+            continue
+        path = tuple(points)
+        if len(path) >= 2 and path not in seen:
+            seen.add(path)
+            normalized.append(path)
+    return tuple(normalized)
+
+
+def _important_road_cache_key(
+    paths: tuple[tuple[tuple[float, float], ...], ...],
+    center_lat: float,
+    center_lon: float,
+    zoom: float,
+    size: tuple[int, int],
+    metrics: RenderMetrics,
+) -> tuple[object, ...]:
+    digest = hashlib.blake2b(digest_size=16)
+    for path in paths:
+        digest.update(struct.pack("!I", len(path)))
+        for latitude, longitude in path:
+            digest.update(struct.pack("!dd", latitude, longitude))
+    return (
+        size[0],
+        size[1],
+        float(center_lat),
+        float(center_lon),
+        float(zoom),
+        float(metrics.scale),
+        digest.digest(),
+    )
+
+
+def _important_road_occupancy(
+    paths: tuple[tuple[tuple[float, float], ...], ...],
+    center_lat: float,
+    center_lon: float,
+    zoom: float,
+    size: tuple[int, int],
+    metrics: RenderMetrics = DEFAULT_METRICS,
+) -> TrafficOccupancy:
+    """Rasterize named OSM road paths as a scale-aware protected corridor."""
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    width = metrics.integer(IMPORTANT_ROAD_CORRIDOR_WIDTH)
+    for path in paths:
+        points = [
+            project(latitude, longitude, center_lat, center_lon, zoom, size)
+            for latitude, longitude in path
+        ]
+        draw.line(points, fill=255, width=width, joint="curve")
+    return TrafficOccupancy(mask)
+
+
+def _cached_important_road_occupancy(
+    paths: Iterable[Iterable[tuple[float, float]]],
+    center_lat: float,
+    center_lon: float,
+    zoom: float,
+    size: tuple[int, int],
+    metrics: RenderMetrics = DEFAULT_METRICS,
+) -> TrafficOccupancy | None:
+    """Return a bounded cached corridor mask for the current native map size."""
+    normalized = _normalize_important_road_paths(paths)
+    if not normalized:
+        return None
+    key = _important_road_cache_key(
+        normalized, center_lat, center_lon, zoom, size, metrics
+    )
+    with _renderer_cache_lock:
+        cached = _important_road_cache.get(key)
+        if cached is not None:
+            _important_road_cache.move_to_end(key)
+            _cache_counters["important_road_hits"] += 1
+            return cached
+        _cache_counters["important_road_misses"] += 1
+
+    computed = _important_road_occupancy(
+        normalized, center_lat, center_lon, zoom, size, metrics
+    )
+    with _renderer_cache_lock:
+        existing = _important_road_cache.get(key)
+        if existing is not None:
+            _important_road_cache.move_to_end(key)
+            return existing
+        _important_road_cache[key] = computed
+        _important_road_cache.move_to_end(key)
+        while len(_important_road_cache) > _IMPORTANT_ROAD_CACHE_LIMIT:
+            _important_road_cache.popitem(last=False)
+            _cache_counters["important_road_evictions"] += 1
     return computed
 
 
@@ -647,6 +774,7 @@ def _layout_bus_labels(
     placed_rects: Iterable[tuple[float, float, float, float]] = (),
     metrics: RenderMetrics = DEFAULT_METRICS,
     traffic: TrafficOccupancy | None = None,
+    important_roads: TrafficOccupancy | None = None,
 ) -> list[LabelPlacement]:
     """Lay out independent route labels and their anchored directional arrows.
 
@@ -695,12 +823,13 @@ def _layout_bus_labels(
     spiral_step = metrics.px(6.0)
     collision_padding = metrics.px(2.0)
 
-    def score(
+    def overlap_costs(
         rect: tuple[float, float, float, float],
-        displacement: float,
-        side: int,
-    ) -> tuple[float, float, int, float]:
-        """Prefer clear labels nearby, but cap how far traffic can push one."""
+    ) -> tuple[bool, float]:
+        important_overlap = False
+        if important_roads is not None:
+            overlap, _area = important_roads.overlap(rect)
+            important_overlap = bool(overlap)
         traffic_penalty = 0.0
         if traffic is not None:
             overlap, area = traffic.overlap(rect)
@@ -709,7 +838,46 @@ def _layout_bus_labels(
                 # increment. At most two logical label rows of displacement
                 # can be justified, so unavoidable traffic stays local.
                 traffic_penalty = metrics.px(24) + metrics.px(20) * overlap / area
-        return displacement + traffic_penalty, traffic_penalty, side, rect[0]
+        return important_overlap, traffic_penalty
+
+    def local_score(
+        rect: tuple[float, float, float, float],
+        displacement: float,
+        side: int,
+    ) -> tuple[bool, float, float, int, float]:
+        """Protect important corridors, then prefer nearby clear traffic."""
+        important_overlap, traffic_penalty = overlap_costs(rect)
+        # Initial and spiral candidates are bounded near the anchor, so strict
+        # lexicographic avoidance cannot send a label across the map. Within
+        # that local set, any zero-overlap slot beats an important-road slot,
+        # even when the former covers ordinary Google traffic pixels.
+        return (
+            important_overlap,
+            displacement + traffic_penalty,
+            traffic_penalty,
+            side,
+            rect[0],
+        )
+
+    def whole_canvas_score(
+        rect: tuple[float, float, float, float],
+        displacement: float,
+        side: int,
+    ) -> tuple[float, float, float, int, float]:
+        """Keep last-resort global searches local despite road priority."""
+        important_overlap, traffic_penalty = overlap_costs(rect)
+        # Unlike bounded local searches, this grid spans the whole canvas. A
+        # fixed 48-logical-pixel cost is greater than traffic's 44-pixel
+        # ceiling, but remains bounded so road priority alone cannot pull a
+        # grouped label map-wide.
+        important_penalty = metrics.px(48) if important_overlap else 0.0
+        return (
+            displacement + traffic_penalty + important_penalty,
+            important_penalty,
+            traffic_penalty,
+            side,
+            rect[0],
+        )
     for group in anchor_groups:
         # Deterministic order within a stack: operator then routes.
         group = sorted(group, key=lambda m: (m.operator.value, m.routes))
@@ -729,7 +897,10 @@ def _layout_bus_labels(
             # Anchor first, then symmetric escape candidates.  The road arrow
             # always remains at the immutable anchor even when the label moves.
             cluster_candidates: list[
-                tuple[tuple[float, float, float, float], tuple[float, float, int, float]]
+                tuple[
+                    tuple[float, float, float, float],
+                    tuple[bool, float, float, int, float],
+                ]
             ] = []
             for offset_y in (
                 0.0,
@@ -755,7 +926,10 @@ def _layout_bus_labels(
                     ):
                         continue
                     cluster_candidates.append(
-                        (candidate, score(candidate, abs(offset_y), 0 if side < 0 else 1))
+                        (
+                            candidate,
+                            local_score(candidate, abs(offset_y), 0 if side < 0 else 1),
+                        )
                     )
             if cluster_candidates:
                 chosen, _score = min(cluster_candidates, key=lambda item: item[1])
@@ -783,14 +957,14 @@ def _layout_bus_labels(
                                 )
                                 and not any(_rects_overlap(candidate, footprint, padding=0) for footprint in arrow_footprints)):
                             spiral_candidates.append(
-                                (candidate, score(
+                                (candidate, local_score(
                                     candidate,
                                     math.hypot(dx, dy),
                                     0 if dx < 0 else 1,
                                 ))
                             )
-                    # Traffic avoidance is capped below two label rows, so
-                    # farther rings cannot beat a valid candidate found here.
+                    # Keep this a local search: strict important-road ordering
+                    # applies only within the established 48-pixel window.
                     if spiral_candidates and radius * spiral_step > metrics.px(48):
                         break
                 if spiral_candidates:
@@ -815,7 +989,10 @@ def _layout_bus_labels(
                                 (candidate[0] + candidate[2]) / 2 - anchor.x,
                                 (candidate[1] + candidate[3]) / 2 - anchor.y,
                             )
-                            scored_candidate = (candidate, score(candidate, displacement, 0))
+                            scored_candidate = (
+                                candidate,
+                                whole_canvas_score(candidate, displacement, 0),
+                            )
                             relaxed_grid_candidates.append(scored_candidate)
                             if not any(
                                 _rects_overlap(candidate, other, padding=collision_padding)
@@ -851,7 +1028,8 @@ def _layout_bus_labels(
                             padding=0,
                         ):
                             fallback_candidates.append((
-                                candidate, score(candidate, 0, 0 if side < 0 else 1)
+                                candidate,
+                                local_score(candidate, 0, 0 if side < 0 else 1),
                             ))
                     if fallback_candidates:
                         chosen, _score = min(fallback_candidates, key=lambda item: item[1])
@@ -878,7 +1056,10 @@ def _layout_bus_labels(
             label_step = pill_height + row_gap
             candidate_offsets = [0.0, -label_step, label_step, -2 * label_step, 2 * label_step]
             candidates: list[
-                tuple[tuple[float, float, float, float], tuple[float, float, int, float]]
+                tuple[
+                    tuple[float, float, float, float],
+                    tuple[bool, float, float, int, float],
+                ]
             ] = []
             for offset_y in candidate_offsets:
                 top = marker.y + offset_y - pill_height / 2
@@ -907,7 +1088,8 @@ def _layout_bus_labels(
                     # are equally good, choose left for stable, edge-friendly
                     # presentation of long route names.
                     candidates.append((
-                        rect, score(rect, abs(offset_y), 0 if text_side < 0 else 1)
+                        rect,
+                        local_score(rect, abs(offset_y), 0 if text_side < 0 else 1),
                     ))
             if candidates:
                 chosen, _score = min(candidates, key=lambda item: item[1])
@@ -951,10 +1133,12 @@ def _layout_bus_labels(
                         if any(_rects_overlap(rect, footprint, padding=0) for footprint in arrow_footprints):
                             continue
                         spiral_candidates.append((
-                            rect, score(
+                            rect, local_score(
                                 rect, math.hypot(dx, dy), 0 if dx < 0 else 1
                             )
                         ))
+                    # Keep this a local search: strict important-road ordering
+                    # applies only within the established 48-pixel window.
                     if spiral_candidates and radius * spiral_step > metrics.px(48):
                         break
                 if spiral_candidates:
@@ -983,7 +1167,8 @@ def _layout_bus_labels(
                         padding=0,
                     ):
                         fallback_candidates.append((
-                            candidate, score(candidate, 0, 0 if side < 0 else 1)
+                            candidate,
+                            local_score(candidate, 0, 0 if side < 0 else 1),
                         ))
                 if fallback_candidates:
                     chosen, _score = min(fallback_candidates, key=lambda item: item[1])
@@ -1791,6 +1976,7 @@ def _render_map_once(
     route_lines: Iterable[object] = (),
     base_image: Image.Image | None = None,
     affected_road_paths: Iterable[Iterable[tuple[float, float]]] = (),
+    important_road_paths: Iterable[Iterable[tuple[float, float]]] = (),
 ) -> bytes:
     route_lines = list(route_lines)
     public_stops = list(public_stops)
@@ -1806,6 +1992,14 @@ def _render_map_once(
     # overlays, so a ten-second redraw can skip HSV/palette analysis when
     # Google has not produced a new frame.
     traffic = _cached_traffic_occupancy(canvas, metrics)
+    important_roads = _cached_important_road_occupancy(
+        important_road_paths,
+        center_lat,
+        center_lon,
+        zoom,
+        size,
+        metrics,
+    )
     draw = ImageDraw.Draw(canvas, "RGBA")
 
     route_paths = [list(line.path) for line in route_lines if len(getattr(line, "path", ())) >= 2]
@@ -1849,7 +2043,13 @@ def _render_map_once(
         estimates, center_lat, center_lon, zoom, size, metrics, traffic
     )
     placements = _layout_bus_labels(
-        bus_markers, draw, font, size, metrics=metrics, traffic=traffic
+        bus_markers,
+        draw,
+        font,
+        size,
+        metrics=metrics,
+        traffic=traffic,
+        important_roads=important_roads,
     )
     for placement in placements:
         _draw_bus_route_marker(
@@ -1902,12 +2102,14 @@ def render_map(
     route_lines: Iterable[object] = (),
     base_image: Image.Image | None = None,
     affected_road_paths: Iterable[Iterable[tuple[float, float]]] = (),
+    important_road_paths: Iterable[Iterable[tuple[float, float]]] = (),
 ) -> bytes:
     """Render overlays natively at progressively smaller fixed resolutions."""
     estimates = list(estimates)
     public_stops = list(public_stops)
     route_lines = list(route_lines)
     affected_road_paths = [list(path) for path in affected_road_paths]
+    important_road_paths = [list(path) for path in important_road_paths]
     pristine = (
         base_image.copy().convert("RGBA")
         if base_image is not None
@@ -1923,6 +2125,7 @@ def render_map(
             return _render_map_once(
                 estimates, cache_dir, public_stops, route_lines, candidate,
                 affected_road_paths,
+                important_road_paths,
             )
         except _OversizedMapError:
             if width == MIN_MAP_WIDTH:

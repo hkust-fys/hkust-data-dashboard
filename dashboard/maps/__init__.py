@@ -176,11 +176,14 @@ async def fetch_traffic_map(
     cache_dir: str = ".cache",
     affected_road_paths: list[list[tuple[float, float]]] | None = None,
     tracker: MarkerTracker | None = None,
+    important_road_paths: list[list[tuple[float, float]]] | None = None,
 ) -> tuple[bytes | None, list[object]]:
     """Capture the Google base map and render estimated bus/stop markers.
 
     ``affected_road_paths`` contains only matched OSM road polylines from
     current TD traffic news; it never represents a whole transit route.
+    ``important_road_paths`` contains the named OSM corridors whose visibility
+    takes priority when estimated-vehicle labels are laid out.
     """
     global _frame_counter
     _frame_counter += 1
@@ -390,6 +393,7 @@ async def fetch_traffic_map(
             route_lines,
             base_image,
             affected_road_paths or [],
+            important_road_paths or [],
         )
         return webp, []
     except Exception as exc:  # noqa: BLE001

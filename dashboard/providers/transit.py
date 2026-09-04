@@ -840,6 +840,11 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
                 continue
         last = -1
         for eta in entry.get("eta") or []:
+            # ``route_seq`` above identifies the route variation/direction;
+            # ``eta_seq`` only orders consecutive minibuses within this exact
+            # route-stop response.  Keep equal timestamps as distinct rows:
+            # without a public vehicle ID, a genuinely bunched pair cannot be
+            # distinguished safely from a duplicated provider prediction.
             # GMB supplies an exact arrival timestamp alongside rounded
             # integer `diff`.  The timestamp keeps staggered stop probes on a
             # common clock and reduces false ladder splits at minute edges.

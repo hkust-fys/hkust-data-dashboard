@@ -158,6 +158,44 @@ def test_gmb_probe_parser_uses_matching_stop_sequence_and_precise_timestamp():
     assert rows[1].arrival_at is None
 
 
+def test_gmb_probe_parser_preserves_equal_consecutive_eta_entries():
+    now = s.utc()
+    arrival = now + timedelta(minutes=2)
+    probe = SimpleNamespace(
+        operator="GMB", route="11", bound="seq-1", stop_id="stop",
+        route_id=2004791, sequence=1, index=8,
+    )
+    raw = {
+        "data": [
+            {
+                "enabled": True,
+                "route_id": 2004791,
+                "route_seq": 1,
+                "stop_seq": 9,
+                "eta": [
+                    {"eta_seq": 1, "diff": 2, "timestamp": arrival.isoformat()},
+                    {"eta_seq": 2, "diff": 2, "timestamp": arrival.isoformat()},
+                ],
+            },
+            {
+                "enabled": True,
+                "route_id": 2004791,
+                "route_seq": 2,
+                "stop_seq": 9,
+                "eta": [
+                    {"eta_seq": 1, "diff": 2, "timestamp": arrival.isoformat()},
+                ],
+            },
+        ]
+    }
+
+    rows = transit._parse_probe_etas(probe, raw, now)  # noqa: SLF001
+
+    assert len(rows) == 2
+    assert [row.arrival_at for row in rows] == [arrival, arrival]
+    assert {row.bound for row in rows} == {"seq-1"}
+
+
 @pytest.mark.asyncio
 async def test_probe_snapshot_preserves_source_minutes_and_ages_cache_metadata(monkeypatch):
     mono = [10.0]

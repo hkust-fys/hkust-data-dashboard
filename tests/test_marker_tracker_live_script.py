@@ -132,6 +132,23 @@ def test_duplicate_track_evidence_is_a_hard_failure():
     assert {duplicate["track_id"], duplicate["other_track_id"]} == {1, 2}
 
 
+def test_reused_source_ladder_is_duplicate_even_when_eta_timestamp_changed():
+    record = provenance_frame((1.0, 1.0), (1.0, 1.0))
+    evidence = record["track_evidence"][KEY]
+    evidence[1]["source_observations"] = [["probe", 42]]
+    evidence[2]["source_observations"] = [["probe", 42]]
+    evidence[1]["eta_arrival_at"] = "2026-01-01T00:01:00+00:00"
+    evidence[2]["eta_arrival_at"] = "2026-01-01T00:02:00+00:00"
+
+    issues, _checks = compare_adjacent(record, record)
+
+    duplicate = next(
+        issue for issue in issues
+        if issue["kind"] == "duplicate_track_evidence"
+    )
+    assert {duplicate["track_id"], duplicate["other_track_id"]} == {1, 2}
+
+
 def test_matching_provenance_still_reports_real_spacing_error():
     old = provenance_frame((1.0, 5.0), (1.0, 5.0))
     bad = provenance_frame((1.0, 2.0), (1.0, 5.0))

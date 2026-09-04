@@ -367,7 +367,16 @@ def _merge_tracks(old, new):
 
 
 def _ordered_pairs(old, new):
-    dp = [[(0, 0.0, ()) for _ in range(len(new) + 1)] for _ in range(len(old) + 1)]
+    # Score an ordered alignment by retained cardinality first, then by ETA-
+    # anchor presence continuity. ETA timestamps can drift by tens of seconds
+    # between provider generations, while an unbracketed turnover candidate
+    # has no timestamp at all. Letting plain distance make that mixed-anchor
+    # pair look cheaper can assign the turnover candidate to a surviving
+    # downstream track and then birth a second marker from its source ladder.
+    # Source-row slots can shift after a departure, so overlap remains only a
+    # deterministic final tie-breaker rather than an identity authority.
+    dp = [[(0, 0, 0.0, ()) for _ in range(len(new) + 1)]
+          for _ in range(len(old) + 1)]
     for i in range(1, len(old) + 1):
         for j in range(1, len(new) + 1):
             choices = [dp[i - 1][j], dp[i][j - 1]]
@@ -386,19 +395,24 @@ def _ordered_pairs(old, new):
                     old[i - 1].estimate.source_observations
                     & new[j - 1].source_observations
                 )
+                anchor_mismatch = (old_anchor is None) != (new_anchor is None)
                 choices.append(
                     (
                         previous[0] + 1,
-                        previous[1] + (
+                        previous[1] + int(anchor_mismatch),
+                        previous[2] + (
                             anchor_distance * 10.0 + distance * 0.01
                             if old_anchor is not None and new_anchor is not None
                             else distance
                         ),
-                        previous[2] + ((0 if overlap else 1, i - 1, j - 1),),
+                        previous[3] + ((0 if overlap else 1, i - 1, j - 1),),
                     )
                 )
-            dp[i][j] = min(choices, key=lambda item: (-item[0], item[1], item[2]))
-    return [(item[1], item[2]) for item in dp[-1][-1][2]]
+            dp[i][j] = min(
+                choices,
+                key=lambda item: (-item[0], item[1], item[2], item[3]),
+            )
+    return [(item[1], item[2]) for item in dp[-1][-1][3]]
 
 
 def _bracket_position(track, candidate):

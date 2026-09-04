@@ -566,3 +566,61 @@ async def test_omitted_route_holds_tie_and_strict_neighbor():
     )
     by_id = {marker.track_id: marker.position for marker in omitted}
     assert [by_id[marker.track_id] for marker in initial] == [9.0, 10.0, 10.0]
+
+
+@pytest.mark.asyncio
+async def test_complete_turnover_prefers_eta_anchors_over_unanchored_distance():
+    tracker = MarkerTracker()
+
+    def candidate(position, token, **kwargs):
+        return replace(
+            _candidate(position, **kwargs),
+            source_observations=frozenset({("probe", token)}),
+        )
+
+    old_arrival = BASE_TIME + timedelta(minutes=10)
+    initial = await tracker.update(
+        _snapshot(1),
+        [
+            candidate(0.0, 10, bracket=(0.0, 0.0), boundary_age=0),
+            candidate(0.0, 20, bracket=(0.0, 0.0), boundary_age=0),
+            candidate(
+                7.9, 30, bracket=(7.0, 8.0), boundary_age=0,
+                arrival_at=old_arrival,
+            ),
+            candidate(
+                7.9, 40, bracket=(7.0, 8.0), boundary_age=0,
+                arrival_at=old_arrival,
+            ),
+        ],
+    )
+    downstream_ids = {
+        next(iter(marker.source_observations))[1]: marker.track_id
+        for marker in initial
+        if marker.position > 0
+    }
+
+    updated = await tracker.update(
+        _snapshot(2, collected_at=BASE_TIME + timedelta(seconds=60)),
+        [
+            # This newly observed gate candidate is spatially matchable to an
+            # old downstream track but has no ETA anchor or fresh bracket.
+            candidate(5.0, 10),
+            candidate(
+                8.0, 30, bracket=(7.0, 8.0), boundary_age=0,
+                arrival_at=old_arrival + timedelta(seconds=24),
+            ),
+            candidate(
+                8.0, 40, bracket=(7.0, 8.0), boundary_age=0,
+                arrival_at=old_arrival + timedelta(seconds=24),
+            ),
+        ],
+    )
+
+    assert [marker.position for marker in updated] == [5.0, 8.0, 8.0]
+    assert {
+        next(iter(marker.source_observations))[1]: marker.track_id
+        for marker in updated
+        if marker.position == 8.0
+    } == downstream_ids
+    assert len({marker.source_observations for marker in updated}) == len(updated)

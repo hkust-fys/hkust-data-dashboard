@@ -202,6 +202,19 @@ def _provenance_signature(evidence):
             eta_arrival_at, tuple(source_indices or ()), observations)
 
 
+def _source_observation_signature(evidence):
+    """Return the estimator ladder claimed by one displayed marker."""
+    if not isinstance(evidence, dict):
+        return None
+    observations = evidence.get("source_observations") or ()
+    if not observations:
+        return None
+    return tuple(
+        tuple(item) if isinstance(item, (list, tuple)) else item
+        for item in observations
+    )
+
+
 def _spacing_provenance_comparable(record, key, tracks, candidates):
     """Check whether current candidate/track positions have a safe bijection."""
     candidate_evidence = record.get("candidate_evidence", {}).get(key)
@@ -316,23 +329,32 @@ def compare_adjacent(old, new, state=None):
     for key in keys:
         a, b = old_tracks.get(key, {}), new_tracks.get(key, {})
         signatures = {}
+        source_signatures = {}
         for track in b:
             route_evidence = new.get("track_evidence", {}).get(key, {})
             track_evidence = route_evidence.get(
                 track, route_evidence.get(str(track))
             )
             signature = _provenance_signature(track_evidence)
-            if signature is None:
-                continue
-            if signature in signatures:
+            source_signature = _source_observation_signature(track_evidence)
+            duplicate = (
+                source_signatures.get(source_signature)
+                if source_signature is not None
+                else None
+            )
+            if duplicate is None and signature is not None:
+                duplicate = signatures.get(signature)
+            if duplicate is not None:
                 issues.append({
                     "kind": "duplicate_track_evidence",
                     "route": key,
                     "track_id": track,
-                    "other_track_id": signatures[signature],
+                    "other_track_id": duplicate,
                 })
-            else:
+            if signature is not None:
                 signatures[signature] = track
+            if source_signature is not None:
+                source_signatures[source_signature] = track
         current_generation = new.get("generations", {}).get(key)
         last_generation = state["last_generation_by_route"].get(key)
         generation_changed = bool(current_generation and last_generation is not None

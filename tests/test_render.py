@@ -573,10 +573,13 @@ def test_weather_embed_shows_all_warnings_once_in_one_icon_strip():
     assert descriptions.count("Strong Wind Signal No. 3") == 1
     assert descriptions.count("Amber Rainstorm Warning Signal") == 1
     assert descriptions.count("Thunderstorm Warning") == 1
+    assert len(payload.files) == 1
+    warning_filename = payload.files[0].filename
+    assert warning_filename.startswith("hko-warnings-")
+    assert warning_filename.endswith(".png")
     assert [embed.thumbnail.url for embed in payload.embeds if embed.thumbnail] == [
-        "attachment://hko-warnings.png",
+        f"attachment://{warning_filename}",
     ]
-    assert [asset.filename for asset in payload.files] == ["hko-warnings.png"]
     strip = Image.open(io.BytesIO(payload.files[0].data))
     assert strip.size == (192, 64)
 
@@ -595,13 +598,45 @@ def test_build_payload_combines_warning_icons_in_one_thumbnail():
     ])
     payload = build_payload(weather, [], [], [], None, None)
     weather_embeds = [e for e in payload.embeds if e.thumbnail]
-    assert [e.thumbnail.url for e in weather_embeds] == [
-        "attachment://hko-warnings.png"
-    ]
     assert len(payload.files) == 1
+    assert [e.thumbnail.url for e in weather_embeds] == [
+        f"attachment://{payload.files[0].filename}"
+    ]
     strip = Image.open(io.BytesIO(payload.files[0].data))
     assert strip.size == (128, 64)
     assert "[!]" not in "\n".join(e.description or "" for e in payload.embeds)
+
+
+def test_warning_icon_strip_is_reused_until_icon_content_changes():
+    from dashboard.models import WeatherConditions, WeatherWarning
+    from dashboard.render import (
+        _build_warning_icon_strip,
+        _compose_warning_icon_strip,
+        warning_icon_filename,
+    )
+
+    _compose_warning_icon_strip.cache_clear()
+    red = _icon_png((255, 0, 0, 255))
+    first = _build_warning_icon_strip(WeatherConditions(warnings=[
+        WeatherWarning("TC8NE", "Gale Signal No. 8 NE", icon_data=red),
+    ]))
+    same = _build_warning_icon_strip(WeatherConditions(warnings=[
+        WeatherWarning("TC8NE", "Updated warning text", icon_data=red),
+    ]))
+
+    assert first is not None
+    assert same is first
+    assert _compose_warning_icon_strip.cache_info().hits == 1
+    assert warning_icon_filename(first) == warning_icon_filename(same)
+
+    changed = _build_warning_icon_strip(WeatherConditions(warnings=[
+        WeatherWarning(
+            "WRAINB", "Black Rainstorm Warning", icon_data=_icon_png((0, 0, 0, 255))
+        ),
+    ]))
+    assert changed is not None
+    assert changed != first
+    assert warning_icon_filename(changed) != warning_icon_filename(first)
 
 
 def test_warning_icons_use_one_meaningful_embed_without_displacing_transit():
@@ -617,7 +652,7 @@ def test_warning_icons_use_one_meaningful_embed_without_displacing_transit():
     ])
     payload = build_payload(weather, s.route_groups(), [], [], None, None)
     thumbnails = [e.thumbnail.url for e in payload.embeds if e.thumbnail]
-    assert thumbnails == ["attachment://hko-warnings.png"]
+    assert thumbnails == [f"attachment://{payload.files[0].filename}"]
     assert sum("Warning " in (e.description or "") for e in payload.embeds) == 1
     assert any(e.title == "🚌 Bus stops" for e in payload.embeds)
 

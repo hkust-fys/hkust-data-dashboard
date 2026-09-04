@@ -495,6 +495,45 @@ def test_payload_fingerprint_changes_when_map_bytes_change():
     assert _payload_fingerprint(first) != _payload_fingerprint(changed)
 
 
+@pytest.mark.asyncio
+async def test_apply_payload_retains_unchanged_content_addressed_attachment():
+    import discord
+
+    from bot import _apply_payload
+
+    class Attachment:
+        def __init__(self, attachment_id, filename, size):
+            self.id = attachment_id
+            self.filename = filename
+            self.size = size
+
+    class Message:
+        def __init__(self, attachments):
+            self.attachments = attachments
+            self.kwargs = None
+
+        async def edit(self, **kwargs):
+            self.kwargs = kwargs
+            return self
+
+    old_map = Attachment(1, "traffic-map-old.webp", 3)
+    warning = Attachment(2, "hko-warnings-stable.png", len(b"warning"))
+    message = Message([old_map, warning])
+    payload = DashboardPayload(files=[
+        ImageAsset("traffic-map-new.webp", b"new"),
+        ImageAsset(warning.filename, b"warning"),
+    ])
+
+    edited = await _apply_payload(message, payload)
+    attachments = message.kwargs["attachments"]
+    assert edited is message
+    assert old_map not in attachments
+    assert attachments[1] is warning
+    assert isinstance(attachments[0], discord.File)
+    assert attachments[0].filename == "traffic-map-new.webp"
+    attachments[0].close()
+
+
 def test_dry_run_recognizes_content_addressed_traffic_map_filename():
     import bot as bot_module
     from dashboard.render import traffic_map_filename

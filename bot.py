@@ -733,14 +733,30 @@ def _payload_fingerprint(payload: DashboardPayload) -> str:
     return hashlib.sha256(serialized).hexdigest()
 
 
-async def _apply_payload(message, payload: DashboardPayload, view=None) -> None:
-    """Edit embeds + attachments atomically; replace images to avoid CDN cache."""
+async def _apply_payload(message, payload: DashboardPayload, view=None):
+    """Edit atomically, retaining already-uploaded content-addressed images."""
     embeds = [e for e in payload.embeds if e is not None]
-    files = [discord_file(asset) for asset in payload.files]
-    await message.edit(
+    existing_by_filename = {
+        attachment.filename: attachment
+        for attachment in getattr(message, "attachments", ())
+        if getattr(attachment, "filename", None)
+    }
+    attachments = []
+    for asset in payload.files:
+        existing = existing_by_filename.get(asset.filename)
+        existing_size = getattr(existing, "size", None)
+        if (
+            existing is not None
+            and getattr(existing, "id", None) is not None
+            and existing_size == len(asset.data)
+        ):
+            attachments.append(existing)
+        else:
+            attachments.append(discord_file(asset))
+    return await message.edit(
         content=DASHBOARD_MESSAGE_MARKER,
         embeds=embeds,
-        attachments=files,
+        attachments=attachments,
         view=view,
     )
 
@@ -1099,7 +1115,14 @@ class DashboardUpdater:
             fingerprint = _payload_fingerprint(payload)
             try:
                 if fingerprint != self._last_payload_fingerprint:
-                    await _apply_payload(self._message, payload, view=self.live_view)
+                    edited_message = await _apply_payload(
+                        self._message, payload, view=self.live_view
+                    )
+                    if edited_message is not None:
+                        # discord.py 2.x returns the edited Message rather than
+                        # mutating this object in place. Retain it so its
+                        # Attachment objects can be passed through next time.
+                        self._message = edited_message
                     self._last_payload_fingerprint = fingerprint
                     map_asset = next(
                         (asset for asset in payload.files

@@ -1161,9 +1161,11 @@ def _draw_bus_route_marker(
     left, top, right, bottom = placement.rect
     anchor_x, anchor_y = placement.marker
     # A short black leader preserves the association when displaced and
-    # terminates exactly at the label edge.
-    end_x = min(max(anchor_x, left), right)
-    end_y = min(max(anchor_y, top), bottom)
+    # terminates exactly at the visible rounded label edge. Clamping to the
+    # raw rectangle corner leaves a transparent gap before the rounded arc.
+    end_x, end_y = _nearest_rounded_rect_edge(
+        (anchor_x, anchor_y), placement.rect, metrics.integer(4)
+    )
     if phase in {"all", "connector"} and (end_x, end_y) != (anchor_x, anchor_y):
         draw.line(
             (anchor_x, anchor_y, end_x, end_y),
@@ -1263,6 +1265,38 @@ def _draw_bus_route_marker(
         )
     text_x = text_origin(placement.text, left, right)
     draw.text((text_x, top + metrics.px(2)), placement.text, fill=text_fill, font=font)
+
+
+def _nearest_rounded_rect_edge(
+    point: tuple[float, float],
+    rect: tuple[float, float, float, float],
+    radius: float,
+) -> tuple[float, float]:
+    """Return the nearest visible point on a rounded rectangle.
+
+    The rounded rectangle is the Minkowski sum of its inset central rectangle
+    and a circle. Projecting onto that circle handles straight sides and all
+    four rounded corners with the same calculation. A point already inside
+    the visible shape is returned unchanged.
+    """
+    x, y = point
+    left, top, right, bottom = rect
+    radius = max(
+        0.0,
+        min(float(radius), max(0.0, (right - left) / 2), max(0.0, (bottom - top) / 2)),
+    )
+    if radius == 0:
+        return min(max(x, left), right), min(max(y, top), bottom)
+
+    center_x = min(max(x, left + radius), right - radius)
+    center_y = min(max(y, top + radius), bottom - radius)
+    delta_x = x - center_x
+    delta_y = y - center_y
+    distance = math.hypot(delta_x, delta_y)
+    if distance <= radius:
+        return point
+    scale = radius / distance
+    return center_x + delta_x * scale, center_y + delta_y * scale
 
 
 def _bus_direction_arrow_triangle(

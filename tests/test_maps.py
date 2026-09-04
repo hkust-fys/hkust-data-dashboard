@@ -799,6 +799,39 @@ def test_displaced_label_connector_runs_from_anchor_to_nearest_edge():
     assert draw.line_calls[0] == ((50.0, 30.0, 70.0, 30.0), (0, 0, 0, 255))
 
 
+def test_diagonal_connector_terminates_on_visible_rounded_corner():
+    class RecordingDraw:
+        def __init__(self, wrapped):
+            self.wrapped, self.line_calls = wrapped, []
+
+        def line(self, xy, *args, **kwargs):
+            self.line_calls.append(xy)
+            return self.wrapped.line(xy, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    canvas = Image.new("RGBA", (120, 80), (120, 120, 120, 255))
+    draw = RecordingDraw(renderer.ImageDraw.Draw(canvas))
+    placement = renderer.LabelPlacement(
+        "792M", (70, 20, 110, 38), (50, 0), Operator.GMB, 0
+    )
+    renderer._draw_bus_route_marker(
+        draw,
+        placement,
+        renderer.OPERATOR_COLORS[Operator.GMB],
+        renderer._font(13),
+        phase="connector",
+    )
+
+    start_x, start_y, end_x, end_y = draw.line_calls[0]
+    assert (start_x, start_y) == placement.marker
+    assert (end_x, end_y) != (70, 20)  # the transparent bounding-box corner
+    assert math.hypot(end_x - 74, end_y - 24) == pytest.approx(4)
+    assert end_x == pytest.approx(71.171572875)
+    assert end_y == pytest.approx(21.171572875)
+
+
 def test_mixed_group_connector_is_one_opaque_black_link():
     class RecordingDraw:
         def __init__(self, wrapped):

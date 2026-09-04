@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import io
 from datetime import UTC, datetime
+from functools import lru_cache
 
 import discord
 from PIL import Image, UnidentifiedImageError
@@ -163,14 +164,13 @@ def _display_weather_warnings(
     return list(weather.warnings or [])
 
 
-def _build_warning_icon_strip(weather: WeatherConditions | None) -> bytes | None:
-    """Combine all available official warning icons into one compact thumbnail."""
+@lru_cache(maxsize=16)
+def _compose_warning_icon_strip(icon_payloads: tuple[bytes, ...]) -> bytes | None:
+    """Return a cached composite for one ordered set of static warning icons."""
     tiles: list[Image.Image] = []
-    for warning in _display_weather_warnings(weather):
-        if not warning.icon_data:
-            continue
+    for icon_data in icon_payloads:
         try:
-            with Image.open(io.BytesIO(warning.icon_data)) as source:
+            with Image.open(io.BytesIO(icon_data)) as source:
                 icon = source.convert("RGBA")
         except (OSError, UnidentifiedImageError):
             continue
@@ -187,6 +187,23 @@ def _build_warning_icon_strip(weather: WeatherConditions | None) -> bytes | None
     output = io.BytesIO()
     strip.save(output, format="PNG", optimize=True)
     return output.getvalue()
+
+
+def _build_warning_icon_strip(weather: WeatherConditions | None) -> bytes | None:
+    """Reuse the composite until the ordered warning-icon content changes."""
+    icon_payloads = tuple(
+        bytes(warning.icon_data)
+        for warning in _display_weather_warnings(weather)
+        if warning.icon_data
+    )
+    return _compose_warning_icon_strip(icon_payloads) if icon_payloads else None
+
+
+def warning_icon_filename(png: bytes) -> str:
+    """Return the content-addressed Discord filename for a warning strip."""
+    digest = hashlib.sha256(png).hexdigest()[:12]
+    return f"hko-warnings-{digest}.png"
+
 
 def _build_weather_embed(weather: WeatherConditions | None) -> discord.Embed | None:
     if weather is None:
@@ -539,10 +556,11 @@ def build_payload(
     if weather_embed is not None:
         warning_icon_strip = _build_warning_icon_strip(weather)
         if warning_icon_strip:
-            weather_embed.set_thumbnail(url="attachment://hko-warnings.png")
+            warning_filename = warning_icon_filename(warning_icon_strip)
+            weather_embed.set_thumbnail(url=f"attachment://{warning_filename}")
             payload.files.append(
                 ImageAsset(
-                    filename="hko-warnings.png",
+                    filename=warning_filename,
                     data=warning_icon_strip,
                     content_type="image/png",
                     label="HKO warning icons",

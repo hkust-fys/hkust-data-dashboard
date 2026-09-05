@@ -1162,14 +1162,19 @@ async def _refresh_probe_etas(
         cycle_budget, (len(remaining_background) + 1) // 2
     )
     if priority_groups:
-        background_reserve = min(background_reserve, max(0, cycle_budget - 1))
+        # Keep at least half of the overall cycle available to active
+        # frontiers.  Unused priority slots are still filled by the following
+        # background ring, so this is a reserve cap rather than wasted quota.
+        background_reserve = min(background_reserve, cycle_budget // 2)
     gmb_background = sum(key.startswith("GMB:") for key in remaining_background)
     gmb_background_reserve = min(
         GMB_GROUPS_PER_CYCLE, (gmb_background + 1) // 2
     )
     if any(key.startswith("GMB:") for key in priority_groups):
         gmb_background_reserve = min(
-            gmb_background_reserve, max(0, GMB_GROUPS_PER_CYCLE - 1)
+            gmb_background_reserve,
+            cycle_budget // 2,
+            GMB_GROUPS_PER_CYCLE // 2,
         )
     _probe_priority_cursor = select_ring(
         priority_groups,

@@ -548,6 +548,42 @@ async def test_sustained_gmb_priorities_reserve_rotating_background_capacity(mon
     assert {"stop-6", "stop-7"} <= set(calls)
 
 
+@pytest.mark.asyncio
+async def test_steady_state_gmb_priority_ring_clears_with_half_cycle_background_cap(monkeypatch):
+    def probe(route, stop_id):
+        return SimpleNamespace(
+            operator="GMB", route=route, bound="seq-1", stop_id=stop_id,
+            route_id=1, sequence=1, index=0,
+        )
+
+    baseline = [probe(f"B{index}", f"baseline-{index}") for index in range(20)]
+    priority = [probe(f"P{index}", f"priority-{index}") for index in range(6)]
+    priorities = {
+        (item.operator, item.route, item.bound): {item.index}
+        for item in priority
+    }
+    for item in baseline:
+        key = (item.operator, item.route, item.bound)
+        group_key = transit._fetch_group_key(item)  # noqa: SLF001
+        transit._probe_route_published_versions[key] = {group_key: 0}  # noqa: SLF001
+    calls: list[str] = []
+
+    async def fetch(_client, selected):
+        calls.append(selected.stop_id)
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 8)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    active = baseline + priority
+    for _ in range(2):
+        await transit._refresh_probe_etas(  # noqa: SLF001
+            object(), active, 8, priorities, generation_probes=baseline
+        )
+
+    assert {item.stop_id for item in priority} <= set(calls)
+    assert len({item.stop_id for item in baseline} & set(calls)) >= 4
+
+
 def test_gmb_repeated_physical_stop_occurrences_have_distinct_cache_keys():
     first = SimpleNamespace(
         operator="GMB", route="104", bound="seq-1", stop_id="gate", index=0,

@@ -88,6 +88,10 @@ class BusEstimate:
     # MarkerTracker combines these with the physical bracket and terminus so a
     # zero plateau advances promptly without sharing evidence between vehicles.
     priority_indices: frozenset[int] = frozenset()
+    # Immutable, exact probe checkpoints owned by this ETA ladder.  Entries
+    # are (stop index, absolute arrival timestamp, refresh revision); unlike
+    # source row offsets they survive staggered probe input rebuilding.
+    checkpoint_evidence: tuple[tuple[int, float, int], ...] = ()
 
     @property
     def bracket_lower(self):
@@ -96,6 +100,21 @@ class BusEstimate:
     @property
     def bracket_upper(self):
         return self.bracket[1] if self.bracket else None
+
+
+def _checkpoint_evidence(rows):
+    """Keep bounded, owned source timestamps; never invent an arrival time."""
+    evidence = set()
+    for row in rows:
+        try:
+            index = int(row.index)
+            revision = int(row.refresh_generation)
+            arrival = float(row.arrival_at.timestamp())
+        except (AttributeError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        if index >= 0 and revision > 0 and math.isfinite(arrival):
+            evidence.add((index, arrival, revision))
+    return tuple(sorted(evidence)[:64])
 
 
 MINUTES_PER_STOP = 2.0
@@ -1484,6 +1503,7 @@ def estimate_bus_positions(
             boundary_revision = None
             bracket_eta_offsets = None
             priority_indices = frozenset()
+            checkpoint_evidence = ()
             observed = observed_by_route.get((operator_name, route, bound))
             if observed is not None and provenance:
                 first_present = min(provenance)
@@ -1498,6 +1518,7 @@ def estimate_bus_positions(
                                if str(kind).lower() == "probe"
                                and 0 <= index < len(probe_inputs)]
                 source_rows = [row for row in source_rows if getattr(row, "minutes", None) is not None]
+                checkpoint_evidence = _checkpoint_evidence(source_rows)
                 zero_indices = sorted({
                     int(row.index)
                     for row in source_rows
@@ -1699,6 +1720,7 @@ def estimate_bus_positions(
                     boundary_revision=boundary_revision,
                     bracket_eta_offsets=bracket_eta_offsets,
                     priority_indices=priority_indices,
+                    checkpoint_evidence=checkpoint_evidence,
                 )
             )
     return estimates

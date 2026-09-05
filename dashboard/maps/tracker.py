@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from math import inf, isfinite
 
 from dashboard.maps.positions import reproject_estimate
@@ -12,6 +12,8 @@ MAX_ROUTES = 64
 MAX_TRACKS_PER_ROUTE = 128
 MATCH_DISTANCE = 3.5
 MAX_PRIORITY_ENDPOINTS_PER_ROUTE = 32
+RECOVERY_ARRIVAL_TOLERANCE_SECONDS = 90.0
+MAX_CHECKPOINT_EVIDENCE = 64
 
 
 @dataclass
@@ -23,6 +25,11 @@ class _Track:
     last_evidence_at: float = 0.0
     boundary_observed_at: float | None = None
     boundary_revision: tuple[int, int] | None = None
+    forward_frontier: tuple[int, ...] = ()
+    forward_after: int | None = None
+    forward_revision: int = 0
+    forward_started_revision: int = 0
+    forward_baselines: dict[int, int] = field(default_factory=dict)
 
 
 def _key(item):
@@ -77,6 +84,7 @@ class MarkerTracker:
             if not tracks:
                 continue
             endpoints = set()
+            recovery_endpoints = set()
             for track in tracks.values():
                 for endpoint in (
                     getattr(track.estimate, "priority_indices", None) or ()
@@ -105,17 +113,20 @@ class MarkerTracker:
                         endpoints.add(midpoint)
                         if upper - lower > 2:
                             endpoints.add(midpoint + 1)
+                recovery_endpoints.update(track.forward_frontier)
+                if track.forward_after is not None:
+                    recovery_endpoints.add(track.forward_after)
             terminal = self._terminal_indices.get(key)
             if terminal is not None:
                 endpoints.add(terminal)
-            if endpoints:
-                selected = sorted(endpoints)
-                if terminal is not None and terminal in endpoints:
-                    selected = sorted(
-                        set(sorted(endpoints - {terminal})[
-                            :MAX_PRIORITY_ENDPOINTS_PER_ROUTE - 1
-                        ]) | {terminal}
-                    )
+            if endpoints or recovery_endpoints:
+                # A held marker's old, low-index rungs must not crowd the
+                # downstream search out of the bounded priority tier.
+                selected = sorted(recovery_endpoints - {terminal})
+                selected.extend(sorted(endpoints - recovery_endpoints - {terminal}))
+                selected = selected[:MAX_PRIORITY_ENDPOINTS_PER_ROUTE - 1]
+                if terminal is not None:
+                    selected.append(terminal)
                 priorities[key] = frozenset(
                     selected[:MAX_PRIORITY_ENDPOINTS_PER_ROUTE]
                 )
@@ -132,7 +143,7 @@ class MarkerTracker:
         }
         grouped = _group(candidates)
         keys = set(complete)
-        keys.update(key for key in grouped if key in self._routes)
+        keys.update(self._routes)
         # Capture every stored route before any complete or same-generation
         # branch can mutate positions. Omitted routes still reach prediction.
         split_ties = {
@@ -150,6 +161,15 @@ class MarkerTracker:
                     continue
                 tracks = self._routes.setdefault(key, {})
             split_ties.setdefault(key, _tie_components(tracks))
+            route_rows = tuple(row for row in getattr(snapshot, "rows", ())
+                               if _key(row) == key)
+            checkpoints = _successful_checkpoints(route_rows)
+            for track in tracks.values():
+                _refresh_forward_search(
+                    track, checkpoints, self._terminal_indices.get(key)
+                )
+            _advance_forward_search_from_candidates(tracks, rows, checkpoints,
+                                                     self._terminal_indices.get(key))
             if generation is not None and generation != self._generations.get(key):
                 old_generation = self._generations.get(key)
                 rollback = old_generation is not None and generation < old_generation
@@ -162,10 +182,23 @@ class MarkerTracker:
                     track.track_id: track.position for track in old
                 }
                 self._predict(old, now, route_lines)
-                pairs = _ordered_pairs(old, rows)
+                pairs = _ordered_pairs(
+                    old, rows, compatible=_search_compatible,
+                    recoveries=_recovery_pairs(old, rows, checkpoints),
+                )
+                # A complete publication can contain one newly discovered,
+                # coarse downstream bracket while a held marker is already
+                # searching forward.  Consume that candidate for lifecycle
+                # cardinality, but defer movement until a narrow requested
+                # corridor arrives.  Restrict this to an unambiguous 1:1
+                # route association; competing tracks fail closed.
+                hold_pairs = _forward_hold_pairs(old, rows)
+                if hold_pairs:
+                    pairs = sorted(set(pairs) | hold_pairs)
                 proposed_positions = {
                     old_index: position
                     for old_index, new_index in pairs
+                    if (old_index, new_index) not in hold_pairs
                     if (position := _bracket_position(
                         old[old_index], rows[new_index]
                     )) is not None
@@ -192,6 +225,8 @@ class MarkerTracker:
                     track.last_evidence_at = now
                     track.boundary_observed_at = _boundary_observed_at(candidate, now)
                     track.boundary_revision = _candidate_revision(candidate)
+                    _clear_forward_search(track)
+                    track.forward_frontier = ()
                 births = []
                 for index, candidate in enumerate(rows):
                     if index in used:
@@ -235,13 +270,14 @@ class MarkerTracker:
                     compatible=lambda track, candidate: _candidate_actionable(
                         candidate, track
                     ),
+                    recoveries=_recovery_pairs(old, fresh_rows, checkpoints),
                 )
                 proposed_positions = {
-                    old_index: _bracket_position(
-                        old[old_index], fresh_rows[new_index]
-                    )
+                    old_index: position
                     for old_index, new_index in pairs
-                    if _bracket_position(old[old_index], fresh_rows[new_index]) is not None
+                    if (position := _bracket_position(
+                        old[old_index], fresh_rows[new_index]
+                    )) is not None
                 }
                 accepted_updates = _select_ordered_updates(
                     old, proposed_positions
@@ -257,6 +293,7 @@ class MarkerTracker:
                     track.last_evidence_at = now
                     track.boundary_observed_at = _boundary_observed_at(candidate, now)
                     track.boundary_revision = _candidate_revision(candidate)
+                    _clear_forward_search(track)
             self._bound()
 
         output = []
@@ -401,7 +438,290 @@ def _merge_tracks(old, new):
     return merged
 
 
-def _ordered_pairs(old, new, compatible=None):
+def _checkpoint_rows(estimate):
+    rows = getattr(estimate, "checkpoint_evidence", ()) or ()
+    out = []
+    for row in rows:
+        try:
+            index, arrival, revision = int(row[0]), float(row[1]), int(row[2])
+        except (TypeError, ValueError, IndexError, OverflowError):
+            continue
+        if index >= 0 and isfinite(arrival) and revision > 0:
+            out.append((index, arrival, revision))
+    return tuple(out[:MAX_CHECKPOINT_EVIDENCE])
+
+
+def _arrival_timestamp(value):
+    if value is None:
+        return None
+    try:
+        stamp = _timestamp(value)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return stamp if isfinite(stamp) else None
+
+
+def _successful_checkpoints(rows):
+    """Index exact cached responses, never treating a missing response as empty."""
+    grouped = {}
+    invalid = set()
+    for row in rows:
+        try:
+            index = int(row.index)
+            revision = int(row.refresh_generation)
+            age = float(row.cache_age_seconds)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            continue
+        if index < 0:
+            continue
+        if revision <= 0 or not isfinite(age) or not 0 <= age < 900:
+            invalid.add(index)
+            continue
+        grouped.setdefault(index, []).append(row)
+    return {
+        index: (int(values[0].refresh_generation), tuple(values))
+        for index, values in grouped.items()
+        if index not in invalid
+        and len({int(row.refresh_generation) for row in values}) == 1
+    }
+
+
+def _missing_instance(track, index, rows):
+    if all(getattr(row, "minutes", None) is None for row in rows):
+        return True
+    prior = [arrival for stop, arrival, _revision in _checkpoint_rows(track.estimate)
+             if stop == index]
+    current = [_arrival_timestamp(getattr(row, "arrival_at", None))
+               for row in rows if getattr(row, "minutes", None) is not None]
+    # Without comparable timestamps, a nonempty response is inconclusive.
+    return bool(prior and current and all(value is not None for value in current)) and not any(
+        abs(before - after) <= RECOVERY_ARRIVAL_TOLERANCE_SECONDS
+        for before in prior for after in current
+    )
+
+
+def _search_anchors(after, terminal):
+    # A few forward scouts plus a distant sentinel; do not walk every stop.
+    return tuple(sorted({index for index in (
+        after + 1, after + 2, after + 4, after + 6,
+        after + max(1, (terminal - after) // 2), terminal,
+    ) if after < index <= terminal}))
+
+
+def _clear_forward_search(track):
+    track.forward_after = None
+    track.forward_revision = 0
+    track.forward_started_revision = 0
+    track.forward_frontier = ()
+    track.forward_baselines.clear()
+
+
+def _refresh_forward_search(track, checkpoints, terminal):
+    if terminal is None:
+        return
+    try:
+        upper = float(track.estimate.bracket[1])
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return
+    if not isfinite(upper) or not upper.is_integer() or not 0 <= upper <= terminal:
+        return
+    previous_revision = track.forward_revision
+    requested = track.forward_frontier
+    advanced = False
+    if track.forward_after is None:
+        index = int(upper)
+        response = checkpoints.get(index)
+        if (response is None or track.boundary_revision is None
+                or bool(getattr(track.estimate, "unreliable", False))
+                or index >= terminal
+                or abs(float(track.position) - upper) > MATCH_DISTANCE):
+            return
+        revision, rows = response
+        if revision <= track.boundary_revision[1] or not _missing_instance(track, index, rows):
+            return
+        track.forward_after = index
+        track.forward_revision = revision
+        track.forward_started_revision = revision
+        advanced = True
+    else:
+        # Only a requested downstream checkpoint can extend the search.  The
+        # consumed watermark prevents the same empty response moving it again.
+        missing = [
+            (index, revision)
+            for index in track.forward_frontier
+            if (response := checkpoints.get(index)) is not None
+            for revision, rows in (response,)
+            if revision > max(track.forward_revision, track.forward_baselines.get(index, 0))
+            and _missing_instance(track, index, rows)
+        ]
+        if missing:
+            track.forward_after = max(index for index, _revision in missing)
+            track.forward_revision = max(revision for _index, revision in missing)
+            advanced = True
+    present = [index for index in requested if index > track.forward_after
+               and (response := checkpoints.get(index)) is not None
+               and response[0] > max(previous_revision, track.forward_baselines.get(index, 0))
+               and any(isinstance(getattr(row, "minutes", None), (int, float))
+                       and row.minutes > 0 for row in response[1])]
+    if not advanced and not present:
+        return
+    frontier = set(_search_anchors(track.forward_after, terminal))
+    if present:
+        # Keep the just-found upper boundary eligible for matching even when
+        # a later-arriving empty lower response advances the search watermark.
+        upper = min(present)
+        frontier = {index for index in frontier if index <= upper or index == terminal}
+        frontier.add(upper)
+    track.forward_frontier = tuple(sorted(frontier))
+    track.forward_baselines = {
+        index: track.forward_baselines.get(index, checkpoints.get(index, (0, ()))[0])
+        for index in track.forward_frontier
+    }
+
+
+def _common_checkpoint(evidence, current_by_index):
+    return any(
+        new_revision > revision
+        and abs(new_arrival - arrival) <= RECOVERY_ARRIVAL_TOLERANCE_SECONDS
+        for index, arrival, revision in evidence
+        for new_arrival, new_revision in current_by_index.get(index, ())
+    )
+
+
+def _recovery_pairs(old, new, checkpoints):
+    """Uniquely evidenced long jumps, not a wider nearest-neighbour radius."""
+    current = []
+    for candidate in new:
+        checkpoints_by_index = {}
+        for index, arrival, revision in _checkpoint_rows(candidate):
+            checkpoints_by_index.setdefault(index, []).append((arrival, revision))
+        current.append(checkpoints_by_index)
+    anchors = {(i, j) for i, track in enumerate(old)
+               for evidence in (_checkpoint_rows(track.estimate),)
+               for j, checkpoints_by_index in enumerate(current)
+               if _common_checkpoint(evidence, checkpoints_by_index)}
+    old_degrees, new_degrees = {}, {}
+    for i, j in anchors:
+        old_degrees[i] = old_degrees.get(i, 0) + 1
+        new_degrees[j] = new_degrees.get(j, 0) + 1
+    possible = set()
+    for i, track in enumerate(old):
+        for j, candidate in enumerate(new):
+            position = _bracket_position(track, candidate)
+            if position is None or abs(position - track.position) <= MATCH_DISTANCE:
+                continue
+            lower, upper = map(float, candidate.bracket)
+            # First narrow a coarse search interval. This also avoids leaping
+            # to its far end and then losing the necessary backward refinement.
+            if upper - lower > MATCH_DISTANCE:
+                continue
+            unique_anchor = ((i, j) in anchors
+                             and old_degrees[i] == new_degrees[j] == 1)
+            nested = (getattr(track.estimate, "bracket", None) is not None
+                      and track.estimate.bracket[0] <= lower <= upper <= track.estimate.bracket[1])
+            if unique_anchor and (position > track.position or nested):
+                possible.add((i, j))
+                continue
+            # Timestamp-free providers can recover one isolated track from a
+            # newly probed, narrow corridor. Any competing vehicle fails closed.
+            response = checkpoints.get(int(upper)) if upper.is_integer() else None
+            if (len(old) == len(new) == 1 and track.forward_after is not None
+                    and position > track.position and lower >= track.forward_after
+                    and int(upper) in track.forward_frontier and response is not None
+                    and response[0] > max(track.forward_started_revision,
+                                          track.forward_baselines.get(int(upper), 0))
+                    and any(getattr(row, "minutes", None) is not None for row in response[1])):
+                possible.add((i, j))
+    return possible
+
+
+def _forward_hold_pairs(old, new):
+    """Associate one coarse forward candidate without moving the marker."""
+    if len(old) != len(new) or len(old) != 1:
+        return set()
+    track, candidate = old[0], new[0]
+    after = track.forward_after
+    bracket = getattr(candidate, "bracket", None)
+    if after is None or not bracket or len(bracket) != 2:
+        return set()
+    try:
+        lower, upper = map(float, bracket)
+        position = float(getattr(candidate, "position", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return set()
+    if (not all(isfinite(value) for value in (lower, upper, position))
+            or lower > upper or upper - lower <= MATCH_DISTANCE
+            or lower < after or position <= track.position
+            or _bracket_position(track, candidate) is None):
+        return set()
+    owned = _checkpoint_rows(track.estimate)
+    current = _checkpoint_rows(candidate)
+    common = any(
+        new_index == old_index
+        and new_revision > old_revision
+        and abs(new_arrival - old_arrival) <= RECOVERY_ARRIVAL_TOLERANCE_SECONDS
+        for old_index, old_arrival, old_revision in owned
+        for new_index, new_arrival, new_revision in current
+    )
+    if not common:
+        return set()
+    return {(0, 0)}
+
+
+def _advance_forward_search_from_candidates(tracks, candidates, checkpoints, terminal):
+    """Use one coarse candidate's fresh lower rung to reseed forward scouts."""
+    if len(tracks) != 1 or len(candidates) != 1 or terminal is None:
+        return
+    track = next(iter(tracks.values()))
+    if track.forward_after is None:
+        return
+    candidate = candidates[0]
+    bracket = getattr(candidate, "bracket", None)
+    if not bracket or len(bracket) != 2:
+        return
+    try:
+        lower, upper = map(float, bracket)
+    except (TypeError, ValueError):
+        return
+    if (not all(isfinite(value) for value in (lower, upper))
+            or not lower.is_integer() or lower <= track.forward_after
+            or upper - lower <= MATCH_DISTANCE
+            or lower >= terminal):
+        return
+    lower = int(lower)
+    response = checkpoints.get(lower)
+    if response is None or lower not in track.forward_frontier:
+        return
+    revision, _rows = response
+    baseline = max(
+        track.forward_revision,
+        track.forward_started_revision,
+        track.forward_baselines.get(lower, 0),
+    )
+    if revision <= baseline:
+        return
+    owned = _checkpoint_rows(track.estimate)
+    current = _checkpoint_rows(candidate)
+    matches = {
+        old_index
+        for old_index, old_arrival, old_revision in owned
+        for new_index, new_arrival, new_revision in current
+        if old_index == new_index
+        and new_revision > old_revision
+        and abs(new_arrival - old_arrival) <= RECOVERY_ARRIVAL_TOLERANCE_SECONDS
+    }
+    if not matches:
+        return
+    track.forward_after = lower
+    track.forward_revision = revision
+    track.forward_frontier = _search_anchors(lower, terminal)
+    track.forward_baselines = {
+        index: checkpoints.get(index, (0, ()))[0]
+        for index in track.forward_frontier
+    }
+
+
+def _ordered_pairs(old, new, compatible=None, recoveries=()):
     # Score an ordered alignment by retained cardinality first, then by ETA-
     # anchor presence continuity. ETA timestamps can drift by tens of seconds
     # between provider generations, while an unbracketed turnover candidate
@@ -410,6 +730,8 @@ def _ordered_pairs(old, new, compatible=None):
     # downstream track and then birth a second marker from its source ladder.
     # Source-row slots can shift after a departure, so overlap remains only a
     # deterministic final tie-breaker rather than an identity authority.
+    reserved_old = {i for i, _j in recoveries}
+    reserved_new = {j for _i, j in recoveries}
     dp = [[(0, 0, 0.0, ()) for _ in range(len(new) + 1)]
           for _ in range(len(old) + 1)]
     for i in range(1, len(old) + 1):
@@ -424,7 +746,10 @@ def _ordered_pairs(old, new, compatible=None):
                 except (TypeError, ValueError):
                     anchor_distance = 0.0
             distance = abs(old[i - 1].position - float(new[j - 1].position or 0.0))
-            if distance <= MATCH_DISTANCE and (
+            pair = (i - 1, j - 1)
+            recovery = pair in recoveries
+            reserved = not recovery and (pair[0] in reserved_old or pair[1] in reserved_new)
+            if not reserved and (distance <= MATCH_DISTANCE or recovery) and (
                 compatible is None or compatible(old[i - 1], new[j - 1])
             ):
                 previous = dp[i - 1][j - 1]
@@ -499,8 +824,17 @@ def _candidate_revision(candidate):
     return revision if all(item > 0 for item in revision) else None
 
 
+def _search_compatible(track, candidate):
+    return (track.forward_after is None
+            or float(getattr(candidate, "position", 0.0) or 0.0) >= track.forward_after)
+
+
 def _candidate_actionable(candidate, track):
     """Require unseen complete boundary evidence in production snapshots."""
+    if not _search_compatible(track, candidate):
+        # A later departure at the vacated stop is not the bus being searched
+        # for. Absence changes probe selection, not this marker's identity.
+        return False
     raw_revision = getattr(candidate, "boundary_revision", None)
     revision = _candidate_revision(candidate)
     if raw_revision is not None and revision is None:

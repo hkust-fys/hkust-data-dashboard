@@ -326,14 +326,13 @@ class MarkerTracker:
                          or _incoherent_checkpoint_chronology(candidate))
                 }
 
-                def complete_compatible(track, candidate, route_tracks=trusted_owners,
+                def complete_identity_compatible(track, candidate, route_tracks=trusted_owners,
                                          cache=complete_ownership_cache,
                                          certified=reconciled_owners,
                                          untrusted=mixed_candidates):
                     certified_owner = certified.get(id(candidate))
                     if certified_owner is not None:
-                        return (track.track_id == certified_owner
-                                and _search_compatible(track, candidate))
+                        return track.track_id == certified_owner
                     if id(candidate) in untrusted:
                         return False
                     cache_key = id(candidate)
@@ -346,14 +345,17 @@ class MarkerTracker:
                     # Complete cardinality remains authoritative, but a
                     # candidate with positive ownership for another survivor
                     # must not be used as a fallback continuation here.
-                    if mixed_ids or (covering_ids and track.track_id not in covering_ids):
-                        return False
-                    return _search_compatible(track, candidate)
-                fixed_pairs, movement_pairs, pairs = _complete_pair_plan(
+                    return not (mixed_ids or (covering_ids and track.track_id not in covering_ids))
+                def complete_compatible(track, candidate):
+                    return (complete_identity_compatible(track, candidate)
+                            and _search_compatible(track, candidate))
+                fixed_pairs, movement_pairs, pairs, cold_reserved = _complete_pair_plan(
                     matching_old,
                     rows,
                     checkpoints,
                     compatible=complete_compatible,
+                    identity_compatible=complete_identity_compatible,
+                    reconciled_owners=reconciled_owners,
                 )
                 # A complete publication can contain one newly discovered,
                 # coarse downstream bracket while a held marker is already
@@ -374,14 +376,43 @@ class MarkerTracker:
                 fragments_by_old = {}
                 for new_index, old_index in fragment_assignments.items():
                     fragments_by_old.setdefault(old_index, []).append(new_index)
+                cold_fragment_pairs = set()
                 for old_index, fragment_indices in fragments_by_old.items():
                     base_index = dict(pairs)[old_index]
+                    base = rows[base_index]
                     rows[base_index] = rebuild_estimate_from_probe_fragments(
-                        rows[base_index],
+                        base,
                         [rows[index] for index in fragment_indices],
                         probe_inputs,
                         route_lines,
                     )
+                    rebuilt = rows[base_index]
+                    if (rebuilt is base
+                            or getattr(rebuilt, "position_authoritative", None) is False):
+                        # A missing lower frontier can leave reconstruction
+                        # unchanged even if the base alone was authoritative.
+                        # Consuming certified fragments must still publish
+                        # their evidence and poll hints without moving.
+                        constituents = [rebuilt, *(rows[index] for index in fragment_indices)]
+                        metadata = {
+                            name: frozenset().union(*(getattr(item, name) for item in constituents))
+                            for name in ("source_indices", "source_observations",
+                                         "priority_indices", "exploratory_indices")
+                        }
+                        rows[base_index] = replace(
+                            rebuilt, **metadata, position_authoritative=False,
+                            checkpoint_evidence=tuple(sorted({
+                                row for item in constituents for row in _checkpoint_rows(item)
+                            })),
+                        )
+                        cold_fragment_pairs.add((old_index, base_index))
+                # Fragment reconciliation may restore a real boundary. Only
+                # candidates still explicitly cold are metadata-only holds.
+                cold_holds = {
+                    pair for pair in cold_reserved | cold_fragment_pairs
+                    if getattr(rows[pair[1]], "position_authoritative", None) is False
+                }
+                hold_pairs |= cold_holds
                 stable_gate_pairs = {
                     (old_index, new_index)
                     for old_index, new_index in pairs
@@ -409,6 +440,7 @@ class MarkerTracker:
                     (old_index, new_index)
                     for old_index, new_index in pairs
                     if (old_index, new_index) in fixed_pairs
+                    and (old_index, new_index) not in cold_holds
                     and old_index not in proposed_positions
                     and _first_boundary_reseed_eligible(
                         old[old_index], rows[new_index], now,
@@ -464,11 +496,21 @@ class MarkerTracker:
                         # but stale, unbracketed, or order-crossing positioning
                         # evidence must retain the last exact boundary.
                         _hold_track(track, held_positions[track.track_id])
-                        track.estimate = replace(
-                            candidate,
-                            track_id=track.track_id,
-                            operator_code=key[0],
-                        )
+                        if (old_index, new_index) in cold_holds:
+                            track.estimate = replace(
+                                track.estimate,
+                                track_id=track.track_id,
+                                operator_code=key[0],
+                                source_indices=getattr(candidate, "source_indices", track.estimate.source_indices),
+                                source_observations=getattr(candidate, "source_observations", track.estimate.source_observations),
+                                checkpoint_evidence=getattr(candidate, "checkpoint_evidence", track.estimate.checkpoint_evidence),
+                                priority_indices=getattr(candidate, "priority_indices", track.estimate.priority_indices),
+                                exploratory_indices=getattr(candidate, "exploratory_indices", track.estimate.exploratory_indices),
+                                position_authoritative=False,
+                            )
+                        else:
+                            track.estimate = replace(candidate, track_id=track.track_id,
+                                                     operator_code=key[0])
                         track.generation = generation
                         track.last_evidence_at = now
                     else:
@@ -526,8 +568,12 @@ class MarkerTracker:
                         cohort_trusted=id(candidate) not in mixed_candidates,
                         committed_boundary_evidence=_checkpoint_rows(candidate),
                         position_authoritative=(
-                            not bool(getattr(candidate, "unreliable", False))
-                            or _candidate_revision(candidate) is not None
+                            getattr(candidate, "position_authoritative", None)
+                            if getattr(candidate, "position_authoritative", None) is not None
+                            else (
+                                not bool(getattr(candidate, "unreliable", False))
+                                or _candidate_revision(candidate) is not None
+                            )
                         ),
                     ))
                 matched_old = {old_index for old_index, _ in pairs}
@@ -616,6 +662,33 @@ class MarkerTracker:
                         for track in matching_old
                     )
                 ]
+                # A cold all-positive projection has no motion boundary, but
+                # an injective continuation of an established identity may
+                # still refresh its polling metadata.  Keep these separate
+                # from motion candidates so they cannot move or birth tracks.
+                cold_metadata_candidates = []
+                for _candidate_index, candidate in enumerate(rows):
+                    if (getattr(candidate, "bracket", None) is not None
+                            or getattr(candidate, "position_authoritative", None) is not False):
+                        continue
+                    matches = []
+                    candidate_checkpoints = set(_checkpoint_rows(candidate))
+                    for old_index, track in enumerate(old):
+                        old_checkpoints = set(_checkpoint_rows(track.estimate))
+                        cohort = set(_cohort_rows(track))
+                        if (candidate_checkpoints == old_checkpoints
+                                and candidate_checkpoints
+                                or any(_evidence_continues(old_row, new_row)
+                                       for old_row in cohort
+                                       for new_row in candidate_checkpoints)):
+                            matches.append(old_index)
+                    if len(matches) == 1:
+                        cold_metadata_candidates.append((matches[0], candidate))
+                # Require a globally injective identity assignment; two cold
+                # candidates must never spend one survivor's continuity proof.
+                cold_counts = Counter(index for index, _candidate in cold_metadata_candidates)
+                cold_metadata = [item for item in cold_metadata_candidates
+                                 if cold_counts[item[0]] == 1]
                 fixed_pairs, recovery_pairs, movement_pairs = _recovery_plan(
                     matching_old,
                     fresh_rows,
@@ -665,6 +738,18 @@ class MarkerTracker:
                     track.display_bracket = getattr(candidate, "bracket", None)
                     _commit_boundary_evidence(track, candidate)
                     _clear_forward_search(track)
+                for old_index, candidate in cold_metadata:
+                    track = old[old_index]
+                    if old_index in accepted_updates:
+                        continue
+                    track.estimate = replace(
+                        track.estimate,
+                        source_indices=getattr(candidate, "source_indices", track.estimate.source_indices),
+                        source_observations=getattr(candidate, "source_observations", track.estimate.source_observations),
+                        priority_indices=getattr(candidate, "priority_indices", track.estimate.priority_indices),
+                        exploratory_indices=getattr(candidate, "exploratory_indices", track.estimate.exploratory_indices),
+                        position_authoritative=False,
+                    )
                 if partial_birth_index is not None:
                     candidate = rows[partial_birth_index]
                     track_id = self._next_id
@@ -686,8 +771,12 @@ class MarkerTracker:
                         cohort_trusted=False,
                         committed_boundary_evidence=_checkpoint_rows(candidate),
                         position_authoritative=(
-                            not bool(getattr(candidate, "unreliable", False))
-                            or _candidate_revision(candidate) is not None
+                            getattr(candidate, "position_authoritative", None)
+                            if getattr(candidate, "position_authoritative", None) is not None
+                            else (
+                                not bool(getattr(candidate, "unreliable", False))
+                                or _candidate_revision(candidate) is not None
+                            )
                         ),
                     )
                     self._partial_birth_generations[key] = generation
@@ -2578,7 +2667,26 @@ def _next_poll_checkpoints(track, terminal):
         # and terminus find a vehicle which crossed several stops between polls.
         return tuple(dict.fromkeys((frontier[0], representative, sentinel)))
 
+    cold_hints = _physical_indices(
+        getattr(track.estimate, "exploratory_indices", None), terminal
+    )
+    if (getattr(track.estimate, "position_authoritative", None) is False
+            and cold_hints):
+        priority = _physical_indices(
+            getattr(track.estimate, "priority_indices", None), terminal
+        )
+        return tuple(dict.fromkeys((*cold_hints, *priority)))[:3]
+
     bracket = _physical_indices(getattr(track.estimate, "bracket", None), terminal)
+    if not bracket:
+        hints = _physical_indices(
+            getattr(track.estimate, "exploratory_indices", None), terminal
+        )
+        if hints:
+            priority = _physical_indices(
+                getattr(track.estimate, "priority_indices", None), terminal
+            )
+            return tuple(dict.fromkeys((*hints, *priority)))[:3]
     if bracket:
         lower, upper = bracket[0], bracket[-1]
         exploratory = tuple(
@@ -3388,13 +3496,15 @@ def _recovery_plan(old, new, checkpoints, compatible=None):
     return fixed, fixed | movement, movement | safe_exact_motion
 
 
-def _complete_pair_plan(old, new, checkpoints, compatible=None):
-    """Match a complete population without ordering tentative placeholders.
+def _complete_pair_plan(old, new, checkpoints, compatible=None,
+                        identity_compatible=None, reconciled_owners=None):
+    """Reserve unique identities before matching the remaining route order.
 
     Mutually unique checkpoint evidence may retain a never-position-confirmed
     timetable identity after a reliable marker passes its held coordinate.
-    Remove only those proved pairs from the ordered problem; every identity
-    with position authority still uses the ordinary global-order matcher.
+    Explicitly cold candidates have a separate strict identity graph: their
+    projections and forward-search fences are not physical position evidence.
+    Historical authority still constrains the later motion acceptance step.
     """
     exact_edges = {}
     reverse_edges = {index: set() for index in range(len(new))}
@@ -3415,11 +3525,20 @@ def _complete_pair_plan(old, new, checkpoints, compatible=None):
         for old_index, edges in exact_edges.items()
         if len(edges) == 1
         if len(reverse_edges[next(iter(edges))]) == 1
-        if not _position_order_authoritative(
-            old[old_index], new[next(iter(edges))]
-        )
+        if not _position_order_authoritative(old[old_index], new[next(iter(edges))])
     }
-    if not tentative:
+    cold_reserved = _complete_cold_reservations(
+        old, new, identity_compatible, reconciled_owners,
+    )
+    # Preserve the existing tentative assignment, accepting cold reservations
+    # only when their endpoints agree with every tentative reservation.
+    cold_reserved = {
+        pair for pair in cold_reserved
+        if all(pair == other or (pair[0] != other[0] and pair[1] != other[1])
+               for other in tentative)
+    }
+    reserved = tentative | cold_reserved
+    if not reserved:
         fixed, recoveries, movement = _recovery_plan(
             old, new, checkpoints, compatible=compatible
         )
@@ -3430,10 +3549,10 @@ def _complete_pair_plan(old, new, checkpoints, compatible=None):
             recoveries=recoveries,
             fixed=fixed,
         )
-        return fixed, movement, pairs
+        return fixed, movement, pairs, set()
 
-    reserved_old = {old_index for old_index, _new_index in tentative}
-    reserved_new = {new_index for _old_index, new_index in tentative}
+    reserved_old = {old_index for old_index, _new_index in reserved}
+    reserved_new = {new_index for _old_index, new_index in reserved}
     old_indices = [index for index in range(len(old)) if index not in reserved_old]
     new_indices = [index for index in range(len(new)) if index not in reserved_new]
     remaining_old = [old[index] for index in old_indices]
@@ -3459,10 +3578,63 @@ def _complete_pair_plan(old, new, checkpoints, compatible=None):
         fixed=fixed,
     )
     return (
-        remap(fixed) | tentative,
+        remap(fixed) | reserved,
         remap(movement),
-        sorted(remap(ordered) | tentative),
+        sorted(remap(ordered) | reserved),
+        cold_reserved,
     )
+
+
+def _complete_cold_reservations(old, new, identity_compatible=None, reconciled_owners=None):
+    """Prove cold continuity against every trusted owner and current claimant."""
+    current = [_strict_checkpoint_rows(candidate) for candidate in new]
+    # Dropping a malformed competitor would falsely make another claim unique.
+    # Empty ledgers are valid no-evidence rows; malformed ledgers invalidate
+    # this census's cold uniqueness proof, including any certified edges.
+    if any(ledger is None for ledger in current):
+        return set()
+    reconciled_owners = reconciled_owners or {}
+    edges = {}
+    reverse = {index: set() for index in range(len(new))}
+    for old_index, track in enumerate(old):
+        if track.cohort_observed_at > 0:
+            if not track.cohort_trusted:
+                continue
+            owned = _strict_checkpoint_rows(replace(
+                track.estimate, checkpoint_evidence=track.cohort_evidence,
+            ))
+        else:
+            owned = _strict_checkpoint_rows(track.estimate)
+        if owned is None:
+            return set()
+        if not owned:
+            continue
+        edges[old_index] = set()
+        for new_index, candidate in enumerate(new):
+            ledger = current[new_index]
+            if not ledger or (identity_compatible is not None
+                              and not identity_compatible(track, candidate)):
+                continue
+            # Atomic raw-slot reconciliation has already proved full injective
+            # ownership, including legitimate refreshed ETA drift. Keep that
+            # stronger certificate alongside the strict raw exact edges.
+            certified = reconciled_owners.get(id(candidate)) == track.track_id
+            if certified or any(
+                old_stop == new_stop and abs(old_arrival - new_arrival) <= 0.5
+                and new_revision >= old_revision
+                for old_stop, old_arrival, old_revision in owned
+                for new_stop, new_arrival, new_revision in ledger
+            ):
+                edges[old_index].add(new_index)
+                reverse[new_index].add(old_index)
+    return {
+        (old_index, new_index)
+        for old_index, candidates in edges.items()
+        if len(candidates) == 1
+        for new_index in candidates
+        if len(reverse[new_index]) == 1
+        if getattr(new[new_index], "position_authoritative", None) is False
+    }
 
 
 def _forward_hold_pairs(old, new):
@@ -4008,12 +4180,15 @@ def _position_order_authoritative(track, candidate):
     tentative coordinate veto a different identity's fresh boundary. Any
     current or historical position authority preserves the strict order rule.
     """
+    if (track.position_authoritative or track.boundary_revision is not None
+            or track.boundary_observed_at is not None):
+        return True
+    explicit = getattr(track.estimate, "position_authoritative", None)
+    if explicit is False or getattr(candidate, "position_authoritative", None) is False:
+        return False
     return (
-        track.position_authoritative
-        or not bool(getattr(track.estimate, "unreliable", False))
+        not bool(getattr(track.estimate, "unreliable", False))
         or not bool(getattr(candidate, "unreliable", False))
-        or track.boundary_revision is not None
-        or track.boundary_observed_at is not None
     )
 
 

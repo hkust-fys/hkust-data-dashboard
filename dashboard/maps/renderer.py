@@ -1535,6 +1535,14 @@ def _merge_bus_markers(
             x, y = _point_on_left(x, y, estimate.heading, 2.5, metrics)
         # Group by the full label so same-route opposite-destination markers
         # (e.g. 91 Diamond Hill vs 91 Clear Water Bay) stay distinct.
+        # Position uncertainty is a rendering concern: keep it separate from
+        # timetable reliability in the estimate, but use the same pale/dashed
+        # marker treatment at this boundary.  Including the combined state in
+        # the grouping key also prevents an uncertain marker from disappearing
+        # into an authoritative marker at the same pixel.
+        visually_uncertain = bool(getattr(estimate, "unreliable", False)) or (
+            getattr(estimate, "position_authoritative", None) is False
+        )
         projected.append(
             (
                 estimate.operator.value,
@@ -1544,7 +1552,7 @@ def _merge_bus_markers(
                 estimate.operator,
                 estimate.heading,
                 route_supported,
-                bool(getattr(estimate, "unreliable", False)),
+                visually_uncertain,
             )
         )
     for row in sorted(projected):

@@ -16,7 +16,9 @@ from dashboard.maps.tracker import (
     _first_boundary_reseed_context,
     _matching_track,
     _missing_instance,
+    _next_poll_checkpoints,
     _ordered_pairs,
+    _position_order_authoritative,
     _retain_current_checkpoint_capacity,
     _same_generation_actionable,
     _select_valid_partial_transaction,
@@ -28,6 +30,81 @@ from dashboard.providers.route_geometry import RouteLine, Stop
 from dashboard.providers.transit import ProbeEta, ProbeEtaSnapshot, ProbeRouteGeneration
 
 BASE_TIME = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def test_unknown_candidate_cannot_demote_sticky_position_authority():
+    estimate = BusEstimate(
+        label="x", lat=0, lon=0, operator=Operator.KMB, heading=0,
+        position=4.5, boundary_revision=(2, 2),
+        position_authoritative=False,
+    )
+    track = _Track(1, estimate, 4.5, 1, position_authoritative=True,
+                   boundary_revision=(2, 2))
+    unknown = replace(estimate, position_authoritative=False,
+                      boundary_revision=None)
+    assert _position_order_authoritative(track, unknown)
+
+
+@pytest.mark.asyncio
+async def test_same_generation_gmb12_unknown_frontier_holds_track_and_adopts_search_hints():
+    evidence = ((23, BASE_TIME.timestamp(), 1324),
+                (24, (BASE_TIME + timedelta(minutes=2)).timestamp(), 1324))
+    initial = BusEstimate(
+        "12 destination", 22.3, 114.2, Operator.GMB, 0.0,
+        route="12", bound="seq-1", operator_code="GMB", position=4.5,
+        source_observations=frozenset({("probe", 0)}),
+        bracket=(2.0, 7.0), boundary_revision=(1324, 1324),
+        source_indices=frozenset({2, 7}),
+        checkpoint_evidence=evidence, priority_indices=frozenset({23, 24}),
+    )
+    tracker = MarkerTracker()
+    first = await tracker.update(
+        _snapshot(1324, route_key=("GMB", "12", "seq-1")), [initial]
+    )
+    track_id = first[0].track_id
+    cold = replace(
+        initial, position=11.2, bracket=None, boundary_revision=None,
+        position_authoritative=False,
+        source_indices=frozenset({23, 24}),
+        source_observations=frozenset({("probe", 1)}),
+        priority_indices=frozenset({23, 24}),
+        exploratory_indices=frozenset({11, 12}),
+    )
+    result = await tracker.update(
+        _snapshot(1324, route_key=("GMB", "12", "seq-1")), [cold]
+    )
+    assert len(result) == 1
+    assert result[0].track_id == track_id
+    assert result[0].position == pytest.approx(4.5)
+    assert result[0].bracket == (2.0, 7.0)
+    assert result[0].boundary_revision == (1324, 1324)
+    assert result[0].checkpoint_evidence == evidence
+    assert tracker._routes[("GMB", "12", "seq-1")][track_id].committed_boundary_evidence == evidence
+    assert result[0].source_observations == cold.source_observations
+    assert result[0].source_indices == frozenset({23, 24})
+    assert result[0].exploratory_indices == frozenset({11, 12})
+    assert tracker.poll_priorities()[("GMB", "12", "seq-1")] == frozenset({11, 12, 23})
+
+
+def test_no_bracket_poll_prefers_cold_exploratory_hints():
+    estimate = BusEstimate(
+        label="x", lat=0, lon=0, operator=Operator.KMB, heading=0,
+        position=11.4, priority_indices=frozenset({23, 24}),
+        exploratory_indices=frozenset({11, 12}), position_authoritative=False,
+    )
+    track = _Track(1, estimate, 4.5, 1)
+    assert _next_poll_checkpoints(track, 30) == (11, 12, 23)
+
+
+def test_certified_due_frontier_clears_cold_hints_and_restores_bracket_poll():
+    estimate = replace(
+        _candidate(3.4, bracket=(3.0, 8.0), priority_indices=(3, 8),
+                   exploratory_indices=(), boundary_revision=(9, 10),
+                   boundary_age=0),
+        position_authoritative=True,
+    )
+    track = _Track(1, estimate, 3.4, 1)
+    assert _next_poll_checkpoints(track, 30) == (3, 5, 8)
 
 
 def test_matching_view_strips_untrusted_authority_but_preserves_legacy_tracks():
@@ -2783,6 +2860,272 @@ async def test_complete_held_gmb12_candidate_refreshes_identity_and_priorities()
     )
 
 
+def _complete_cold_fixture():
+    first = replace(
+        _candidate(4.5, bracket=(4.0, 5.0), boundary_age=0,
+                   boundary_revision=(20, 20)),
+        position_authoritative=True,
+        source_indices=frozenset({4, 5}),
+        checkpoint_evidence=((23, BASE_TIME.timestamp() + 300, 20),
+                             (24, BASE_TIME.timestamp() + 360, 20)),
+    )
+    second = replace(
+        _candidate(8.0, bracket=(7.0, 9.0), boundary_age=0,
+                   boundary_revision=(20, 20)),
+        position_authoritative=True,
+        source_indices=frozenset({25, 26}),
+        checkpoint_evidence=((25, BASE_TIME.timestamp() + 420, 20),
+                             (26, BASE_TIME.timestamp() + 480, 20)),
+    )
+    cold = replace(
+        first, position=11.2, lat=22.4, lon=114.3,
+        bracket=None, boundary_revision=None, position_authoritative=False,
+        source_indices=frozenset({23, 24}),
+        source_observations=frozenset({("probe", 100), ("probe", 101)}),
+        checkpoint_evidence=tuple((index, arrival, 21)
+                                  for index, arrival, _revision in first.checkpoint_evidence),
+        priority_indices=frozenset({23, 24}),
+        exploratory_indices=frozenset({11, 12}),
+    )
+    return first, second, cold
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse_candidates", [False, True])
+@pytest.mark.parametrize("reverse_insertion", [False, True])
+async def test_complete_cold_crossover_preserves_ids_and_later_certified_motion(
+    reverse_candidates, reverse_insertion,
+):
+    first, second, cold = _complete_cold_fixture()
+    tracker = MarkerTracker()
+    initial = await tracker.update(_snapshot(1), [first, second])
+    first_id, second_id = [marker.track_id for marker in initial]
+    tracks = tracker._routes[("KMB", "R", "out")]
+    original = tracks[first_id]
+    boundary_time = original.boundary_observed_at
+    next_id = tracker._next_id
+    if reverse_insertion:
+        tracker._routes[("KMB", "R", "out")] = dict(reversed(list(tracks.items())))
+    candidates = [cold, second] if reverse_candidates else [second, cold]
+    current = await tracker.update(_snapshot(2), candidates)
+    assert len(current) == 2
+    by_id = {marker.track_id: marker for marker in current}
+    assert set(by_id) == {first_id, second_id}
+    assert tracker._next_id == next_id
+    held = by_id[first_id]
+    assert held.position == pytest.approx(4.5)
+    assert (held.lat, held.lon) == (first.lat, first.lon)
+    assert held.bracket == original.display_bracket == original.motion_bracket == first.bracket
+    assert held.boundary_revision == original.boundary_revision == first.boundary_revision
+    assert original.boundary_observed_at == boundary_time
+    assert original.committed_boundary_evidence == first.checkpoint_evidence
+    assert original.position_authoritative is True
+    assert held.position_authoritative is False
+    for name in ("source_indices", "source_observations", "checkpoint_evidence",
+                 "priority_indices", "exploratory_indices"):
+        assert getattr(held, name) == getattr(cold, name)
+    assert original.cohort_evidence == cold.checkpoint_evidence
+    assert original.cohort_trusted is True
+    assert original.generation == 2
+    assert by_id[second_id].position == pytest.approx(8.0)
+
+    certified = replace(
+        cold, position=5.5, bracket=(5.0, 6.0), boundary_revision=(22, 22),
+        position_authoritative=True, priority_indices=frozenset({5, 6}),
+        exploratory_indices=frozenset(),
+        source_indices=frozenset({5, 6, 23, 24}),
+        source_observations=frozenset({("probe", 200), ("probe", 201)}),
+        checkpoint_evidence=((5, BASE_TIME.timestamp(), 22),
+                             (6, BASE_TIME.timestamp() + 60, 22),
+                             *cold.checkpoint_evidence),
+    )
+    final = await tracker.update(_snapshot(3), [second, certified])
+    assert len(final) == 2
+    by_id = {marker.track_id: marker for marker in final}
+    assert set(by_id) == {first_id, second_id}
+    moved = by_id[first_id]
+    assert moved.position == pytest.approx(5.5)
+    assert moved.bracket == (5.0, 6.0)
+    assert moved.boundary_revision == (22, 22)
+    assert moved.position_authoritative is True
+    assert moved.exploratory_indices == frozenset()
+    assert moved.priority_indices == frozenset({5, 6})
+    assert original.committed_boundary_evidence == certified.checkpoint_evidence
+    assert by_id[second_id].position == pytest.approx(8.0)
+    assert tracker._next_id == next_id
+
+
+@pytest.mark.parametrize("competition", ["cold_claimant", "authoritative_claimant", "shared_owner"])
+def test_complete_cold_reservation_ambiguous_witness_fails_closed(competition):
+    first, _second, cold = _complete_cold_fixture()
+    old = [_Track(1, first, first.position, 1, position_authoritative=True,
+                  cohort_observed_at=BASE_TIME.timestamp(),
+                  cohort_evidence=first.checkpoint_evidence)]
+    candidates = [cold]
+    if competition == "shared_owner":
+        old.append(replace(old[0], track_id=2, position=8.0))
+    else:
+        candidates.append(replace(
+            cold, position=8.0,
+            position_authoritative=competition == "authoritative_claimant",
+        ))
+    assert tracker_module._complete_cold_reservations(old, candidates) == set()
+    assert tracker_module._complete_pair_plan(old, candidates, {})[3] == set()
+
+
+@pytest.mark.parametrize("malformed_competitor", ["candidate", "owner"])
+def test_complete_cold_reservation_malformed_competitor_cannot_create_uniqueness(
+    malformed_competitor,
+):
+    first, _second, cold = _complete_cold_fixture()
+    old = [_Track(1, first, first.position, 1, position_authoritative=True,
+                  cohort_observed_at=BASE_TIME.timestamp(),
+                  cohort_evidence=first.checkpoint_evidence)]
+    candidates = [cold]
+    if malformed_competitor == "candidate":
+        candidates.append(replace(cold))
+    else:
+        old.append(replace(old[0], track_id=2))
+    assert tracker_module._complete_cold_reservations(old, candidates) == set()
+    malformed = ((True, 100.0, 21),)
+    if malformed_competitor == "candidate":
+        candidates[1] = replace(cold, checkpoint_evidence=cold.checkpoint_evidence + malformed)
+    else:
+        old[1] = replace(old[1], cohort_evidence=first.checkpoint_evidence + malformed)
+    assert tracker_module._complete_cold_reservations(old, candidates) == set()
+
+
+def test_complete_cold_reservation_counts_raw_and_certified_competitors_together():
+    first, _second, cold = _complete_cold_fixture()
+    old = [_Track(1, first, first.position, 1, position_authoritative=True)]
+    certified = replace(cold, checkpoint_evidence=tuple(
+        (index, arrival + 10, revision)
+        for index, arrival, revision in cold.checkpoint_evidence
+    ))
+    assert tracker_module._complete_cold_reservations(
+        old, [certified], reconciled_owners={id(certified): 1},
+    ) == {(0, 0)}
+    assert tracker_module._complete_cold_reservations(
+        old, [certified, cold], reconciled_owners={id(certified): 1},
+    ) == set()
+
+
+@pytest.mark.asyncio
+async def test_complete_cold_crossover_retains_atomic_reconciliation_with_arrival_drift():
+    tracker = MarkerTracker()
+    rows = tuple(_fresh_probe_row(
+        index, BASE_TIME + timedelta(seconds=seconds), 20, BASE_TIME,
+    ) for index, seconds in ((23, 300), (24, 360), (25, 420), (26, 480)))
+    first = replace(_candidate_from_rows(4.5, (4.0, 5.0), (20, 20), rows, (0, 1)),
+                    position_authoritative=True)
+    second = replace(_candidate_from_rows(8.0, (7.0, 9.0), (20, 20), rows, (2, 3)),
+                     position_authoritative=True)
+    initial = await tracker.update(_snapshot(1, rows), [first, second])
+    first_id, second_id = [marker.track_id for marker in initial]
+    next_id = tracker._next_id
+    now = BASE_TIME + timedelta(seconds=30)
+    current_rows = tuple(_fresh_probe_row(
+        row.index, row.arrival_at + timedelta(seconds=10 if row.index < 25 else 0),
+        21, now,
+    ) for row in rows)
+    cold = replace(
+        _candidate_from_rows(11.2, None, None, current_rows, (0, 1)),
+        position_authoritative=False, priority_indices=frozenset({23, 24}),
+        exploratory_indices=frozenset({11, 12}),
+    )
+    current_second = replace(
+        _candidate_from_rows(8.0, (7.0, 9.0), (21, 21), current_rows, (2, 3)),
+        position_authoritative=True,
+    )
+    tracks = list(tracker._routes[("KMB", "R", "out")].values())
+    candidates, certificates = tracker_module._reconcile_complete_probe_ownership(
+        tracks, [current_second, cold], now.timestamp(), current_rows, (),
+    )
+    assert certificates == {id(cold): first_id, id(current_second): second_id}
+    assert tracker_module._complete_cold_reservations(tracks, candidates) == set()
+    result = await tracker.update(_snapshot(2, current_rows, collected_at=now), candidates)
+    assert len(result) == 2
+    by_id = {marker.track_id: marker for marker in result}
+    assert set(by_id) == {first_id, second_id}
+    assert tracker._next_id == next_id
+    held = by_id[first_id]
+    assert held.position == pytest.approx(4.5)
+    assert held.bracket == first.bracket
+    assert held.boundary_revision == first.boundary_revision
+    assert held.checkpoint_evidence == cold.checkpoint_evidence
+    assert held.source_observations == cold.source_observations
+    assert held.exploratory_indices == cold.exploratory_indices
+    assert held.position_authoritative is False
+    assert tracks[0].committed_boundary_evidence == first.checkpoint_evidence
+    assert tracks[0].cohort_evidence == cold.checkpoint_evidence
+    assert by_id[second_id].position == pytest.approx(8.0)
+
+
+@pytest.mark.parametrize("ledger", [
+    ((True, 100.0, 20),), ((23, "100", 20),), ((23, float("nan"), 20),),
+    ((23, 100.0, True),), ((23, 100.0, "20"),), ((23, 100.0, 20, 1),),
+    [(23, 100.0, 20)],
+])
+@pytest.mark.parametrize("malformed_old", [False, True])
+def test_complete_cold_reservation_rejects_malformed_ledgers(ledger, malformed_old):
+    first, _second, cold = _complete_cold_fixture()
+    valid = ((23, 100.0, 20),)
+    track = _Track(
+        1, first, first.position, 1, position_authoritative=True,
+        cohort_observed_at=BASE_TIME.timestamp(),
+        cohort_evidence=ledger if malformed_old else valid,
+    )
+    candidate = replace(cold, checkpoint_evidence=valid if malformed_old else ledger)
+    assert tracker_module._complete_cold_reservations([track], [candidate]) == set()
+
+
+@pytest.mark.parametrize("revision,drift,expected", [(19, 0, False), (20, 0.5, True),
+                                                    (21, 0.51, False)])
+def test_complete_cold_reservation_requires_exact_nonregressing_witness(revision, drift, expected):
+    first, _second, cold = _complete_cold_fixture()
+    track = _Track(1, first, first.position, 1, position_authoritative=True)
+    candidate = replace(cold, checkpoint_evidence=tuple(
+        (index, arrival + drift, revision)
+        for index, arrival, _revision in first.checkpoint_evidence
+    ))
+    assert bool(tracker_module._complete_cold_reservations([track], [candidate])) is expected
+
+
+@pytest.mark.asyncio
+async def test_complete_cold_hold_remains_authoritative_order_barrier():
+    first, second, cold = _complete_cold_fixture()
+    second = replace(second, position=6.0, bracket=(5.0, 7.0))
+    tracker = MarkerTracker()
+    initial = await tracker.update(_snapshot(1), [first, second])
+    crossing = replace(second, position=3.5, bracket=(3.0, 4.0), boundary_revision=(21, 21))
+    moving_track = tracker._routes[("KMB", "R", "out")][initial[1].track_id]
+    assert tracker_module._paired_position(moving_track, crossing, False) == 3.5
+    current = await tracker.update(_snapshot(2), [crossing, cold])
+    assert [marker.track_id for marker in current] == [marker.track_id for marker in initial]
+    assert [marker.position for marker in current] == pytest.approx([4.5, 6.0])
+    held = tracker._routes[("KMB", "R", "out")][initial[0].track_id]
+    assert held.position_authoritative is True
+    assert held.estimate.position_authoritative is False
+
+
+@pytest.mark.asyncio
+async def test_complete_exact_cold_continuation_behind_forward_after_retains_id():
+    first, _second, cold = _complete_cold_fixture()
+    tracker = MarkerTracker()
+    initial = await tracker.update(_snapshot(1), [first])
+    held = tracker._routes[("KMB", "R", "out")][initial[0].track_id]
+    held.forward_after = 15
+    held.forward_frontier = (16, 17)
+    held.forward_started_revision = 20
+    current = await tracker.update(_snapshot(2), [cold])
+    assert len(current) == 1
+    assert current[0].track_id == initial[0].track_id
+    assert current[0].position == pytest.approx(4.5)
+    assert current[0].checkpoint_evidence == cold.checkpoint_evidence
+    assert held.forward_after == 15
+    assert held.forward_frontier == (16, 17)
+
+
 @pytest.mark.asyncio
 async def test_complete_gate_continuation_uses_physical_identity_across_revisions():
     tracker = MarkerTracker()
@@ -2996,6 +3339,133 @@ async def test_complete_91m_split_terminal_reuses_retained_cohort_owner():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_all_positive_cold_fragment_union_holds_and_conserves_current_metadata(reverse):
+    tracker = MarkerTracker()
+    line = _geometry_line(stops=10)
+    route_key = ("KMB", "R", "out")
+    initial_rows = [_fresh_probe_row(
+        index, BASE_TIME + timedelta(minutes=offset), 10, BASE_TIME,
+    ) for index, offset in ((4, -1 / 3), (6, 1 / 3), (8, 1.0), (9, 7 / 6))]
+    candidates = estimate_bus_positions(
+        initial_rows, [line],
+        observed_checkpoint_indices={route_key: {0, 4, 6, 8, 9}},
+    )
+    assert len(candidates) == 1
+    assert candidates[0].position == pytest.approx(5.0)
+    assert candidates[0].bracket == (4.0, 6.0)
+    initial = await tracker.update(_snapshot(1, initial_rows), candidates, [line])
+    track = tracker._routes[route_key][initial[0].track_id]
+    committed = track.committed_boundary_evidence
+    boundary_time = track.boundary_observed_at
+    next_id = tracker._next_id
+    now = BASE_TIME + timedelta(seconds=30)
+    current_rows = [_fresh_probe_row(
+        index, now + timedelta(minutes=offset), 11, now,
+    ) for index, offset in ((4, 0.2), (8, 0.7), (9, 0.8))]
+    if reverse:
+        current_rows.reverse()
+    split = estimate_bus_positions(
+        current_rows, [line], observed_checkpoint_indices={route_key: {4, 8, 9}},
+    )
+    assert [candidate.position for candidate in split] == pytest.approx([3.9, 8.6])
+    assert all(candidate.position_authoritative is False for candidate in split)
+    sources = Counter(source for candidate in split for source in candidate.source_observations)
+    checkpoints = Counter(row for candidate in split for row in candidate.checkpoint_evidence)
+    priorities = frozenset().union(*(candidate.priority_indices for candidate in split))
+    exploratory = frozenset().union(*(candidate.exploratory_indices for candidate in split))
+    if reverse:
+        split.reverse()
+    current = await tracker.update(_snapshot(2, current_rows, collected_at=now), split, [line])
+    assert len(current) == 1
+    held = current[0]
+    assert held.track_id == initial[0].track_id
+    assert tracker._next_id == next_id
+    assert held.position == pytest.approx(5.0)
+    assert held.bracket == initial[0].bracket
+    assert held.boundary_revision == initial[0].boundary_revision
+    assert held.position_authoritative is False
+    assert track.position_authoritative is True
+    assert track.boundary_observed_at == boundary_time
+    assert track.committed_boundary_evidence == committed
+    assert held.source_indices == frozenset({4, 8, 9})
+    assert Counter(held.source_observations) == sources
+    assert Counter(held.checkpoint_evidence) == checkpoints
+    assert Counter(track.cohort_evidence) == checkpoints
+    assert held.priority_indices == priorities
+    assert held.exploratory_indices == exploratory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_authoritative_base_with_cold_fragment_holds_failed_union(reverse):
+    tracker = MarkerTracker()
+    line = _geometry_line(stops=10)
+    route_key = ("KMB", "R", "out")
+    initial_rows = [_fresh_probe_row(
+        index, BASE_TIME + timedelta(minutes=offset), 10, BASE_TIME,
+    ) for index, offset in ((4, -0.7), (6, -0.5), (8, 1 / 6), (9, 4 / 15))]
+    candidates = estimate_bus_positions(
+        initial_rows, [line],
+        observed_checkpoint_indices={route_key: {4, 6, 8, 9}},
+    )
+    assert len(candidates) == 1
+    assert candidates[0].position == pytest.approx(7.5)
+    initial = await tracker.update(_snapshot(1, initial_rows), candidates, [line])
+    track = tracker._routes[route_key][initial[0].track_id]
+    committed = track.committed_boundary_evidence
+    boundary_time = track.boundary_observed_at
+    next_id = tracker._next_id
+    now = BASE_TIME + timedelta(seconds=30)
+    current_rows = [_fresh_probe_row(
+        index, now + timedelta(minutes=offset), 11, now,
+    ) for index, offset in ((4, 0.2), (8, 0.7), (9, 0.8))]
+    current_rows.insert(1, ProbeEta(
+        "KMB", "R", "out", "s6", 6, None,
+        cache_age_seconds=0.0, refresh_generation=11,
+    ))
+    if reverse:
+        current_rows.reverse()
+    split = estimate_bus_positions(
+        current_rows, [line],
+        observed_checkpoint_indices={route_key: {4, 6, 8, 9}},
+    )
+    assert [candidate.position for candidate in split] == pytest.approx([3.9, 7.65])
+    fragment, base = split
+    assert fragment.position_authoritative is False
+    assert _position_order_authoritative(track, base)
+    assert base.bracket == (6.0, 8.0)
+    # The union's first present stop is 4, whose upstream frontier is unknown.
+    assert tracker_module.rebuild_estimate_from_probe_fragments(
+        base, [fragment], current_rows, [line],
+    ) is base
+    sources = Counter(source for candidate in split for source in candidate.source_observations)
+    checkpoints = Counter(row for candidate in split for row in candidate.checkpoint_evidence)
+    priorities = frozenset().union(*(candidate.priority_indices for candidate in split))
+    exploratory = frozenset().union(*(candidate.exploratory_indices for candidate in split))
+    if reverse:
+        split.reverse()
+    current = await tracker.update(_snapshot(2, current_rows, collected_at=now), split, [line])
+    assert len(current) == 1
+    held = current[0]
+    assert held.track_id == initial[0].track_id
+    assert tracker._next_id == next_id
+    assert held.position == pytest.approx(7.5)
+    assert held.bracket == initial[0].bracket
+    assert held.boundary_revision == initial[0].boundary_revision
+    assert held.position_authoritative is False
+    assert track.position_authoritative is True
+    assert track.boundary_observed_at == boundary_time
+    assert track.committed_boundary_evidence == committed
+    assert held.source_indices == frozenset({4, 8, 9})
+    assert Counter(held.source_observations) == sources
+    assert Counter(held.checkpoint_evidence) == checkpoints
+    assert Counter(track.cohort_evidence) == checkpoints
+    assert held.priority_indices == priorities
+    assert held.exploratory_indices == exploratory
+
+
+@pytest.mark.asyncio
 async def test_all_positive_fragment_union_moves_to_first_present_boundary():
     """A split all-positive ladder rejoins at its upstream physical boundary."""
     tracker = MarkerTracker()
@@ -3048,7 +3518,7 @@ async def test_all_positive_fragment_union_moves_to_first_present_boundary():
         [line],
         observed_checkpoint_indices={route_key: {0, 4, 8, 9}},
     )
-    assert [candidate.position for candidate in split] == pytest.approx([3.9, 7.65])
+    assert [candidate.position for candidate in split] == pytest.approx([3.9, 8.6])
 
     current = await tracker.update(
         _snapshot(2, current_rows, collected_at=collected_at),

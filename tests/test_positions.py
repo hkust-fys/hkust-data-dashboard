@@ -3,6 +3,7 @@
 from collections import Counter
 from copy import copy
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ from dashboard.maps.positions import (
     _plan_gate_associations,
     _quantize_position,
     _separate_common_stop_departures,
+    classify_checkpoint,
     estimate_bus_positions,
     rebuild_estimate_from_probe_fragments,
     rebuild_estimate_from_probe_sources,
@@ -25,6 +27,69 @@ from dashboard.maps.positions import (
 from dashboard.models import EtaKind, Operator
 from dashboard.providers.route_geometry import RouteLine, Stop
 from dashboard.providers.transit import ProbeEtaSnapshot, ProbeRouteGeneration
+
+
+def test_checkpoint_classifier_three_state_matrix():
+    arrival = datetime(2026, 1, 1, tzinfo=UTC)
+    downstream = SimpleNamespace(
+        arrival_at=arrival, minutes=2, kind=EtaKind.REALTIME,
+        cache_age_seconds=2, refresh_generation=8,
+    )
+    empty = SimpleNamespace(index=21, minutes=None, kind=EtaKind.REALTIME,
+                            cache_age_seconds=2, refresh_generation=7)
+    assert classify_checkpoint(21, [empty], {21}, [downstream]) == "present"
+    assert classify_checkpoint(21, [empty], (), [downstream]) == "certified absent"
+    unavailable = SimpleNamespace(**{**empty.__dict__, "kind": EtaKind.UNAVAILABLE})
+    assert classify_checkpoint(21, [unavailable], (), [downstream]) == "unknown"
+    later = SimpleNamespace(index=21, minutes=4, kind=EtaKind.REALTIME,
+                            arrival_at=arrival + timedelta(minutes=5),
+                            cache_age_seconds=2, refresh_generation=7)
+    assert classify_checkpoint(21, [later], (), [downstream]) == "certified absent"
+    saturated = [SimpleNamespace(**{**later.__dict__, "refresh_generation": i})
+                 for i in (7, 8, 9)]
+    assert classify_checkpoint(21, saturated, (), [downstream]) == "unknown"
+    assert classify_checkpoint(21, [SimpleNamespace(**{**later.__dict__, "cache_age_seconds": None})], (), [downstream]) == "unknown"
+    assert classify_checkpoint(21, [SimpleNamespace(**{**later.__dict__, "refresh_generation": 0})], (), [downstream]) == "unknown"
+    assert classify_checkpoint(21, [SimpleNamespace(**{**later.__dict__, "cache_age_seconds": True})], (), [downstream]) == "unknown"
+    assert classify_checkpoint(21, [SimpleNamespace(**{**later.__dict__, "refresh_generation": True})], (), [downstream]) == "unknown"
+    assert classify_checkpoint(21, [SimpleNamespace(**{**later.__dict__, "cache_age_seconds": 60})], (), [downstream]) == "unknown"
+    assert classify_checkpoint(21, [later], (), [SimpleNamespace(**{**downstream.__dict__, "cache_age_seconds": 60})]) == "unknown"
+    tied = SimpleNamespace(**{**later.__dict__, "arrival_at": arrival + timedelta(seconds=180)})
+    assert classify_checkpoint(21, [tied], (), [downstream]) == "unknown"
+    assert classify_checkpoint(21, [SimpleNamespace(**{**later.__dict__, "arrival_at": arrival + timedelta(seconds=179)})], (), [downstream]) == "unknown"
+    mixed = [later, SimpleNamespace(**{**later.__dict__, "minutes": None})]
+    assert classify_checkpoint(21, mixed, (), [downstream]) == "unknown"
+    later_two = SimpleNamespace(**{**later.__dict__, "arrival_at": arrival + timedelta(minutes=6),
+                                   "refresh_generation": 7})
+    assert classify_checkpoint(21, [later, later_two], (), [downstream]) == "certified absent"
+    assert classify_checkpoint(21, [later_two, later], (), [downstream]) == "certified absent"
+    mixed_revision = SimpleNamespace(**{**later.__dict__, "refresh_generation": 8})
+    assert classify_checkpoint(21, [later, mixed_revision], (), [downstream]) == "unknown"
+    for bad_age in (float("nan"), float("inf")):
+        bad_downstream = SimpleNamespace(**{**downstream.__dict__, "cache_age_seconds": bad_age})
+        assert classify_checkpoint(21, [empty], (), [bad_downstream]) == "unknown"
+
+
+def test_rebuild_probe_sources_clears_stale_position_metadata_on_cold_fallback():
+    line = _line(stop_count=10)
+    row = Probe("KMB", "X", "outbound", 8, 2, cache_age_seconds=0,
+                refresh_generation=9,
+                arrival_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=16))
+    template = BusEstimate(
+        "X destination", 22.3, 114.2, Operator.KMB, 0.0,
+        route="X", bound="outbound", operator_code="KMB", position=1.5,
+        bracket=(1.0, 2.0), eta_minutes=1, bracket_initial_eta=1,
+        bracket_eta_offsets=(-1, 1), boundary_age_seconds=4,
+        boundary_revision=(3, 4), priority_indices=frozenset({1, 2}),
+    )
+    rebuilt = rebuild_estimate_from_probe_sources(template, (0,), [row], [line])
+    assert rebuilt is not None
+    assert rebuilt.position == pytest.approx(7)
+    assert rebuilt.bracket is None
+    assert rebuilt.eta_minutes is None
+    assert rebuilt.boundary_revision is None
+    assert rebuilt.priority_indices == frozenset({8})
+    assert rebuilt.exploratory_indices == frozenset({7})
 
 
 class Probe:
@@ -1914,7 +1979,7 @@ def test_verified_gate_probe_leaves_unmatched_passed_vehicle_separate():
         verified_gate_indices={key: 7},
     )
 
-    assert sorted(estimate.position for estimate in estimates) == [6.0, 17.0]
+    assert sorted(estimate.position for estimate in estimates) == [2.0, 17.0]
     assert {estimate.source_observations for estimate in estimates} == {
         frozenset({("probe", 1)}),
         frozenset({("probe", 2)}),
@@ -1965,8 +2030,8 @@ def test_live_terminal_singleton_prioritizes_eta_implied_interior_stops():
         if estimate.source_observations == {("probe", 2)}
     )
     # Search hints do not turn the heuristic projection into motion evidence.
-    assert live.position == 17.0
-    assert live.bracket == (9.0, 18.0)
+    assert live.position == pytest.approx(15.063)
+    assert live.bracket is None
     assert live.priority_indices == frozenset({18})
     assert live.exploratory_indices == frozenset({15, 16})
 
@@ -2124,8 +2189,10 @@ def test_negative_gate_probe_cannot_make_filtered_rows_position_evidence():
     )
 
     assert len(estimates) == 1
-    assert estimates[0].position == 17.0
-    assert estimates[0].bracket == (9.0, 18.0)
+    assert estimates[0].position == pytest.approx(4.0)
+    assert estimates[0].bracket is None
+    assert estimates[0].position_authoritative is False
+    assert estimates[0].exploratory_indices == frozenset({4})
     assert estimates[0].source_observations == {("probe", 3)}
 
 
@@ -3798,8 +3865,9 @@ def test_heading_follows_travel_direction():
 def test_all_stop_boundary_controls_proportion_and_ignores_unrelated_cache_age():
     line = _line(stop_count=7)
     rows = [
-        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=1),
-        Probe("KMB", "X", "outbound", 3, 1, cache_age_seconds=1),
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=1, refresh_generation=1),
+        Probe("KMB", "X", "outbound", 3, 1, cache_age_seconds=1, refresh_generation=2,
+              arrival_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=6)),
         # A stale downstream rung may help identify the same ETA ladder, but
         # it is not one of the two physical boundary observations.
         Probe("KMB", "X", "outbound", 4, 3, cache_age_seconds=120),
@@ -3822,17 +3890,20 @@ def test_all_stop_boundary_controls_proportion_and_ignores_unrelated_cache_age()
 def test_boundary_revision_includes_empty_lower_endpoint():
     line = _line(stop_count=7)
     rows = [
-        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=38,
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=9.0,
               refresh_generation=101),
         Probe("KMB", "X", "outbound", 3, 1, cache_age_seconds=8.4,
-              refresh_generation=102),
+              refresh_generation=102,
+              arrival_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=6)),
     ]
     estimates = estimate_bus_positions(
         rows, [line],
         observed_checkpoint_indices={("KMB", "X", "outbound"): range(7)},
     )
     assert len(estimates) == 1
+    assert estimates[0].bracket == (2.0, 3.0)
     assert estimates[0].boundary_revision == (101, 102)
+    assert estimates[0].position_authoritative is not False
 
 
 def test_priority_indices_cover_full_zero_plateau_and_next_positive_stop():
@@ -3891,12 +3962,14 @@ def test_consecutive_empty_stops_then_downstream_observation_forms_one_boundary_
     line = _line(stop_count=7)
     rows = [
         # Several consecutive checkpoints see zero instances of this vehicle.
-        Probe("KMB", "X", "outbound", 1, None, cache_age_seconds=0),
-        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0),
-        Probe("KMB", "X", "outbound", 3, None, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 1, None, cache_age_seconds=0, refresh_generation=1),
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0, refresh_generation=1),
+        Probe("KMB", "X", "outbound", 3, None, cache_age_seconds=0, refresh_generation=1),
         # Stop 4 first sees it; stop 5 corroborates the same ETA ladder.
-        Probe("KMB", "X", "outbound", 4, 1, cache_age_seconds=0),
-        Probe("KMB", "X", "outbound", 5, 3, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 4, 1, cache_age_seconds=0, refresh_generation=2,
+              arrival_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=8)),
+        Probe("KMB", "X", "outbound", 5, 3, cache_age_seconds=0, refresh_generation=2,
+              arrival_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=10)),
     ]
 
     estimates = estimate_bus_positions(
@@ -3915,11 +3988,11 @@ def test_consecutive_empty_stops_then_downstream_observation_forms_one_boundary_
 def test_staggered_immutable_minutes_are_normalized_only_for_identity_matching():
     line = _line(stop_count=7)
     rows = [
-        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0, refresh_generation=1),
         # As fetched six minutes ago this source implied position -1.  On the
         # common identity clock it aligns with the fresh downstream rung at 2.
-        Probe("KMB", "X", "outbound", 3, 8, cache_age_seconds=360),
-        Probe("KMB", "X", "outbound", 4, 4, cache_age_seconds=0),
+        Probe("KMB", "X", "outbound", 3, 8, cache_age_seconds=360, refresh_generation=2),
+        Probe("KMB", "X", "outbound", 4, 4, cache_age_seconds=0, refresh_generation=3),
     ]
     estimates = estimate_bus_positions(
         rows,
@@ -3928,10 +4001,10 @@ def test_staggered_immutable_minutes_are_normalized_only_for_identity_matching()
     )
     assert len(estimates) == 1
     assert estimates[0].source_indices == frozenset({3, 4})
-    assert estimates[0].bracket == (2.0, 3.0)
+    assert estimates[0].bracket is None
     # The stale source value itself is unchanged; its age was not converted
     # into displayed motion.
-    assert estimates[0].eta_minutes == 8
+    assert estimates[0].eta_minutes is None
     assert estimates[0].position == 2.0
 
 
@@ -3950,11 +4023,15 @@ def test_partial_observation_without_upstream_absence_has_no_bracket():
 def test_rebuild_positive_union_uses_upstream_empty_checkpoint():
     line = _line(stop_count=10)
     rows = [
-        Probe("KMB", "X", "outbound", 0, None, refresh_generation=11),
-        Probe("KMB", "X", "outbound", 4, 0.2, refresh_generation=11),
-        Probe("KMB", "X", "outbound", 6, None, refresh_generation=11),
-        Probe("KMB", "X", "outbound", 8, 0.7, refresh_generation=11),
-        Probe("KMB", "X", "outbound", 9, 0.8, refresh_generation=11),
+        Probe("KMB", "X", "outbound", 0, None, cache_age_seconds=0, refresh_generation=11),
+        Probe("KMB", "X", "outbound", 4, 0.2, cache_age_seconds=0,
+              refresh_generation=11,
+              arrival_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=8)),
+        Probe("KMB", "X", "outbound", 6, None, cache_age_seconds=0, refresh_generation=11),
+        Probe("KMB", "X", "outbound", 8, 0.7, cache_age_seconds=0, refresh_generation=11,
+              arrival_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=16)),
+        Probe("KMB", "X", "outbound", 9, 0.8, cache_age_seconds=0, refresh_generation=11,
+              arrival_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=18)),
     ]
     base = BusEstimate(
         "X destination", 22.3, 114.2, Operator.KMB, 0.0,
@@ -3977,7 +4054,7 @@ def test_rebuild_positive_union_uses_upstream_empty_checkpoint():
     assert rebuilt.boundary_revision == (11, 11)
 
 
-def test_rebuild_positive_union_accepts_unrelated_upstream_eta_checkpoint():
+def test_rebuild_positive_union_rejects_unrelated_upstream_eta_checkpoint():
     line = _line(stop_count=8)
     rows = [
         Probe("KMB", "X", "outbound", 2, 5.0, refresh_generation=12),
@@ -3989,9 +4066,10 @@ def test_rebuild_positive_union_accepts_unrelated_upstream_eta_checkpoint():
         source_observations=frozenset({("probe", 1)}),
     )
     rebuilt = rebuild_estimate_from_probe_fragments(base, (), rows, [line])
-    assert rebuilt.bracket == (2.0, 4.0)
-    assert rebuilt.position == pytest.approx(3.9)
-    assert rebuilt.boundary_revision == (12, 12)
+    assert rebuilt.bracket is None
+    assert rebuilt.position_authoritative is None
+    assert rebuilt.position is None
+    assert rebuilt.boundary_revision is None
 
 
 def test_rebuild_due_only_union_is_a_point_boundary():

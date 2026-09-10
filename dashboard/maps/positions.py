@@ -98,6 +98,9 @@ class BusEstimate:
     # are (stop index, absolute arrival timestamp, refresh revision); unlike
     # source row offsets they survive staggered probe input rebuilding.
     checkpoint_evidence: tuple[tuple[int, float, int], ...] = ()
+    # Explicitly false only for a cold all-positive projection whose upstream
+    # frontier is unknown. None preserves legacy gate/reliable semantics.
+    position_authoritative: bool | None = None
 
     @property
     def bracket_lower(self):
@@ -106,6 +109,114 @@ class BusEstimate:
     @property
     def bracket_upper(self):
         return self.bracket[1] if self.bracket else None
+
+
+def classify_checkpoint(index, route_rows, owned_indices=(), downstream_rows=()):
+    """Classify one observed checkpoint without conflating missing evidence.
+
+    ``present`` is owned by the candidate.  An explicit empty response is a
+    certified absence; a non-empty response is certified only when it is a
+    small, fresh, temporally coherent response strictly after the candidate's
+    downstream arrival.  Everything else is deliberately unknown.
+    """
+    if index in set(owned_indices):
+        return "present"
+    rows = [row for row in route_rows
+            if getattr(row, "index", None) == index]
+    if not rows:
+        return "unknown"
+    if not downstream_rows:
+        return "unknown"
+    try:
+        downstream_ages = []
+        for row in downstream_rows:
+            if (getattr(row, "minutes", None) is None
+                    or isinstance(row.minutes, bool)
+                    or not math.isfinite(float(row.minutes))
+                    or isinstance(row.cache_age_seconds, bool)
+                    or isinstance(row.refresh_generation, bool)
+                    or not math.isfinite(float(row.cache_age_seconds))
+                    or float(row.cache_age_seconds) < 0
+                    or float(row.cache_age_seconds) >= 60
+                    or int(row.refresh_generation) <= 0
+                    or row.arrival_at is None):
+                return "unknown"
+            if (getattr(row, "kind", None) not in {
+                    EtaKind.REALTIME, EtaKind.SCHEDULED,
+                    EtaKind.MOVING_SLOWLY, EtaKind.DELAYED,
+            } or not isinstance(row.refresh_generation, int)):
+                return "unknown"
+            if not math.isfinite(float(row.arrival_at.timestamp())):
+                return "unknown"
+            downstream_ages.append(float(row.cache_age_seconds))
+        if len({row.refresh_generation for row in downstream_rows}) != 1:
+            return "unknown"
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return "unknown"
+    if all(getattr(row, "minutes", None) is None for row in rows):
+        if (len(rows) != 1 or getattr(rows[0], "kind", None) is not EtaKind.REALTIME):
+            return "unknown"
+        try:
+            if any(isinstance(row.cache_age_seconds, bool)
+                   or isinstance(row.refresh_generation, bool) for row in rows):
+                return "unknown"
+            ages = [float(row.cache_age_seconds) for row in rows]
+            revisions = [row.refresh_generation for row in rows]
+            if (not ages or any(not math.isfinite(age) or age < 0 or age >= 60
+                                for age in ages)
+                    or any(not isinstance(revision, int) or revision <= 0 for revision in revisions)
+                    or any(age > max(downstream_ages) + 5 for age in ages)):
+                return "unknown"
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return "unknown"
+        return "certified absent"
+    if len(rows) >= 3:
+        return "unknown"
+    try:
+        downstream_arrivals = [row.arrival_at.timestamp()
+                               for row in downstream_rows
+                               if row.arrival_at is not None]
+        if not downstream_arrivals:
+            return "unknown"
+        down = max(downstream_arrivals)
+        down_age = max(float(row.cache_age_seconds)
+                       for row in downstream_rows)
+        arrivals = []
+        revisions = set()
+        for row in rows:
+            if (row.minutes is None or isinstance(row.minutes, bool)
+                    or not math.isfinite(float(row.minutes))
+                    or row.arrival_at is None):
+                return "unknown"
+            if getattr(row, "kind", None) not in {
+                    EtaKind.REALTIME, EtaKind.SCHEDULED,
+                    EtaKind.MOVING_SLOWLY, EtaKind.DELAYED,
+            }:
+                return "unknown"
+            if (isinstance(row.cache_age_seconds, bool)
+                    or isinstance(row.refresh_generation, bool)):
+                return "unknown"
+            age = float(row.cache_age_seconds)
+            revision = row.refresh_generation
+            revisions.add(revision)
+            arrival = float(row.arrival_at.timestamp())
+            if (not math.isfinite(age) or age < 0 or age >= 60
+                    or age > down_age + 5
+                    or not isinstance(revision, int) or revision <= 0):
+                return "unknown"
+            if (not math.isfinite(arrival)
+                    or arrival <= down + CHECKPOINT_ARRIVAL_SKEW_SECONDS):
+                return "unknown"
+            arrivals.append(arrival)
+        if (not math.isfinite(down_age) or down_age < 0 or down_age >= 60
+                or any(int(row.refresh_generation) <= 0
+                       for row in downstream_rows)):
+            return "unknown"
+        if len(revisions) != 1:
+            return "unknown"
+        return "certified absent" if arrivals else "unknown"
+    except (AttributeError, TypeError, ValueError, OverflowError, OSError):
+        return "unknown"
 
 
 def _checkpoint_evidence(rows):
@@ -131,6 +242,7 @@ TERMINUS_DEPARTURE_GRACE_MINUTES = 0.5
 GATE_DOWNSTREAM_DRIFT_MINUTES = 15.0
 GATE_UPSTREAM_DRIFT_MINUTES = 25.0
 GATE_PASSAGE_SKEW_MINUTES = 3.0
+CHECKPOINT_ARRIVAL_SKEW_SECONDS = GATE_PASSAGE_SKEW_MINUTES * 60.0
 PROBE_FRESHNESS_MARGIN_SECONDS = 5.0
 STALE_SINGLETON_MATCH_TOLERANCE_MINUTES = 2.0
 PROVISIONAL_GATE_PROBE_FRESHNESS_SECONDS = 60.0
@@ -2502,20 +2614,51 @@ def estimate_bus_positions(
             priority_indices = frozenset()
             exploratory_indices = frozenset()
             checkpoint_evidence = ()
+            position_authoritative = None
             observed = observed_by_route.get((operator_name, route, bound))
             if observed is not None and provenance:
-                first_present = min(provenance)
-                if first_present == 0:
-                    bracket = (0.0, 0.0)
-                else:
-                    absent = [index for index in observed
-                              if index < first_present and index not in provenance]
-                    if absent:
-                        bracket = (float(max(absent)), float(first_present))
                 source_rows = [probe_inputs[index] for kind, index in source_observations
                                if str(kind).lower() == "probe"
                                and 0 <= index < len(probe_inputs)]
                 source_rows = [row for row in source_rows if getattr(row, "minutes", None) is not None]
+                first_present = min(provenance)
+                if first_present == 0:
+                    bracket = (0.0, 0.0)
+                else:
+                    route_rows = [row for row in probe_inputs
+                                  if (str(getattr(row, "operator", "")),
+                                      str(getattr(row, "route", "")),
+                                      str(getattr(row, "bound", "")))
+                                  == (operator_name, route, bound)]
+                    downstream_rows = [row for row in source_rows
+                                       if int(getattr(row, "index", -1)) == first_present]
+                    absent = []
+                    for index in sorted(
+                        (value for value in observed if value < first_present),
+                        reverse=True,
+                    ):
+                        state = classify_checkpoint(
+                            index, route_rows,
+                            {int(value) for value in provenance},
+                            downstream_rows,
+                        )
+                        if state == "unknown":
+                            break
+                        if state == "certified absent":
+                            absent.append(index)
+                    if absent:
+                        bracket = (float(max(absent)), float(first_present))
+                    else:
+                        # Preserve the visible ETA projection, but explicitly
+                        # prevent it from becoming an order/motion witness.
+                        position_authoritative = False
+                        projected = float(position)
+                        exploratory_indices = frozenset(
+                            index for index in {
+                                math.floor(projected), math.ceil(projected)
+                            }
+                            if 0 <= index < stops_count
+                        )
                 checkpoint_evidence = _checkpoint_evidence(source_rows)
                 zero_indices = sorted({
                     int(row.index)
@@ -2548,6 +2691,10 @@ def estimate_bus_positions(
                 priority_indices = frozenset(refresh_frontier)
                 boundary_index = first_present
                 if zero_indices:
+                    # Owned due/future evidence is a physical boundary even
+                    # when an earlier all-positive frontier was ambiguous.
+                    position_authoritative = True
+                    exploratory_indices = frozenset()
                     due_index = zero_indices[-1]
                     boundary_index = (
                         next_positive if next_positive is not None else due_index
@@ -2728,8 +2875,9 @@ def estimate_bus_positions(
                     bracket_eta_offsets=bracket_eta_offsets,
                     priority_indices=priority_indices,
                     exploratory_indices=exploratory_indices,
-                    checkpoint_evidence=checkpoint_evidence,
-                )
+                checkpoint_evidence=checkpoint_evidence,
+                position_authoritative=position_authoritative,
+            )
             )
     return estimates
 
@@ -2845,13 +2993,22 @@ def rebuild_estimate_from_probe_fragments(
             upper_index = lower_index
     elif positive_indices:
         upper_index = positive_indices[0]
-        # Any currently observed upstream stop not owned by this identity is
-        # an absence checkpoint. Its ETA may belong to another bus; use it
-        # only for endpoint freshness, never as this identity's ETA.
-        lower_candidates = [
-            index for index in current_indices
-            if index < upper_index and index not in active_indices
-        ]
+        # Only certified absence may form the lower endpoint. An observed
+        # response owned by another ladder is not proof of absence.
+        lower_candidates = []
+        for index in sorted(
+            (value for value in current_indices
+             if value < upper_index and value not in active_indices),
+            reverse=True,
+        ):
+            state = classify_checkpoint(
+                index, current_route_rows, active_indices,
+                [row for row in source_rows if int(row.index) == upper_index],
+            )
+            if state == "unknown":
+                break
+            if state == "certified absent":
+                lower_candidates.append(index)
         if not lower_candidates:
             return base
         lower_index = max(lower_candidates)
@@ -2972,6 +3129,7 @@ def rebuild_estimate_from_probe_fragments(
         ),
         exploratory_indices=frozenset(),
         checkpoint_evidence=_checkpoint_evidence(source_rows),
+        position_authoritative=True,
     )
 
 
@@ -3061,16 +3219,48 @@ def rebuild_estimate_from_probe_sources(
             return None
     clean = replace(
         template,
+        position=None,
         source_observations=frozenset(("probe", slot) for slot in slots),
         source_indices=frozenset(),
+        bracket=None,
+        eta_minutes=None,
+        eta_arrival_at=None,
+        bracket_initial_eta=None,
+        bracket_eta_offsets=None,
+        priority_indices=frozenset(),
+        exploratory_indices=frozenset(),
         checkpoint_evidence=(),
         boundary_revision=None,
         boundary_age_seconds=None,
+        position_authoritative=None,
     )
     rebuilt = rebuild_estimate_from_probe_fragments(clean, (), probe_inputs, route_lines)
-    if rebuilt is clean:
+    if rebuilt is not clean:
+        return rebuilt
+    # An owned all-positive fragment can legitimately have an unknown lower
+    # frontier. Keep it visible as a bounded, non-authoritative projection.
+    try:
+        projected = max(
+            float(row.index) - float(row.minutes) / MINUTES_PER_STOP
+            for row in selected
+        )
+        if projected < 0:
+            return None
+        projected = min(projected, len(line.stops) - 1)
+    except (TypeError, ValueError, OverflowError):
         return None
-    return rebuilt
+    projected_estimate = reproject_estimate(clean, projected, route_lines)
+    hints = frozenset(index for index in {math.floor(projected), math.ceil(projected)}
+                      if 0 <= index < len(line.stops))
+    return replace(
+        projected_estimate,
+        source_indices=frozenset(int(row.index) for row in selected),
+        source_observations=clean.source_observations,
+        position_authoritative=False,
+        priority_indices=frozenset(int(row.index) for row in selected),
+        exploratory_indices=hints,
+        checkpoint_evidence=_checkpoint_evidence(selected),
+    )
 
 
 def _label_for(

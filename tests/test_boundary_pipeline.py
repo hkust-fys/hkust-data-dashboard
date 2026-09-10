@@ -134,8 +134,16 @@ async def test_complete_snapshot_repartitions_already_paired_rows(case, reverse,
         assert Counter((row.index, row.arrival_at.timestamp(), row.refresh_generation)
                        for row in actual_rows) == Counter(evidence)
         assert tracker._routes[KEY][owner_id].cohort_evidence == evidence
-        assert marker.boundary_revision == (11, 11)
-        assert marker.exploratory_indices == frozenset()
+        if marker.bracket is not None:
+            expected_revision = (10, 10) if marker.position_authoritative is False else (11, 11)
+            assert marker.boundary_revision == expected_revision
+            expected_hints = frozenset({25, 26}) if marker.position_authoritative is False else frozenset()
+            assert marker.exploratory_indices == expected_hints
+        else:
+            expected_revision = (
+                None if marker.position_authoritative is False else (10, 10)
+            )
+            assert marker.boundary_revision == expected_revision
         if case == "frame22" and number < 2:
             position = 12.812385 if number == 0 else 13.099816
             assert marker.position == pytest.approx(position)
@@ -212,8 +220,19 @@ async def test_complete_repartition_exclusions_are_atomic(exclusion):
     result, owners = _reconcile_complete_probe_ownership(
         tracks, candidates, current_time.timestamp(), rows, lines,
     )
-    assert not owners
-    assert set(map(id, result)) == set(map(id, candidates))
+    if exclusion == "missing_boundary":
+        assert set(owners.values()) == {1, 2}
+        assert len(owners) == 2
+        assert len(result) == len(candidates)
+        assert Counter(source for candidate in result
+                       for source in candidate.source_observations) == Counter(
+                           source for candidate in candidates
+                           for source in candidate.source_observations
+                       )
+    else:
+        assert not owners
+    if exclusion != "missing_boundary":
+        assert set(map(id, result)) == set(map(id, candidates))
     assert [(track.cohort_evidence, track.cohort_observed_at) for track in tracks] == ledger_before
 
 
@@ -672,14 +691,20 @@ async def test_provisional_11s_gate_handoff_never_creates_second_track():
 @pytest.mark.asyncio
 async def test_estimate_revisions_move_delayed_and_hold_replayed_or_partial():
     route_line = line()
-    initial_rows = [Probe(2, None, 0.0, 101), Probe(3, 1, 0.0, 102)]
+    initial_rows = [
+        Probe(2, None, 9.0, 101),
+        Probe(3, 1, 8.0, 102, arrival_at=BASE + timedelta(minutes=6)),
+    ]
     first = estimates(initial_rows)
     assert len(first) == 1 and first[0].boundary_revision == (101, 102)
     tracker = MarkerTracker()
     first_output = await tracker.update(snapshot(1, BASE, initial_rows), first, [route_line])
     assert first_output[0].position == pytest.approx(first[0].position)
 
-    delayed_rows = [Probe(2, None, 38.0, 103), Probe(3, 4, 8.4, 104)]
+    delayed_rows = [
+        Probe(2, None, 9.0, 103),
+        Probe(3, 4, 8.4, 104, arrival_at=BASE + timedelta(minutes=6)),
+    ]
     delayed = estimates(delayed_rows)
     moved = await tracker.update(
         snapshot(1, BASE.replace(second=20), delayed_rows), delayed, [route_line]

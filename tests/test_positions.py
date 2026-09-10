@@ -70,6 +70,109 @@ def test_checkpoint_classifier_three_state_matrix():
         assert classify_checkpoint(21, [empty], (), [bad_downstream]) == "unknown"
 
 
+@pytest.mark.parametrize("kinds", [
+    (EtaKind.SCHEDULED,),
+    (EtaKind.SCHEDULED, EtaKind.SCHEDULED),
+    (EtaKind.REALTIME, EtaKind.SCHEDULED),
+    (EtaKind.SCHEDULED, EtaKind.REALTIME),
+    (EtaKind.REALTIME, EtaKind.REALTIME, EtaKind.SCHEDULED),
+])
+def test_scheduled_lower_response_cannot_certify_checkpoint_absence(kinds):
+    arrival = datetime(2026, 1, 1, tzinfo=UTC)
+    downstream = Probe("GMB", "11S", "seq-1", 5, 2,
+                       cache_age_seconds=0, refresh_generation=17, arrival_at=arrival)
+    rows = [Probe("GMB", "11S", "seq-1", 4, 20 + index, kind=kind,
+                  cache_age_seconds=0, refresh_generation=17,
+                  arrival_at=arrival + timedelta(minutes=20 + index))
+            for index, kind in enumerate(kinds)]
+    assert classify_checkpoint(4, rows, (), [downstream]) == "unknown"
+
+
+@pytest.mark.parametrize("kind", [EtaKind.REALTIME, EtaKind.MOVING_SLOWLY, EtaKind.DELAYED])
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_live_lower_response_certifies_only_unsaturated_checkpoint(kind, count):
+    arrival = datetime(2026, 1, 1, tzinfo=UTC)
+    downstream = Probe("GMB", "11S", "seq-1", 5, 2,
+                       cache_age_seconds=0, refresh_generation=17, arrival_at=arrival)
+    rows = [Probe("GMB", "11S", "seq-1", 4, 20 + index, kind=kind,
+                  cache_age_seconds=0, refresh_generation=17,
+                  arrival_at=arrival + timedelta(minutes=20 + index))
+            for index in range(count)]
+    assert classify_checkpoint(4, rows, (), [downstream]) == (
+        "certified absent" if count < 3 else "unknown"
+    )
+
+
+@pytest.mark.parametrize("nonempty", [False, True])
+@pytest.mark.parametrize("downstream_kind", [EtaKind.REALTIME, EtaKind.SCHEDULED])
+def test_live_absence_certificate_preserves_empty_and_downstream_kind_rules(
+    nonempty, downstream_kind,
+):
+    arrival = datetime(2026, 1, 1, tzinfo=UTC)
+    downstream = Probe("GMB", "11S", "seq-1", 5, 2, kind=downstream_kind,
+                       cache_age_seconds=0, refresh_generation=17, arrival_at=arrival)
+    lower = Probe("GMB", "11S", "seq-1", 4, 20 if nonempty else None,
+                  cache_age_seconds=0, refresh_generation=17,
+                  arrival_at=arrival + timedelta(minutes=20) if nonempty else None)
+    assert classify_checkpoint(4, [lower], (), [downstream]) == "certified absent"
+
+
+@pytest.mark.parametrize(("seconds", "lower_age", "downstream_age", "expected"), [
+    (180, 0, 0, "unknown"),
+    (180.001, 0, 0, "certified absent"),
+    (240, 5, 0, "certified absent"),
+    (240, 5.001, 0, "unknown"),
+    (240, 59.999, 55, "certified absent"),
+    (240, 60, 55, "unknown"),
+])
+def test_live_absence_certificate_keeps_strict_time_and_freshness_bounds(
+    seconds, lower_age, downstream_age, expected,
+):
+    arrival = datetime(2026, 1, 1, tzinfo=UTC)
+    downstream = Probe("GMB", "11S", "seq-1", 5, 2,
+                       cache_age_seconds=downstream_age, refresh_generation=17,
+                       arrival_at=arrival)
+    lower = Probe("GMB", "11S", "seq-1", 4, 20,
+                  cache_age_seconds=lower_age, refresh_generation=17,
+                  arrival_at=arrival + timedelta(seconds=seconds))
+    assert classify_checkpoint(4, [lower], (), [downstream]) == expected
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_scheduled_omission_keeps_estimator_and_rebuild_frontiers_unknown(mixed):
+    key = ("GMB", "11S", "seq-1")
+    line = _line(*key, stop_count=7)
+    arrival = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [Probe(*key, 4, 20, kind=EtaKind.SCHEDULED,
+                  cache_age_seconds=0, refresh_generation=17,
+                  arrival_at=arrival + timedelta(minutes=20))]
+    if mixed:
+        rows.append(Probe(*key, 4, 21, kind=EtaKind.REALTIME,
+                          cache_age_seconds=0, refresh_generation=17,
+                          arrival_at=arrival + timedelta(minutes=21)))
+    slot = len(rows)
+    rows.append(Probe(*key, 5, 0.5, cache_age_seconds=0, refresh_generation=17,
+                      arrival_at=arrival + timedelta(minutes=0.5)))
+    estimates = estimate_bus_positions(
+        rows, [line], observed_checkpoint_indices={key: {4, 5}},
+    )
+    live = next(estimate for estimate in estimates
+                if ("probe", slot) in estimate.source_observations)
+    assert live.bracket is None
+    assert live.position_authoritative is False
+    assert live.boundary_revision is None
+    assert live.source_indices == frozenset({5})
+    assert live.source_observations == frozenset({("probe", slot)})
+    assert live.checkpoint_evidence == ((5, rows[slot].arrival_at.timestamp(), 17),)
+    assert rebuild_estimate_from_probe_fragments(live, [], rows, [line]) is live
+    rebuilt = rebuild_estimate_from_probe_sources(live, [slot], rows, [line])
+    assert rebuilt is not None
+    assert rebuilt.bracket is None
+    assert rebuilt.position_authoritative is False
+    assert rebuilt.checkpoint_evidence == live.checkpoint_evidence
+    assert rebuilt.source_observations == live.source_observations
+
+
 def test_rebuild_probe_sources_clears_stale_position_metadata_on_cold_fallback():
     line = _line(stop_count=10)
     row = Probe("KMB", "X", "outbound", 8, 2, cache_age_seconds=0,

@@ -116,8 +116,8 @@ def classify_checkpoint(index, route_rows, owned_indices=(), downstream_rows=())
 
     ``present`` is owned by the candidate.  An explicit empty response is a
     certified absence; a non-empty response is certified only when it is a
-    small, fresh, temporally coherent response strictly after the candidate's
-    downstream arrival.  Everything else is deliberately unknown.
+    small, fresh, live, temporally coherent response strictly after the
+    candidate's downstream arrival. Everything else is deliberately unknown.
     """
     if index in set(owned_indices):
         return "present"
@@ -188,10 +188,7 @@ def classify_checkpoint(index, route_rows, owned_indices=(), downstream_rows=())
                     or not math.isfinite(float(row.minutes))
                     or row.arrival_at is None):
                 return "unknown"
-            if getattr(row, "kind", None) not in {
-                    EtaKind.REALTIME, EtaKind.SCHEDULED,
-                    EtaKind.MOVING_SLOWLY, EtaKind.DELAYED,
-            }:
+            if getattr(row, "kind", None) not in LIVE_PROBE_ETA_KINDS:
                 return "unknown"
             if (isinstance(row.cache_age_seconds, bool)
                     or isinstance(row.refresh_generation, bool)):

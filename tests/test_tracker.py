@@ -86,6 +86,56 @@ async def test_same_generation_gmb12_unknown_frontier_holds_track_and_adopts_sea
     assert tracker.poll_priorities()[("GMB", "12", "seq-1")] == frozenset({11, 12, 23})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("lower", "upper"), [(4, 5), (0, 4)])
+async def test_scheduled_lower_omission_holds_existing_physical_boundary(lower, upper):
+    tracker = MarkerTracker()
+    line = _geometry_line(stops=7)
+    key = ("KMB", "R", "out")
+    initial_rows = [
+        _fresh_probe_row(upper - 2, BASE_TIME - timedelta(minutes=1), 12, BASE_TIME),
+        _fresh_probe_row(upper, BASE_TIME + timedelta(minutes=1), 12, BASE_TIME),
+    ]
+    candidates = estimate_bus_positions(
+        initial_rows, [line], observed_checkpoint_indices={key: {upper - 2, upper}},
+    )
+    assert len(candidates) == 1
+    initial = await tracker.update(_snapshot(12, initial_rows), candidates, [line])
+    original = initial[0]
+    track = tracker._routes[key][original.track_id]
+    committed = track.committed_boundary_evidence
+    boundary_time = track.boundary_observed_at
+    now = BASE_TIME + timedelta(seconds=30)
+    current_rows = [
+        _fresh_probe_row(lower, now + timedelta(minutes=20), 17, now,
+                         kind=EtaKind.SCHEDULED),
+        _fresh_probe_row(upper, BASE_TIME + timedelta(minutes=1), 17, now),
+    ]
+    candidates = estimate_bus_positions(
+        current_rows, [line], observed_checkpoint_indices={key: {lower, upper}},
+    )
+    live = next(candidate for candidate in candidates
+                if ("probe", 1) in candidate.source_observations)
+    assert live.bracket is None
+    assert live.position_authoritative is False
+    current = await tracker.update(
+        _snapshot(17, current_rows, collected_at=now), candidates, [line],
+    )
+    held = next(marker for marker in current if marker.track_id == original.track_id)
+    assert held.position == pytest.approx(original.position)
+    assert held.bracket == original.bracket
+    assert held.bracket != (float(lower), float(upper))
+    assert held.boundary_revision == original.boundary_revision
+    assert held.position_authoritative is False
+    assert track.display_bracket == track.motion_bracket == original.bracket
+    assert track.boundary_observed_at == boundary_time
+    assert track.committed_boundary_evidence == committed
+    for name in ("source_indices", "source_observations", "checkpoint_evidence",
+                 "priority_indices", "exploratory_indices"):
+        assert getattr(held, name) == getattr(live, name)
+    assert track.cohort_evidence == live.checkpoint_evidence
+
+
 def test_no_bracket_poll_prefers_cold_exploratory_hints():
     estimate = BusEstimate(
         label="x", lat=0, lon=0, operator=Operator.KMB, heading=0,

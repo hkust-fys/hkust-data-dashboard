@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from dashboard.http import FetchError, HttpClient
+from dashboard.http import FetchError, HttpClient, RequestNotStarted
 from dashboard.models import EtaKind, EtaRow, Operator, RouteEtaGroup
 
 log = logging.getLogger(__name__)
@@ -320,6 +320,9 @@ async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
             return _gmb_gate_cache.get()
         try:
             result = await client.fetch_json(url)
+        except RequestNotStarted:
+            log.info("GMB gate request skipped before HTTP start")
+            return _gmb_gate_cache.get()
         except FetchError as exc:
             if exc.status_code == 403:
                 _record_gmb_403()
@@ -1863,6 +1866,11 @@ async def _refresh_probe_etas(
         attempted_groups.add(group_key)
         try:
             raw = await _fetch_raw_stop_eta(client, probes_in_group[0])
+        except RequestNotStarted:
+            attempted_groups.discard(group_key)
+            successful.pop(group_key, None)
+            log.info("probe ETA request skipped before HTTP start for %s", group_key)
+            return group_key.startswith("GMB:")
         except FetchError as exc:
             if exc.status_code == 403 and group_key.startswith("GMB:"):
                 _record_gmb_403()

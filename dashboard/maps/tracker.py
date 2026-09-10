@@ -58,6 +58,10 @@ class _Track:
     # This survives replacement of ``estimate`` by a held complete-generation
     # candidate (which may contain a different bus' checkpoint population).
     committed_boundary_evidence: tuple[tuple[int, float, int], ...] = ()
+    # Sticky once any reliable display or fresh motion boundary establishes
+    # this identity's route order. A later timetable-only cohort cannot erase
+    # that historical position authority.
+    position_authoritative: bool = False
 
 
 def _key(item):
@@ -345,13 +349,11 @@ class MarkerTracker:
                     if mixed_ids or (covering_ids and track.track_id not in covering_ids):
                         return False
                     return _search_compatible(track, candidate)
-                fixed_pairs, recovery_pairs, movement_pairs = _recovery_plan(
-                    matching_old, rows, checkpoints, compatible=complete_compatible
-                )
-                pairs = _ordered_pairs(
-                    matching_old, rows, compatible=complete_compatible,
-                    recoveries=recovery_pairs,
-                    fixed=fixed_pairs,
+                fixed_pairs, movement_pairs, pairs = _complete_pair_plan(
+                    matching_old,
+                    rows,
+                    checkpoints,
+                    compatible=complete_compatible,
                 )
                 # A complete publication can contain one newly discovered,
                 # coarse downstream bracket while a held marker is already
@@ -436,8 +438,14 @@ class MarkerTracker:
                 accepted_updates = _select_ordered_updates(
                     old, proposed_positions,
                     eligible_indices={
-                        old_index for old_index, _ in pairs
+                        old_index for old_index, new_index in pairs
                         if old_index not in boundary_reseeds
+                        if (
+                            old_index in proposed_positions
+                            or _position_order_authoritative(
+                                old[old_index], rows[new_index]
+                            )
+                        )
                     },
                 )
                 used = set(fragment_assignments)
@@ -470,6 +478,7 @@ class MarkerTracker:
                             track_id=track.track_id,
                             operator_code=key[0],
                         )
+                        track.position_authoritative = True
                         track.generation = generation
                         track.last_evidence_at = now
                         track.display_bracket = getattr(candidate, "bracket", None)
@@ -516,6 +525,10 @@ class MarkerTracker:
                         cohort_observed_at=now,
                         cohort_trusted=id(candidate) not in mixed_candidates,
                         committed_boundary_evidence=_checkpoint_rows(candidate),
+                        position_authoritative=(
+                            not bool(getattr(candidate, "unreliable", False))
+                            or _candidate_revision(candidate) is not None
+                        ),
                     ))
                 matched_old = {old_index for old_index, _ in pairs}
                 # A complete all-stop generation is the lifecycle authority.
@@ -644,6 +657,7 @@ class MarkerTracker:
                     track.position = proposed_positions[old_index]
                     track.estimate = replace(candidate, track_id=track.track_id,
                                              operator_code=key[0])
+                    track.position_authoritative = True
                     track.last_evidence_at = now
                     track.boundary_observed_at = _boundary_observed_at(candidate, now)
                     track.boundary_revision = _candidate_revision(candidate)
@@ -671,6 +685,10 @@ class MarkerTracker:
                         cohort_observed_at=now,
                         cohort_trusted=False,
                         committed_boundary_evidence=_checkpoint_rows(candidate),
+                        position_authoritative=(
+                            not bool(getattr(candidate, "unreliable", False))
+                            or _candidate_revision(candidate) is not None
+                        ),
                     )
                     self._partial_birth_generations[key] = generation
                     self._routes[key] = self._sort_tracks(tracks)
@@ -3370,6 +3388,83 @@ def _recovery_plan(old, new, checkpoints, compatible=None):
     return fixed, fixed | movement, movement | safe_exact_motion
 
 
+def _complete_pair_plan(old, new, checkpoints, compatible=None):
+    """Match a complete population without ordering tentative placeholders.
+
+    Mutually unique checkpoint evidence may retain a never-position-confirmed
+    timetable identity after a reliable marker passes its held coordinate.
+    Remove only those proved pairs from the ordered problem; every identity
+    with position authority still uses the ordinary global-order matcher.
+    """
+    exact_edges = {}
+    reverse_edges = {index: set() for index in range(len(new))}
+    for old_index, track in enumerate(old):
+        edges = set()
+        for new_index, candidate in enumerate(new):
+            if compatible is not None and not compatible(track, candidate):
+                continue
+            if _checkpoint_overlap(
+                _cohort_rows(track), _checkpoint_rows(candidate)
+            ):
+                edges.add(new_index)
+                reverse_edges[new_index].add(old_index)
+        exact_edges[old_index] = edges
+
+    tentative = {
+        (old_index, next(iter(edges)))
+        for old_index, edges in exact_edges.items()
+        if len(edges) == 1
+        if len(reverse_edges[next(iter(edges))]) == 1
+        if not _position_order_authoritative(
+            old[old_index], new[next(iter(edges))]
+        )
+    }
+    if not tentative:
+        fixed, recoveries, movement = _recovery_plan(
+            old, new, checkpoints, compatible=compatible
+        )
+        pairs = _ordered_pairs(
+            old,
+            new,
+            compatible=compatible,
+            recoveries=recoveries,
+            fixed=fixed,
+        )
+        return fixed, movement, pairs
+
+    reserved_old = {old_index for old_index, _new_index in tentative}
+    reserved_new = {new_index for _old_index, new_index in tentative}
+    old_indices = [index for index in range(len(old)) if index not in reserved_old]
+    new_indices = [index for index in range(len(new)) if index not in reserved_new]
+    remaining_old = [old[index] for index in old_indices]
+    remaining_new = [new[index] for index in new_indices]
+    fixed, recoveries, movement = _recovery_plan(
+        remaining_old,
+        remaining_new,
+        checkpoints,
+        compatible=compatible,
+    )
+
+    def remap(pairs):
+        return {
+            (old_indices[old_index], new_indices[new_index])
+            for old_index, new_index in pairs
+        }
+
+    ordered = _ordered_pairs(
+        remaining_old,
+        remaining_new,
+        compatible=compatible,
+        recoveries=recoveries,
+        fixed=fixed,
+    )
+    return (
+        remap(fixed) | tentative,
+        remap(movement),
+        sorted(remap(ordered) | tentative),
+    )
+
+
 def _forward_hold_pairs(old, new):
     """Associate one coarse forward candidate without moving the marker."""
     if len(old) != len(new) or len(old) != 1:
@@ -3903,6 +3998,23 @@ def _candidate_actionable(candidate, track):
         return revision[0] > previous[0] and revision[1] > previous[1]
     # Hand-built/legacy estimates have no stable provider revision.
     return previous is None
+
+
+def _position_order_authoritative(track, candidate):
+    """Whether a held identity can constrain another marker's exact motion.
+
+    A timetable-only placeholder with no retained physical boundary has no
+    trustworthy route coordinate. Keep that marker fixed, but do not let its
+    tentative coordinate veto a different identity's fresh boundary. Any
+    current or historical position authority preserves the strict order rule.
+    """
+    return (
+        track.position_authoritative
+        or not bool(getattr(track.estimate, "unreliable", False))
+        or not bool(getattr(candidate, "unreliable", False))
+        or track.boundary_revision is not None
+        or track.boundary_observed_at is not None
+    )
 
 
 def _select_ordered_updates(old, proposed_positions, eligible_indices=None):

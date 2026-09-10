@@ -9,6 +9,7 @@ from dashboard.http import (
     CachedFetch,
     FetchError,
     HttpClient,
+    RequestNotStarted,
     TtlCache,
 )
 
@@ -272,6 +273,44 @@ async def test_post_http_403_is_not_retried():
         await client.post_form_json(
             "https://example.test/data", {"data": "query"}, attempts=3
         )
+
+    assert session.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_post_retry_skip_rethrows_prior_started_failure(monkeypatch):
+    class UnavailableResponse:
+        status = 503
+        headers = {"Content-Type": "application/json"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Session:
+        calls = 0
+
+        def post(self, *_args, **_kwargs):
+            self.calls += 1
+            return UnavailableResponse()
+
+    session = Session()
+    client = HttpClient(session, retry_attempts=2, origin_request_interval_seconds=0)
+    pace_calls = 0
+
+    async def block_retry(_url):
+        nonlocal pace_calls
+        pace_calls += 1
+        if pace_calls == 2:
+            raise RequestNotStarted("retry admission closed")
+
+    client._pace_origin = block_retry  # noqa: SLF001
+    monkeypatch.setattr("dashboard.http.RETRY_BASE_DELAY", 0.0)
+
+    with pytest.raises(FetchError, match="HTTP 503"):
+        await client.post_form_json("https://example.test/data", {"data": "query"})
 
     assert session.calls == 1
 

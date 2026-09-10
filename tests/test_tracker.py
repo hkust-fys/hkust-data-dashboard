@@ -2355,6 +2355,301 @@ async def test_complete_generation_retires_old_order_barrier_before_selecting_up
 
 
 @pytest.mark.asyncio
+async def test_complete_reliable_motion_ignores_tentative_order_barrier():
+    tracker = MarkerTracker()
+    reliable_arrival = BASE_TIME + timedelta(minutes=10)
+    unreliable_arrival = BASE_TIME + timedelta(minutes=15)
+    reliable_evidence = ((15, reliable_arrival.timestamp(), 10),)
+    unreliable_evidence = ((18, unreliable_arrival.timestamp(), 10),)
+    initial_candidates = [
+        replace(
+            _candidate(
+                12.737,
+                bracket=(12.0, 13.0),
+                boundary_age=0,
+                boundary_revision=(10, 10),
+                arrival_at=reliable_arrival,
+            ),
+            checkpoint_evidence=reliable_evidence,
+        ),
+        replace(
+            _candidate(
+                13.0,
+                unreliable=True,
+                bracket=(13.0, 14.0),
+                arrival_at=unreliable_arrival,
+            ),
+            checkpoint_evidence=unreliable_evidence,
+        ),
+    ]
+    initial = await tracker.update(_snapshot(1), initial_candidates)
+
+    reliable_candidate = replace(
+        initial_candidates[0],
+        position=14.219,
+        bracket=(14.0, 15.0),
+        boundary_revision=(11, 11),
+    )
+    current_unreliable_evidence = ((
+        18,
+        (unreliable_arrival + timedelta(seconds=30)).timestamp(),
+        11,
+    ),)
+    unreliable_candidate = replace(
+        initial_candidates[1],
+        position=15.0,
+        bracket=(15.0, 16.0),
+        checkpoint_evidence=current_unreliable_evidence,
+    )
+    current = await tracker.update(
+        _snapshot(2, collected_at=BASE_TIME + timedelta(seconds=30)),
+        [unreliable_candidate, reliable_candidate],
+    )
+
+    assert len(current) == len(initial) == 2
+    reliable = next(
+        marker for marker in current if marker.track_id == initial[0].track_id
+    )
+    assert reliable.position == pytest.approx(14.219)
+    assert reliable.bracket == (14.0, 15.0)
+    assert reliable.checkpoint_evidence == reliable_evidence
+    tentative = next(
+        marker for marker in current if marker.track_id == initial[1].track_id
+    )
+    assert tentative.unreliable is True
+    assert tentative.position == pytest.approx(13.0)
+    assert tentative.bracket == (13.0, 14.0)
+    assert tentative.checkpoint_evidence == current_unreliable_evidence
+    route = tracker._routes[("KMB", "R", "out")]  # noqa: SLF001
+    assert route[tentative.track_id].cohort_evidence == current_unreliable_evidence
+
+    continued = await tracker.update(
+        _snapshot(3, collected_at=BASE_TIME + timedelta(seconds=60)),
+        [
+            replace(
+                reliable_candidate,
+                position=14.6,
+                bracket=(14.0, 15.0),
+                boundary_revision=(12, 12),
+            ),
+            replace(unreliable_candidate, position=15.2),
+        ],
+    )
+
+    continued_by_id = {marker.track_id: marker for marker in continued}
+    assert set(continued_by_id) == {marker.track_id for marker in initial}
+    assert continued_by_id[reliable.track_id].position == pytest.approx(14.6)
+    assert continued_by_id[tentative.track_id].position == pytest.approx(13.0)
+
+
+@pytest.mark.asyncio
+async def test_retained_boundary_history_remains_an_order_barrier_when_unreliable():
+    tracker = MarkerTracker()
+    initial_candidates = [
+        _candidate(
+            12.737,
+            bracket=(12.0, 13.0),
+            boundary_age=0,
+            boundary_revision=(10, 10),
+        ),
+        _candidate(
+            13.0,
+            unreliable=True,
+            bracket=(13.0, 14.0),
+            boundary_age=0,
+            boundary_revision=(10, 10),
+        ),
+    ]
+    initial = await tracker.update(_snapshot(1), initial_candidates)
+    moving = replace(
+        initial_candidates[0],
+        position=14.219,
+        bracket=(14.0, 15.0),
+        boundary_revision=(11, 11),
+    )
+    held_barrier = replace(
+        initial_candidates[1],
+        position=15.0,
+        bracket=(15.0, 16.0),
+        boundary_age_seconds=None,
+        boundary_revision=None,
+    )
+
+    current = await tracker.update(
+        _snapshot(2, collected_at=BASE_TIME + timedelta(seconds=30)),
+        [moving, held_barrier],
+    )
+
+    assert [marker.track_id for marker in current] == [
+        marker.track_id for marker in initial
+    ]
+    assert [marker.position for marker in current] == pytest.approx([12.737, 13.0])
+    assert [marker.bracket for marker in current] == [
+        (12.0, 13.0),
+        (13.0, 14.0),
+    ]
+    assert current[0].boundary_revision == (10, 10)
+    assert current[1].boundary_revision == (10, 10)
+
+
+@pytest.mark.asyncio
+async def test_reliable_position_history_survives_unreliable_complete_holds():
+    tracker = MarkerTracker()
+    moving = _candidate(
+        10.0,
+        bracket=(9.0, 10.0),
+        boundary_age=0,
+        boundary_revision=(10, 10),
+    )
+    prior_reliable_barrier = _candidate(13.0, bracket=(13.0, 14.0))
+    initial = await tracker.update(
+        _snapshot(1), [moving, prior_reliable_barrier]
+    )
+    unreliable_barrier = replace(
+        prior_reliable_barrier,
+        position=15.0,
+        bracket=(15.0, 16.0),
+        unreliable=True,
+    )
+
+    held = await tracker.update(
+        _snapshot(2, collected_at=BASE_TIME + timedelta(seconds=30)),
+        [moving, unreliable_barrier],
+    )
+    barrier_id = initial[1].track_id
+    barrier_track = tracker._routes[("KMB", "R", "out")][barrier_id]  # noqa: SLF001
+    assert next(marker for marker in held if marker.track_id == barrier_id).position == 13.0
+    assert barrier_track.estimate.unreliable is True
+    assert barrier_track.position_authoritative is True
+
+    advanced_candidate = replace(
+        moving,
+        position=13.219,
+        bracket=(13.0, 14.0),
+        boundary_revision=(11, 11),
+    )
+    current = await tracker.update(
+        _snapshot(3, collected_at=BASE_TIME + timedelta(seconds=60)),
+        [advanced_candidate, unreliable_barrier],
+    )
+
+    assert [marker.track_id for marker in current] == [
+        marker.track_id for marker in initial
+    ]
+    assert [marker.position for marker in current] == pytest.approx([10.0, 13.0])
+
+
+@pytest.mark.asyncio
+async def test_complete_reliable_motion_can_pass_multiple_tentative_barriers():
+    tracker = MarkerTracker()
+    arrivals = [BASE_TIME + timedelta(minutes=value) for value in (10, 15, 20)]
+    initial_candidates = [
+        _candidate(
+            10.0,
+            bracket=(9.0, 10.0),
+            boundary_age=0,
+            boundary_revision=(10, 10),
+            arrival_at=arrivals[0],
+        ),
+        _candidate(
+            11.0,
+            unreliable=True,
+            bracket=(11.0, 12.0),
+            arrival_at=arrivals[1],
+        ),
+        _candidate(
+            12.0,
+            unreliable=True,
+            bracket=(12.0, 13.0),
+            arrival_at=arrivals[2],
+        ),
+    ]
+    initial = await tracker.update(_snapshot(1), initial_candidates)
+    candidates = [
+        replace(
+            initial_candidates[0],
+            position=13.2,
+            bracket=(13.0, 14.0),
+            boundary_revision=(11, 11),
+        ),
+        replace(initial_candidates[1], position=14.0, bracket=(14.0, 15.0)),
+        replace(initial_candidates[2], position=15.0, bracket=(15.0, 16.0)),
+    ]
+
+    current = await tracker.update(
+        _snapshot(2, collected_at=BASE_TIME + timedelta(seconds=30)),
+        list(reversed(candidates)),
+    )
+
+    by_id = {marker.track_id: marker for marker in current}
+    assert set(by_id) == {marker.track_id for marker in initial}
+    assert by_id[initial[0].track_id].position == pytest.approx(13.2)
+    assert by_id[initial[1].track_id].position == pytest.approx(11.0)
+    assert by_id[initial[2].track_id].position == pytest.approx(12.0)
+
+
+@pytest.mark.asyncio
+async def test_same_generation_tentative_barrier_keeps_strict_order():
+    tracker = MarkerTracker()
+    reliable_evidence = ((
+        15,
+        (BASE_TIME + timedelta(minutes=10)).timestamp(),
+        10,
+    ),)
+    tentative_evidence = ((
+        18,
+        (BASE_TIME + timedelta(minutes=15)).timestamp(),
+        10,
+    ),)
+    initial_candidates = [
+        replace(
+            _candidate(
+                12.737,
+                bracket=(12.0, 13.0),
+                boundary_age=0,
+                boundary_revision=(10, 10),
+            ),
+            checkpoint_evidence=reliable_evidence,
+        ),
+        replace(
+            _candidate(
+                13.0,
+                unreliable=True,
+                bracket=(13.0, 14.0),
+            ),
+            checkpoint_evidence=tentative_evidence,
+        ),
+    ]
+    initial = await tracker.update(_snapshot(1), initial_candidates)
+
+    current = await tracker.update(
+        _snapshot(1, collected_at=BASE_TIME + timedelta(seconds=30)),
+        [
+            replace(
+                initial_candidates[0],
+                position=14.219,
+                bracket=(14.0, 15.0),
+                boundary_revision=(11, 11),
+            ),
+            replace(
+                initial_candidates[1],
+                position=15.0,
+                bracket=(15.0, 16.0),
+            ),
+        ],
+    )
+
+    assert [marker.track_id for marker in current] == [
+        marker.track_id for marker in initial
+    ]
+    assert [marker.position for marker in current] == pytest.approx([12.737, 13.0])
+    assert [marker.bracket for marker in current] == [
+        (12.0, 13.0),
+        (13.0, 14.0),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_same_generation_gmb11_staggered_candidate_holds_multiple_checkpoint_owners():
     tracker = MarkerTracker()
     t39 = BASE_TIME + timedelta(minutes=4)

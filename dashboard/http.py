@@ -63,6 +63,10 @@ class FetchError(RuntimeError):
         self.status_code = status_code
 
 
+class RequestNotStarted(RuntimeError):
+    """Raised when admission or pacing aborts before the HTTP request starts."""
+
+
 @dataclass
 class CacheEntry:
     value: Any
@@ -169,6 +173,7 @@ class HttpClient:
 
     async def _request_bytes(self, url: str, headers: dict[str, str] | None) -> bytes:
         """GET with bounded size; raises FetchError on bad status/content-type."""
+        last_started_error: Exception | None = None
         for attempt in range(1, self.retry_attempts + 1):
             try:
                 await self._pace_origin(url)
@@ -191,6 +196,10 @@ class HttpClient:
                     if len(data) > MAX_BYTES_IMAGE:
                         raise FetchError(f"Response too large for {url}")
                     return data
+            except RequestNotStarted:
+                if last_started_error is not None:
+                    raise last_started_error from None
+                raise
             except (TimeoutError, aiohttp.ClientError, FetchError) as exc:
                 # Retrying a forbidden request immediately amplifies an origin
                 # rate limit. Other terminal client errors are equally unlikely
@@ -204,6 +213,7 @@ class HttpClient:
                     raise
                 if attempt >= self.retry_attempts:
                     raise
+                last_started_error = exc
                 delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
                 log.warning(
                     "fetch %s failed (attempt %d): %s; retrying in %.1fs", url, attempt, exc, delay
@@ -271,6 +281,7 @@ class HttpClient:
         )
         tries = attempts or self.retry_attempts
         body = b""
+        last_started_error: Exception | None = None
         for attempt in range(1, tries + 1):
             try:
                 await self._pace_origin(url)
@@ -291,6 +302,10 @@ class HttpClient:
                     if len(body) > max_bytes:
                         raise FetchError(f"Response too large for {url}")
                     break
+            except RequestNotStarted:
+                if last_started_error is not None:
+                    raise last_started_error from None
+                raise
             except (TimeoutError, aiohttp.ClientError, FetchError) as exc:
                 if (
                     isinstance(exc, FetchError)
@@ -301,6 +316,7 @@ class HttpClient:
                     raise
                 if attempt >= tries:
                     raise
+                last_started_error = exc
                 delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
                 log.warning(
                     "POST %s failed (attempt %d): %s; retrying in %.1fs",

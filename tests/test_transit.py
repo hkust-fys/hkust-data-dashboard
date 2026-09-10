@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from dashboard.http import RequestNotStarted
 from dashboard.maps.positions import estimate_bus_positions
 from dashboard.maps.tracker import MarkerTracker
 from dashboard.models import EtaKind, Operator
@@ -3329,6 +3330,26 @@ async def test_gmb_gate_cooldown_expiry_resumes_polling():
     assert client.calls
 
 
+@pytest.mark.asyncio
+async def test_gmb_gate_request_not_started_serves_cache_without_cooldown():
+    cached = s.eta_row("11", "Choi Hung", "S", 5, operator=Operator.GMB)
+    transit._gmb_gate_cache.set([cached])
+
+    class Client:
+        calls = 0
+
+        async def fetch_json(self, _url):
+            self.calls += 1
+            raise RequestNotStarted("admission closed")
+
+    client = Client()
+    rows = await _fetch_gmb(client, s.utc())
+
+    assert client.calls == 1
+    assert rows == [cached]
+    assert transit._gmb_cooldown_until == 0  # noqa: SLF001
+
+
 def test_gmb_gate_cache_has_hard_ttl_for_live_and_unknown_etas():
     transit._gmb_gate_cache.set([
         s.eta_row("11", "Choi Hung", "S", 5, operator=Operator.GMB),
@@ -3595,6 +3616,107 @@ async def test_gmb_cooldown_skip_does_not_advance_probe_attempt_token(monkeypatc
 
     assert transit._probe_attempt_generation == 0  # noqa: SLF001
     assert transit._probe_attempted_checkpoints == frozenset()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_request_not_started_preserves_probe_service_accounting(monkeypatch):
+    probe = SimpleNamespace(
+        operator="GMB", route="11S", bound="seq-1", stop_id="stop",
+        route_id=1, sequence=1, index=0,
+    )
+    route_key = (probe.operator, probe.route, probe.bound)
+    group_key = transit._fetch_group_key(probe)  # noqa: SLF001
+    _seed_warm_routes([probe])
+    transit._probe_group_service_debt[group_key] = 7  # noqa: SLF001
+    transit._probe_priority_owed.add(group_key)  # noqa: SLF001
+    transit._probe_failed_groups.add(group_key)  # noqa: SLF001
+
+    starts = []
+    client = transit.HttpClient(
+        SimpleNamespace(get=lambda *args, **kwargs: starts.append((args, kwargs)))
+    )
+
+    async def skip_before_start(_url):
+        raise RequestNotStarted("admission closed")
+
+    client._pace_origin = skip_before_start  # noqa: SLF001
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        client, [probe], max_per_cycle=1,
+        priorities={route_key: {probe.index}}, generation_probes=[probe],
+    )
+
+    assert starts == []
+    assert transit._probe_attempt_generation == 0  # noqa: SLF001
+    assert transit._probe_attempted_checkpoints == frozenset()  # noqa: SLF001
+    assert transit._probe_group_service_debt[group_key] == 8  # noqa: SLF001
+    assert group_key in transit._probe_priority_owed  # noqa: SLF001
+    assert group_key in transit._probe_failed_groups  # noqa: SLF001
+    assert transit._probe_route_generations[route_key].public.generation == 1  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_retry_skip_retains_prior_started_failure_accounting(monkeypatch):
+    probe = SimpleNamespace(
+        operator="GMB", route="11S", bound="seq-1", stop_id="stop",
+        route_id=1, sequence=1, index=0,
+    )
+    route_key = (probe.operator, probe.route, probe.bound)
+    group_key = transit._fetch_group_key(probe)  # noqa: SLF001
+    _seed_warm_routes([probe])
+    transit._probe_group_service_debt[group_key] = 7  # noqa: SLF001
+    transit._probe_priority_owed.add(group_key)  # noqa: SLF001
+    starts = []
+
+    class Response:
+        status = 503
+        headers = {"Content-Type": "application/json"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            starts.append(transit.time.monotonic())
+            return Response()
+
+    client = transit.HttpClient(Session(), retry_attempts=2)
+    pace_calls = 0
+
+    async def block_retry(_url):
+        nonlocal pace_calls
+        pace_calls += 1
+        if pace_calls == 2:
+            transit._gmb_cooldown_until = transit.time.monotonic() + 60  # noqa: SLF001
+            raise RequestNotStarted("retry admission closed")
+
+    client._pace_origin = block_retry
+    monkeypatch.setattr("dashboard.http.RETRY_BASE_DELAY", 0.0)
+
+    tracker = MarkerTracker()
+    remaining = {probe.index}
+    tracker._priority_pending[route_key] = ((probe.index,), remaining)  # noqa: SLF001
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        client, [probe], max_per_cycle=1,
+        priorities={route_key: {probe.index}}, generation_probes=[probe],
+    )
+    tracker._ack_probe_attempts(SimpleNamespace(  # noqa: SLF001
+        probe_attempt_generation=transit._probe_attempt_generation,  # noqa: SLF001
+        attempted_checkpoints=transit._probe_attempted_checkpoints,  # noqa: SLF001
+    ))
+
+    assert len(starts) == 1
+    assert transit._probe_attempt_generation == 1  # noqa: SLF001
+    assert transit._probe_attempted_checkpoints == {  # noqa: SLF001
+        (probe.operator, probe.route, probe.bound, probe.index),
+    }
+    assert transit._probe_group_service_debt[group_key] == 0  # noqa: SLF001
+    assert group_key not in transit._probe_priority_owed  # noqa: SLF001
+    assert group_key in transit._probe_failed_groups  # noqa: SLF001
+    assert remaining == set()
+    assert transit._probe_route_generations[route_key].public.generation == 1  # noqa: SLF001
 
 
 @pytest.mark.asyncio

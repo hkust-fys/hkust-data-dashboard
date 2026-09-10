@@ -308,6 +308,9 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
     assert seen["priorities"] == {
         ("KMB", "91", "outbound"): frozenset({0, 3, 4, 5, 6, 8})
     }
+    assert seen["lifecycle_routes"] == {
+        ("KMB", "91", "outbound")
+    }
     assert seen["wait_for_refresh"] is False
 
 

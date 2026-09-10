@@ -963,6 +963,7 @@ async def fetch_probe_etas(
     *,
     wait_for_refresh: bool = True,
     generation_probes: Sequence[Any] | None = None,
+    lifecycle_routes=None,
 ) -> list[ProbeEta]:
     """Return cached probe observations, refreshing the network at most every 30s."""
     global _probe_network_refresh_at, _probe_refresh_task, _probe_refresh_waiters
@@ -979,6 +980,7 @@ async def fetch_probe_etas(
             _refresh_probe_etas(
                 client, probes, max_per_cycle, priorities,
                 generation_probes=generation_probes,
+                lifecycle_routes=lifecycle_routes,
             )
         )
         _probe_refresh_task.add_done_callback(_finish_probe_refresh)
@@ -1046,6 +1048,7 @@ async def _refresh_probe_etas(
     priorities=None,
     *,
     generation_probes: Sequence[Any] | None = None,
+    lifecycle_routes=None,
 ) -> list[ProbeEta]:
     """Poll up to ``max_per_cycle`` fetch groups round-robin; cache results.
 
@@ -1150,6 +1153,40 @@ async def _refresh_probe_etas(
             _gmb_cooldown_until - time.monotonic(),
         )
     cycle_budget = max(0, max_per_cycle)
+    # A tracker-requested lifecycle census is already reduced to the fixed
+    # sparse baseline (normally four representative stops). Prefer its still
+    # missing groups inside the ordinary priority allocation so a coherent
+    # generation is gathered promptly without bypassing cold reservations or
+    # carry-over service obligations. Oldest publications lead; shared
+    # physical groups keep their earliest rank.
+    requested_lifecycle = {
+        tuple(str(value) for value in route_key)
+        for route_key in (lifecycle_routes or ())
+        if isinstance(route_key, (tuple, list)) and len(route_key) == 3
+    }
+    lifecycle_group_ranks = {}
+    lifecycle_routes_by_age = sorted(
+        (
+            stored.published_monotonic,
+            route_key,
+            [
+                group_key
+                for group_key in baseline_routes[route_key]
+                if _probe_group_versions.get(group_key, 0)
+                <= _probe_route_published_versions[route_key].get(group_key, 0)
+            ],
+        )
+        for route_key in requested_lifecycle & set(baseline_routes)
+        if (stored := _probe_route_generations.get(route_key)) is not None
+        and route_key in _probe_route_published_versions
+    )
+    for published_at, route_key, missing_groups in lifecycle_routes_by_age:
+        for group_index, group_key in enumerate(dict.fromkeys(missing_groups)):
+            rank = (published_at, route_key, group_index)
+            lifecycle_group_ranks[group_key] = min(
+                rank,
+                lifecycle_group_ranks.get(group_key, rank),
+            )
     # Stage individual fetch groups in a bounded round-robin. Publications are
     # assembled below only after every group has advanced since publication.
     selected_groups: list[str] = []
@@ -1158,7 +1195,7 @@ async def _refresh_probe_etas(
     priority_groups = []
     priority_indices = priorities or {}
     for group_key, route_probes in groups.items():
-        is_priority = False
+        is_priority = group_key in lifecycle_group_ranks
         for probe in route_probes:
             wanted = {int(index) for index in priority_indices.get(
                 (probe.operator, probe.route, probe.bound), ())
@@ -1199,6 +1236,20 @@ async def _refresh_probe_etas(
         key for key in group_keys
         if any(key in baseline_routes[route_key] for route_key in cold_route_keys)
     ]
+    def priority_selection_order(key: str, owed_groups) -> tuple:
+        """Keep carried debt first, then cohere requested sparse censuses."""
+        debt = _probe_group_service_debt.get(key, 0)
+        is_owed = key in owed_groups
+        lifecycle_rank = lifecycle_group_ranks.get(key)
+        return (
+            not is_owed,
+            -debt if is_owed else 0,
+            lifecycle_rank is None,
+            lifecycle_rank or (float("inf"), ("", "", ""), 0),
+            -debt,
+            key,
+        )
+
     def select_ring(
         ring: list[str],
         cursor: int,
@@ -1268,12 +1319,7 @@ async def _refresh_probe_etas(
             return
         ordered = sorted(
             (key for key in ring if key not in selected_set),
-            key=lambda key: (
-                key not in (owed_groups or ()),
-                -_probe_group_service_debt.get(key, 0),
-                not key.startswith("GMB:"),
-                key,
-            ),
+            key=lambda key: priority_selection_order(key, owed_groups or ()),
         )
         for key in ordered:
             if len(selected_groups) >= min(cycle_budget, total_limit):
@@ -1560,12 +1606,8 @@ async def _refresh_probe_etas(
     other_priority = [
         key for key in selectable_priority if not key.startswith("GMB:")
     ]
-    def priority_order(key: str) -> tuple[bool, int, str]:
-        return (
-            key not in priority_owed,
-            -_probe_group_service_debt.get(key, 0),
-            key,
-        )
+    def priority_order(key: str) -> tuple:
+        return priority_selection_order(key, priority_owed)
 
     gmb_candidates = sorted(gmb_priority, key=priority_order)
     other_candidates = sorted(other_priority, key=priority_order)
@@ -1907,11 +1949,13 @@ async def fetch_probe_snapshot(
     *,
     wait_for_refresh: bool = True,
     generation_probes: Sequence[Any] | None = None,
+    lifecycle_routes=None,
 ) -> ProbeEtaSnapshot:
     """Fetch probes and expose only atomically complete route generations."""
     await fetch_probe_etas(client, probes, max_per_cycle=max_per_cycle,
                            priorities=priorities, wait_for_refresh=wait_for_refresh,
-                           generation_probes=generation_probes)
+                           generation_probes=generation_probes,
+                           lifecycle_routes=lifecycle_routes)
     collected_at = _probe_wall_clock()
     monotonic_at = _probe_mono_clock()
     for stale_key, stale_generation in tuple(_probe_route_generations.items()):

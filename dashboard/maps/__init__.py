@@ -273,6 +273,7 @@ async def fetch_traffic_map(
                 fetch_probe_snapshot(
                     client, probes, priorities=priorities, wait_for_refresh=False,
                     generation_probes=baseline_probes,
+                    lifecycle_routes=lifecycle_routes,
                 )
             )
             operation_tasks.append(probe_task)

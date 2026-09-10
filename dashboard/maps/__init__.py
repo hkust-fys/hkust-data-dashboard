@@ -230,10 +230,16 @@ async def fetch_traffic_map(
                       if route_lines else [])
             priority_provider = getattr(tracker, "poll_priorities", None)
             priorities = priority_provider() if callable(priority_provider) else None
-            lifecycle_provider = getattr(tracker, "poll_lifecycle_routes", None)
-            lifecycle_routes = (
-                lifecycle_provider() if callable(lifecycle_provider) else ()
+            lifecycle_request_provider = getattr(
+                tracker, "poll_lifecycle_requests", None
             )
+            if callable(lifecycle_request_provider):
+                lifecycle_routes = lifecycle_request_provider()
+            else:
+                lifecycle_provider = getattr(tracker, "poll_lifecycle_routes", None)
+                lifecycle_routes = (
+                    lifecycle_provider() if callable(lifecycle_provider) else ()
+                )
             if lifecycle_routes:
                 promoted = {
                     route_key: set(indices)

@@ -292,6 +292,9 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
         def poll_lifecycle_routes(self):
             return frozenset({("KMB", "91", "outbound")})
 
+        def poll_lifecycle_requests(self):
+            return {("KMB", "91", "outbound"): 17}
+
         async def update(self, _snapshot, estimates, _lines):
             return estimates
 
@@ -309,7 +312,7 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
         ("KMB", "91", "outbound"): frozenset({0, 3, 4, 5, 6, 8})
     }
     assert seen["lifecycle_routes"] == {
-        ("KMB", "91", "outbound")
+        ("KMB", "91", "outbound"): 17,
     }
     assert seen["wait_for_refresh"] is False
 

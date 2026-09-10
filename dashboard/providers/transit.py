@@ -11,7 +11,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1156,19 +1156,37 @@ async def _refresh_probe_etas(
     # A tracker-requested lifecycle census is already reduced to the fixed
     # sparse baseline (normally four representative stops). Prefer its still
     # missing groups inside the ordinary priority allocation so a coherent
-    # generation is gathered promptly without bypassing cold reservations or
-    # carry-over service obligations. Oldest publications lead; shared
-    # physical groups keep their earliest rank.
-    requested_lifecycle = {
-        tuple(str(value) for value in route_key)
-        for route_key in (lifecycle_routes or ())
-        if isinstance(route_key, (tuple, list)) and len(route_key) == 3
-    }
+    # generation is gathered promptly without bypassing cold reservations.
+    # Fresh, unfailed requests lead oldest-first, but share a contested page
+    # with carried service obligations; failed retries yield completely.
+    # Shared physical groups keep their earliest rank.
+    raw_lifecycle_requests = lifecycle_routes or ()
+    lifecycle_request_generations = {}
+    if isinstance(raw_lifecycle_requests, Mapping):
+        lifecycle_request_generations = {
+            tuple(str(value) for value in route_key): generation
+            for route_key, generation in raw_lifecycle_requests.items()
+            if isinstance(route_key, (tuple, list)) and len(route_key) == 3
+        }
+    else:
+        lifecycle_request_generations = {
+            tuple(str(value) for value in route_key): None
+            for route_key in raw_lifecycle_requests
+            if isinstance(route_key, (tuple, list)) and len(route_key) == 3
+        }
+    requested_lifecycle = set(lifecycle_request_generations)
     lifecycle_group_ranks = {}
+    fresh_lifecycle_group_ranks = {}
     lifecycle_routes_by_age = sorted(
         (
             stored.published_monotonic,
             route_key,
+            (
+                isinstance(lifecycle_request_generations[route_key], int)
+                and not isinstance(lifecycle_request_generations[route_key], bool)
+                and stored.public.generation
+                == lifecycle_request_generations[route_key]
+            ),
             [
                 group_key
                 for group_key in baseline_routes[route_key]
@@ -1180,13 +1198,20 @@ async def _refresh_probe_etas(
         if (stored := _probe_route_generations.get(route_key)) is not None
         and route_key in _probe_route_published_versions
     )
-    for published_at, route_key, missing_groups in lifecycle_routes_by_age:
+    for published_at, route_key, request_is_fresh, missing_groups in (
+        lifecycle_routes_by_age
+    ):
         for group_index, group_key in enumerate(dict.fromkeys(missing_groups)):
             rank = (published_at, route_key, group_index)
             lifecycle_group_ranks[group_key] = min(
                 rank,
                 lifecycle_group_ranks.get(group_key, rank),
             )
+            if request_is_fresh:
+                fresh_lifecycle_group_ranks[group_key] = min(
+                    rank,
+                    fresh_lifecycle_group_ranks.get(group_key, rank),
+                )
     # Stage individual fetch groups in a bounded round-robin. Publications are
     # assembled below only after every group has advanced since publication.
     selected_groups: list[str] = []
@@ -1220,11 +1245,80 @@ async def _refresh_probe_etas(
         _probe_group_service_debt[group_key] = (
             _probe_group_service_debt.get(group_key, 0) + 1
         )
-    baseline_group_keys = {key for values in baseline_routes.values() for key in values}
+    baseline_group_keys = {
+        key for values in baseline_routes.values() for key in values
+    }
     background_groups = [
         key for key in group_keys
         if key not in priority_groups and key in baseline_group_keys
     ]
+    fresh_priority_groups = [
+        key for key in priority_groups
+        if key in fresh_lifecycle_group_ranks and key not in _probe_failed_groups
+    ]
+    fresh_priority_set = set(fresh_priority_groups)
+    owed_nonfresh = _probe_priority_owed - fresh_priority_set
+    owed_nonfresh_gmb = {
+        key for key in owed_nonfresh if key.startswith("GMB:")
+    }
+    waiting_background = {
+        key for key in background_groups if key in selectable_keys
+    }
+    waiting_background_gmb = {
+        key for key in waiting_background if key.startswith("GMB:")
+    }
+    # A fresh census may lead carried work, but it never owns more than half of
+    # a contested resource page. This completes the normal
+    # four-anchor census in one live cap-eight sweep while guaranteeing progress
+    # when real successive lifecycle changes keep producing new request tokens.
+    leading_total_limit = (
+        cycle_budget
+        if not owed_nonfresh and not waiting_background
+        else cycle_budget // 2
+    )
+    leading_gmb_limit = (
+        GMB_GROUPS_PER_CYCLE
+        if not owed_nonfresh_gmb and not waiting_background_gmb
+        else GMB_GROUPS_PER_CYCLE // 2
+    )
+    selectable_priority_count = sum(
+        key in selectable_keys for key in priority_groups
+    )
+    selectable_gmb_priority_count = sum(
+        key in selectable_keys and key.startswith("GMB:")
+        for key in priority_groups
+    )
+    # The warm-background allocator needs two remaining slots when another
+    # priority still waits: one for each population. Half of a two-slot page is
+    # otherwise still large enough for a recurring one-group census to consume
+    # the only slot left after the active priority.
+    if (
+        waiting_background
+        and selectable_priority_count > leading_total_limit
+    ):
+        leading_total_limit = min(
+            leading_total_limit, max(0, cycle_budget - 2)
+        )
+    if (
+        waiting_background_gmb
+        and selectable_gmb_priority_count > leading_gmb_limit
+    ):
+        leading_gmb_limit = min(
+            leading_gmb_limit, max(0, GMB_GROUPS_PER_CYCLE - 2)
+        )
+    leading_fresh_group_ranks = {}
+    leading_gmb = 0
+    for group_key in sorted(
+        fresh_priority_groups,
+        key=lambda key: (fresh_lifecycle_group_ranks[key], key),
+    ):
+        if len(leading_fresh_group_ranks) >= leading_total_limit:
+            break
+        if group_key.startswith("GMB:"):
+            if leading_gmb >= leading_gmb_limit:
+                continue
+            leading_gmb += 1
+        leading_fresh_group_ranks[group_key] = fresh_lifecycle_group_ranks[group_key]
     # During bootstrap, complete every route's fixed baseline as quickly as
     # the per-cycle budgets allow. Once published, active frontiers lead and
     # remaining capacity refreshes the baseline for lifecycle changes.
@@ -1472,7 +1566,19 @@ async def _refresh_probe_etas(
                 total_limit=lifecycle_total_limit,
                 gmb_limit=lifecycle_gmb_limit,
             )
+    # Only the cold tier satisfies the existing lifecycle/background slot;
+    # explicit fresh census work must not suppress warm background service.
     lifecycle_selected = bool(selected_groups)
+    # Commit the bounded fresh share before calculating resource quotas. If it
+    # merely led each resource's candidate ordering, a smaller quota chosen
+    # below could consist entirely of fresh work while the quota scorer
+    # incorrectly assumed that it had served carried groups.
+    select_ring(
+        list(leading_fresh_group_ranks),
+        0,
+        total_limit=leading_total_limit,
+        gmb_limit=leading_gmb_limit,
+    )
     # When priorities coexist, still-cold work belongs exclusively to the
     # bounded cold tier above. In particular, a GMB group deferred by the
     # cap-one alternator must not re-enter through generic background work.

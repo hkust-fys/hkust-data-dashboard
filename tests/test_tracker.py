@@ -3938,6 +3938,7 @@ async def test_two_stop_census_births_one_partial_surplus_then_atomic_promotes_i
     }
     assert tracker._routes[route_key][newborn_id].cohort_trusted is True  # noqa: SLF001
     assert tracker.poll_lifecycle_routes() == frozenset()
+    assert tracker.poll_lifecycle_requests() == {}
 
 
 @pytest.mark.asyncio
@@ -4071,6 +4072,7 @@ async def test_partial_birth_at_capacity_keeps_established_tracks():
     ]
     assert route_key not in tracker._partial_birth_generations  # noqa: SLF001
     assert tracker.poll_lifecycle_routes() == frozenset({route_key})
+    assert tracker.poll_lifecycle_requests() == {route_key: 1}
 
 
 @pytest.mark.asyncio
@@ -4221,12 +4223,14 @@ async def test_partial_population_requests_lifecycle_refresh_until_new_generatio
     # cancel the request; only a different complete generation is authority.
     await tracker.update(_snapshot(1), [_candidate(1.0)])
     assert tracker.poll_lifecycle_routes() == frozenset({route_key})
+    assert tracker.poll_lifecycle_requests() == {route_key: 1}
 
     refreshed = await tracker.update(
         _snapshot(2), [_candidate(1.0), _candidate(4.0)]
     )
     assert len(refreshed) == 2
     assert tracker.poll_lifecycle_routes() == frozenset()
+    assert tracker.poll_lifecycle_requests() == {}
 
 
 @pytest.mark.asyncio

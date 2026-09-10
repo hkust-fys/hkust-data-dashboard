@@ -2568,7 +2568,7 @@ async def test_gmb_completion_yields_to_oversized_active_floor(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_requested_lifecycle_census_leads_crowded_priority_ring(monkeypatch):
-    """A fitting sparse census completes now; remaining slots refine markers."""
+    """A fresh sparse census leads carry without breaking two-cycle service."""
     def probe(route, index, stop_id):
         return SimpleNamespace(
             operator="GMB", route=route, bound="seq-1", stop_id=stop_id,
@@ -2584,8 +2584,9 @@ async def test_requested_lifecycle_census_leads_crowded_priority_ring(monkeypatc
     route_key = ("GMB", "R", "seq-1")
     priorities = {
         (item.operator, item.route, item.bound): {item.index}
-        for item in active
+        for item in competitors
     }
+    priorities[route_key] = set(range(4))
     calls = []
 
     async def fetch(_client, selected):
@@ -2596,17 +2597,346 @@ async def test_requested_lifecycle_census_leads_crowded_priority_ring(monkeypatc
     monkeypatch.setattr(transit, "_probe_generation", 10)
     monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
     monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 15)
+    transit._probe_priority_owed.update(  # noqa: SLF001
+        transit._fetch_group_key(item) for item in competitors  # noqa: SLF001
+    )
 
     await transit._refresh_probe_etas(  # noqa: SLF001
         object(), active, 36, priorities,
         generation_probes=baseline,
-        lifecycle_routes={route_key},
+        lifecycle_routes={route_key: 1},
     )
 
     assert transit._probe_route_generations[route_key].public.generation > 1  # noqa: SLF001
     assert {item.stop_id for item in baseline} <= set(calls)
     assert len(calls) == len(set(calls)) == 15
     assert len(set(calls) & {item.stop_id for item in competitors}) == 11
+
+    first_cycle = set(calls)
+    calls.clear()
+    await transit._refresh_probe_etas(  # noqa: SLF001
+        object(), active, 36, priorities,
+        generation_probes=baseline,
+        lifecycle_routes={route_key: 1},
+    )
+    assert len(calls) == len(set(calls)) == 15
+    assert {item.stop_id for item in competitors} <= first_cycle | set(calls)
+
+
+@pytest.mark.asyncio
+async def test_successive_lifecycle_tokens_preserve_carried_service(monkeypatch):
+    """Renewed censuses share a capped page with continuously owed probes."""
+    def probe(route, index):
+        return SimpleNamespace(
+            operator="GMB", route=route, bound="seq-1",
+            stop_id=f"{route}-{index}", route_id=index + 1,
+            sequence=1, index=index,
+        )
+
+    first = [probe("A", index) for index in range(4)]
+    second = [probe("B", index) for index in range(4)]
+    competitors = [probe(f"C{index}", 0) for index in range(2)]
+    probes = first + second + competitors
+    route_keys = (("GMB", "A", "seq-1"), ("GMB", "B", "seq-1"))
+    priorities = {
+        (item.operator, item.route, item.bound): {item.index}
+        for item in probes
+    }
+    calls = []
+
+    async def fetch(_client, selected):
+        calls.append(selected.stop_id)
+        return {"data": []}
+
+    _seed_warm_routes(first + second)
+    monkeypatch.setattr(transit, "_probe_generation", 10)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 5)
+    transit._probe_priority_owed.update(  # noqa: SLF001
+        transit._fetch_group_key(item) for item in competitors  # noqa: SLF001
+    )
+
+    per_cycle = []
+    for _ in range(6):
+        tokens = {
+            key: transit._probe_route_generations[key].public.generation  # noqa: SLF001
+            for key in route_keys
+        }
+        calls.clear()
+        await transit._refresh_probe_etas(  # noqa: SLF001
+            object(), probes, 5, priorities,
+            generation_probes=first + second,
+            lifecycle_routes=tokens,
+        )
+        assert len(calls) == len(set(calls)) == 5
+        per_cycle.append(set(calls))
+
+    competitor_stops = {item.stop_id for item in competitors}
+    assert all(
+        competitor_stops <= left | right
+        for left, right in zip(per_cycle, per_cycle[1:], strict=False)
+    )
+    assert all(
+        transit._probe_route_generations[key].public.generation > 1  # noqa: SLF001
+        for key in route_keys
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_gmb_census_uses_reserved_share_before_mixed_quota(monkeypatch):
+    """The GMB quota scorer sees carry after a fresh census is reserved."""
+    def probe(operator, route, index, stop_id):
+        return SimpleNamespace(
+            operator=operator, route=route, bound="seq-1", stop_id=stop_id,
+            route_id=route, sequence=1, index=index,
+        )
+
+    baseline = [probe("GMB", "R", index, f"base-{index}") for index in range(4)]
+    gmb_carry = [probe("GMB", "H", index, f"gmb-{index}") for index in range(4)]
+    ctb = [probe("CTB", "X", index, f"ctb-{index}") for index in range(64)]
+    probes = baseline + gmb_carry + ctb
+    route_key = ("GMB", "R", "seq-1")
+    priorities = {}
+    for item in probes:
+        priorities.setdefault(
+            (item.operator, item.route, item.bound), set()
+        ).add(item.index)
+    calls = []
+
+    async def fetch(_client, selected):
+        calls.append(selected.stop_id)
+        return {"data": []}
+
+    _seed_warm_routes(baseline)
+    monkeypatch.setattr(transit, "_probe_generation", 10)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 8)
+    initially_owed = [*gmb_carry, *ctb[:32]]
+    transit._probe_priority_owed.update(  # noqa: SLF001
+        transit._fetch_group_key(item) for item in initially_owed  # noqa: SLF001
+    )
+
+    per_cycle = []
+    generations = []
+    for _ in range(6):
+        token = transit._probe_route_generations[  # noqa: SLF001
+            route_key
+        ].public.generation
+        calls.clear()
+        await transit._refresh_probe_etas(  # noqa: SLF001
+            object(), probes, 36, priorities,
+            generation_probes=baseline,
+            lifecycle_routes={route_key: token},
+        )
+        assert len(calls) == len(set(calls)) == 36
+        assert {item.stop_id for item in baseline} <= set(calls)
+        per_cycle.append(set(calls))
+        generations.append(
+            transit._probe_route_generations[route_key].public.generation  # noqa: SLF001
+        )
+
+    assert generations == sorted(set(generations))
+    carried_gmb_stops = {item.stop_id for item in gmb_carry}
+    assert all(
+        carried_gmb_stops <= left | right
+        for left, right in zip(per_cycle, per_cycle[1:], strict=False)
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_other_census_cannot_occupy_entire_other_quota(monkeypatch):
+    """A one-group KMB census cannot indefinitely displace owed Citybus."""
+    def probe(operator, route, index, stop_id):
+        return SimpleNamespace(
+            operator=operator, route=route, bound="outbound", stop_id=stop_id,
+            route_id=route, sequence=1, index=index,
+        )
+
+    baseline = [probe("KMB", "R", index, f"base-{index}") for index in range(4)]
+    citybus = probe("CTB", "X", 0, "ctb-owed")
+    gmb = [probe("GMB", "H", index, f"gmb-{index}") for index in range(8)]
+    probes = baseline + [citybus, *gmb]
+    route_key = ("KMB", "R", "outbound")
+    priorities = {}
+    for item in probes:
+        priorities.setdefault(
+            (item.operator, item.route, item.bound), set()
+        ).add(item.index)
+    calls = []
+
+    async def fetch(_client, selected):
+        calls.append(selected.stop_id)
+        return {"data": []}
+
+    _seed_warm_routes(baseline)
+    monkeypatch.setattr(transit, "_probe_generation", 10)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 5)
+    transit._probe_priority_owed.update(  # noqa: SLF001
+        transit._fetch_group_key(item) for item in [citybus, *gmb]  # noqa: SLF001
+    )
+
+    per_cycle = []
+    for _ in range(6):
+        token = transit._probe_route_generations[  # noqa: SLF001
+            route_key
+        ].public.generation
+        calls.clear()
+        await transit._refresh_probe_etas(  # noqa: SLF001
+            object(), probes, 5, priorities,
+            generation_probes=baseline,
+            lifecycle_routes={route_key: token},
+        )
+        assert len(calls) == len(set(calls)) == 5
+        assert calls[0] == "base-0"
+        per_cycle.append(set(calls))
+
+    # One recurring census leaves eight carry slots across two pages for nine
+    # physical carry groups, so three pages is the tight feasible deadline.
+    carried_stops = {citybus.stop_id, *(item.stop_id for item in gmb)}
+    assert all(
+        carried_stops <= first_page | second_page | third_page
+        for first_page, second_page, third_page in zip(
+            per_cycle, per_cycle[1:], per_cycle[2:], strict=False,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_slot_fresh_census_preserves_warm_background(monkeypatch):
+    """A fresh request leaves both priority and background service room."""
+    def probe(operator, route, index, stop_id):
+        return SimpleNamespace(
+            operator=operator, route=route, bound="outbound", stop_id=stop_id,
+            route_id=route, sequence=1, index=index,
+        )
+
+    requested = [probe("KMB", "R", index, f"base-{index}") for index in range(4)]
+    active = [probe("CTB", "H", 0, "active")]
+    background = [
+        probe("CTB", "W", index, f"warm-{index}") for index in range(4)
+    ]
+    probes = requested + active + background
+    route_key = ("KMB", "R", "outbound")
+    background_key = ("CTB", "W", "outbound")
+    priorities = {
+        route_key: set(range(4)),
+        ("CTB", "H", "outbound"): {0},
+    }
+    calls = []
+
+    async def fetch(_client, selected):
+        calls.append(selected.stop_id)
+        return {"data": []}
+
+    _seed_warm_routes(probes)
+    initial_requested_generation = transit._probe_route_generations[  # noqa: SLF001
+        route_key
+    ].public.generation
+    initial_background_generation = transit._probe_route_generations[  # noqa: SLF001
+        background_key
+    ].public.generation
+    monkeypatch.setattr(transit, "_probe_generation", 10)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+
+    per_cycle = []
+    for _ in range(8):
+        token = transit._probe_route_generations[  # noqa: SLF001
+            route_key
+        ].public.generation
+        calls.clear()
+        await transit._refresh_probe_etas(  # noqa: SLF001
+            object(), probes, 2, priorities,
+            generation_probes=probes,
+            lifecycle_routes={route_key: token},
+        )
+        assert len(calls) == len(set(calls)) == 2
+        per_cycle.append(set(calls))
+
+    assert all(
+        "active" in left | right
+        for left, right in zip(per_cycle, per_cycle[1:], strict=False)
+    )
+    background_stops = {item.stop_id for item in background}
+    assert all(background_stops & page for page in per_cycle)
+    assert transit._probe_route_generations[  # noqa: SLF001
+        route_key
+    ].public.generation > initial_requested_generation
+    assert transit._probe_route_generations[  # noqa: SLF001
+        background_key
+    ].public.generation > initial_background_generation
+
+
+@pytest.mark.asyncio
+async def test_successive_fresh_census_preserves_warm_gmb_background(monkeypatch):
+    """Recurring lifecycle requests cannot disable warm-route rotation."""
+    def probe(route, index):
+        return SimpleNamespace(
+            operator="GMB", route=route, bound="seq-1",
+            stop_id=f"{route}-{index}", route_id=route,
+            sequence=1, index=index,
+        )
+
+    requested = [probe("R", index) for index in range(4)]
+    active = [probe("H", 0)]
+    background = [probe("W", index) for index in range(4)]
+    probes = requested + active + background
+    route_key = ("GMB", "R", "seq-1")
+    background_key = ("GMB", "W", "seq-1")
+    priorities = {
+        route_key: set(range(4)),
+        ("GMB", "H", "seq-1"): {0},
+    }
+    calls = []
+
+    async def fetch(_client, selected):
+        calls.append(selected.stop_id)
+        return {"data": []}
+
+    _seed_warm_routes(probes)
+    initial_requested_generation = transit._probe_route_generations[  # noqa: SLF001
+        route_key
+    ].public.generation
+    initial_background_generation = transit._probe_route_generations[  # noqa: SLF001
+        background_key
+    ].public.generation
+    monkeypatch.setattr(transit, "_probe_generation", 10)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 5)
+    transit._probe_priority_owed.update(  # noqa: SLF001
+        transit._fetch_group_key(item) for item in active  # noqa: SLF001
+    )
+
+    per_cycle = []
+    for _ in range(8):
+        token = transit._probe_route_generations[  # noqa: SLF001
+            route_key
+        ].public.generation
+        calls.clear()
+        await transit._refresh_probe_etas(  # noqa: SLF001
+            object(), probes, 5, priorities,
+            generation_probes=probes,
+            lifecycle_routes={route_key: token},
+        )
+        assert len(calls) == len(set(calls)) == 5
+        per_cycle.append(set(calls))
+
+    active_stops = {item.stop_id for item in active}
+    assert all(
+        active_stops <= left | right
+        for left, right in zip(per_cycle, per_cycle[1:], strict=False)
+    )
+    background_stops = {item.stop_id for item in background}
+    assert all(
+        background_stops & (left | right)
+        for left, right in zip(per_cycle, per_cycle[1:], strict=False)
+    )
+    assert transit._probe_route_generations[  # noqa: SLF001
+        background_key
+    ].public.generation > initial_background_generation
+    assert transit._probe_route_generations[  # noqa: SLF001
+        route_key
+    ].public.generation > initial_requested_generation
 
 
 @pytest.mark.asyncio
@@ -2637,7 +2967,7 @@ async def test_requested_lifecycle_censuses_are_oldest_first(monkeypatch):
 
     await transit._refresh_probe_etas(  # noqa: SLF001
         object(), probes, 4, generation_probes=probes,
-        lifecycle_routes={first_key, second_key},
+        lifecycle_routes={first_key: 1, second_key: 1},
     )
     assert calls == [item.stop_id for item in first]
     first_generation = transit._probe_route_generations[first_key].public.generation  # noqa: SLF001
@@ -2646,7 +2976,7 @@ async def test_requested_lifecycle_censuses_are_oldest_first(monkeypatch):
     calls.clear()
     await transit._refresh_probe_etas(  # noqa: SLF001
         object(), probes, 4, generation_probes=probes,
-        lifecycle_routes={first_key, second_key},
+        lifecycle_routes={first_key: 1, second_key: 1},
     )
     assert calls == [item.stop_id for item in second]
     assert transit._probe_route_generations[first_key].public.generation == first_generation  # noqa: SLF001
@@ -2692,7 +3022,7 @@ async def test_requested_lifecycle_403_yields_to_unattempted_priorities(monkeypa
         await transit._refresh_probe_etas(  # noqa: SLF001
             object(), probes, 4, priorities,
             generation_probes=baseline,
-            lifecycle_routes={route_key},
+            lifecycle_routes={route_key: 1},
         )
         per_cycle.append(list(calls))
 
@@ -2738,7 +3068,7 @@ async def test_requested_lifecycle_keeps_cold_route_reservation(monkeypatch):
     await transit._refresh_probe_etas(  # noqa: SLF001
         object(), probes, 36, priorities,
         generation_probes=baseline + cold,
-        lifecycle_routes={route_key},
+        lifecycle_routes={route_key: 1},
     )
 
     assert any(stop_id.startswith("cold-") for stop_id in calls)

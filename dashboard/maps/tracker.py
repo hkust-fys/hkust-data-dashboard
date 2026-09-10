@@ -237,6 +237,13 @@ class MarkerTracker:
         """Return routes whose partial ETA population needs a full refresh."""
         return frozenset(self._lifecycle_refresh_routes)
 
+    def poll_lifecycle_requests(self):
+        """Return refresh routes fenced to their last reconciled generation."""
+        return {
+            key: self._generations.get(key)
+            for key in self._lifecycle_refresh_routes
+        }
+
     def _update(self, snapshot, candidates, route_lines):
         now = _timestamp(getattr(snapshot, "collected_at", 0.0))
         route_terminals = _route_terminals(route_lines)

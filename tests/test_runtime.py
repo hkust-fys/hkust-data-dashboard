@@ -5,6 +5,7 @@ operation after a failed provider."""
 
 import asyncio
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -21,11 +22,26 @@ from dashboard.models import DashboardPayload, ImageAsset
 from tests.fixtures import sample_data as s
 
 
+@pytest.fixture(autouse=True)
+def _isolate_dashboard_runtime_state(monkeypatch, tmp_path):
+    import bot as bot_module
+
+    state_path = tmp_path / "dashboard-runtime-state.json"
+    monkeypatch.setattr(
+        bot_module,
+        "_dashboard_runtime_state_path",
+        lambda _cache_dir: state_path,
+    )
+
+
 class _FakeMessage:
-    def __init__(self, author, content, id=1):
+    def __init__(self, author, content, id=1, *, created_at=None, delete_error=None):
         self.author = author
         self.content = content
         self.id = id
+        self.created_at = created_at
+        self.delete_error = delete_error
+        self.deleted = False
         self.edits = 0
         self.embeds = []
         self.attachments = []
@@ -34,6 +50,11 @@ class _FakeMessage:
         self.edits += 1
         self.embeds = kwargs.get("embeds", [])
         self.attachments = kwargs.get("attachments", [])
+
+    async def delete(self):
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted = True
 
 
 class _FakeAuthor:
@@ -46,15 +67,19 @@ class _FakeChannel:
     def __init__(self, messages):
         self.messages = messages
         self.sent = []
+        self.send_kwargs = []
         self.guild = type("Guild", (), {"me": _FakeAuthor(bot=True, id=42)})()
 
-    async def history(self, limit=50):
+    async def history(self, limit=50, **_kwargs):
         for m in reversed(self.messages):
             yield m
 
     async def send(self, **kwargs):
         msg = _FakeMessage(_FakeAuthor(bot=True), kwargs.get("content", ""), id=999)
+        msg.nonce = kwargs.get("nonce")
+        msg.embeds = kwargs.get("embeds", [])
         self.sent.append(msg)
+        self.send_kwargs.append(kwargs)
         return msg
 
     async def fetch_message(self, message_id):
@@ -307,6 +332,1327 @@ async def test_updater_edits_same_message_and_no_duplicate(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_updater_rolls_old_dashboard_before_discord_edit_cap(monkeypatch):
+    import bot as bot_module
+
+    old_thread = _FakeThread()
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        created_at=datetime.now(UTC) - timedelta(minutes=56),
+    )
+    channel = _FakeChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = old  # noqa: SLF001
+    updater._thread = old_thread  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert old.deleted
+    assert old.edits == 0
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    assert updater._thread is old_thread  # noqa: SLF001
+    assert channel.send_kwargs[0]["content"] == DASHBOARD_MESSAGE_MARKER
+    assert len(channel.send_kwargs[0]["files"]) == 1
+    assert updater._last_payload_fingerprint == _payload_fingerprint(payload)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_dashboard_rollover_tracks_old_message_if_delete_fails(monkeypatch):
+    import bot as bot_module
+
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        created_at=datetime.now(UTC) - timedelta(minutes=56),
+        delete_error=RuntimeError("cannot delete old dashboard"),
+    )
+    channel = _FakeChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = old  # noqa: SLF001
+    updater._thread = _FakeThread()  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    replacement = channel.sent[0]
+    assert updater._message is replacement  # noqa: SLF001
+    assert not old.deleted
+    assert not replacement.deleted
+    assert updater._dashboard_message_key(old) in updater._pending_dashboard_deletes  # noqa: SLF001
+    assert updater._last_payload_fingerprint == _payload_fingerprint(payload)  # noqa: SLF001
+
+    # A failed cleanup must not trigger another rollover and accumulate copies.
+    updater._snapshot = bot_module.CollectionSnapshot({}, 2, 0.0)
+    next_payload = DashboardPayload(files=[ImageAsset("map.png", b"newer-map")])
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: next_payload)
+    await updater._tick(channel)  # noqa: SLF001
+    assert len(channel.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_rollover_persists_stale_predecessor_before_clearing_episode(
+    monkeypatch, tmp_path
+):
+    import bot as bot_module
+
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=100,
+    )
+    replacement = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=200,
+    )
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    updater = DashboardUpdater(settings)
+    updater._message = old  # noqa: SLF001
+    real_store = bot_module._store_dashboard_runtime_state  # noqa: SLF001
+    writes = []
+
+    def fail_first_cleanup_write(store_settings, state):
+        writes.append(dict(state))
+        if len(writes) == 2:
+            return False
+        return real_store(store_settings, state)
+
+    monkeypatch.setattr(
+        bot_module,
+        "_store_dashboard_runtime_state",
+        fail_first_cleanup_write,
+    )
+    assert updater._mark_rollover_send_uncertain()  # noqa: SLF001
+
+    updater._adopt_dashboard_rollover(  # noqa: SLF001
+        (replacement, old),
+        "replacement-fingerprint",
+    )
+    persisted = bot_module._load_dashboard_runtime_state(settings)  # noqa: SLF001
+    assert persisted["pending_dashboard_message_ids"] == [old.id]
+    assert persisted["dashboard_message_id"] == replacement.id
+    assert "dashboard_send_nonce" not in persisted
+    assert "dashboard_send_predecessor_id" not in persisted
+
+    abandoned_cleanup = updater._dashboard_cleanup_task  # noqa: SLF001
+    assert abandoned_cleanup is not None
+    abandoned_cleanup.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned_cleanup
+
+    class RestartChannel(_FakeChannel):
+        async def history(self, limit=50, **_kwargs):
+            for message in ():
+                yield message
+
+        async def fetch_message(self, message_id):
+            return {
+                replacement.id: replacement,
+                old.id: old,
+            }[message_id]
+
+    restarted = DashboardUpdater(settings)
+    await restarted._reconcile_dashboard_messages(  # noqa: SLF001
+        RestartChannel([replacement])
+    )
+    cleanup = restarted._dashboard_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    await cleanup
+    await asyncio.sleep(0)
+
+    assert old.deleted
+    assert restarted._message is replacement  # noqa: SLF001
+    assert not restarted._pending_dashboard_delete_ids  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_dashboard_rollover_treats_missing_old_message_as_success(monkeypatch):
+    import bot as bot_module
+
+    class MissingMessage(Exception):
+        status = 404
+
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        created_at=datetime.now(UTC) - timedelta(minutes=56),
+        delete_error=MissingMessage("already deleted"),
+    )
+    channel = _FakeChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = old  # noqa: SLF001
+    updater._thread = _FakeThread()  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    assert not updater._pending_dashboard_deletes  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_cancelled_rollover_finishes_single_handoff(monkeypatch):
+    import bot as bot_module
+
+    delete_started = asyncio.Event()
+    release_delete = asyncio.Event()
+
+    class SlowDeleteMessage(_FakeMessage):
+        async def delete(self):
+            delete_started.set()
+            await release_delete.wait()
+            self.deleted = True
+
+    old = SlowDeleteMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        created_at=datetime.now(UTC) - timedelta(minutes=56),
+    )
+    channel = _FakeChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    fingerprint = _payload_fingerprint(payload)
+    updater = DashboardUpdater(_fake_settings())
+    updater._message = old  # noqa: SLF001
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 1.0)
+
+    rollover = asyncio.create_task(
+        updater._rollover_dashboard(channel, payload, fingerprint)  # noqa: SLF001
+    )
+    await delete_started.wait()
+    rollover.cancel()
+    release_delete.set()
+    with pytest.raises(asyncio.CancelledError):
+        await rollover
+
+    assert old.deleted
+    assert len(channel.sent) == 1
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    assert updater._last_payload_fingerprint == fingerprint  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_updater_rolls_dashboard_when_discord_reports_old_edit_cap(monkeypatch):
+    import bot as bot_module
+
+    class OldMessageEditCap(Exception):
+        code = 30046
+
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        created_at=datetime.now(UTC),
+    )
+    channel = _FakeChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = old  # noqa: SLF001
+    updater._thread = _FakeThread()  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    async def reject_edit(*_args, **_kwargs):
+        raise OldMessageEditCap("old-message edit quota reached")
+
+    monkeypatch.setattr(bot_module, "_apply_payload", reject_edit)
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert old.deleted
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    assert updater._last_payload_fingerprint == _payload_fingerprint(payload)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_updater_bounds_discord_edit_retry_wait(monkeypatch):
+    import bot as bot_module
+
+    old = _FakeMessage(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+    channel = _FakeChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = old  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
+
+    async def blocked_edit(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(bot_module, "_apply_payload", blocked_edit)
+
+    await asyncio.wait_for(updater._tick(channel), timeout=0.25)  # noqa: SLF001
+
+    assert updater._last_payload_fingerprint is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_timed_out_accepted_rollover_is_reconciled_before_retry(
+    monkeypatch, tmp_path
+):
+    import bot as bot_module
+
+    class AcceptedThenLostChannel(_FakeChannel):
+        async def history(self, limit=50, **_kwargs):
+            for message in reversed([*self.messages, *self.sent]):
+                yield message
+
+        async def send(self, **kwargs):
+            message = await super().send(**kwargs)
+            if len(self.sent) == 1:
+                await asyncio.Event().wait()
+            return message
+
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=100,
+        created_at=datetime.now(UTC) - timedelta(minutes=56),
+    )
+    channel = AcceptedThenLostChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._message = old  # noqa: SLF001
+    updater._thread = _FakeThread()  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
+
+    await updater._tick(channel)  # noqa: SLF001
+    assert len(channel.sent) == 1
+    assert updater._rollover_uncertain_since is not None  # noqa: SLF001
+
+    await updater._tick(channel)  # noqa: SLF001
+    cleanup = updater._dashboard_cleanup_task  # noqa: SLF001
+    if cleanup is not None:
+        await cleanup
+        await asyncio.sleep(0)
+
+    assert len(channel.sent) == 1
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    assert updater._rollover_uncertain_since is None  # noqa: SLF001
+    assert old.deleted
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_never_downgrades_to_a_pending_stale_message():
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=100,
+    )
+    replacement = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=200,
+    )
+    channel = _FakeChannel([old])
+    updater = DashboardUpdater(_fake_settings())
+    updater._message = replacement  # noqa: SLF001
+    updater._pending_dashboard_deletes[old.id] = old  # noqa: SLF001
+    updater._pending_dashboard_delete_ids.add(old.id)  # noqa: SLF001
+
+    await updater._reconcile_dashboard_messages(channel)  # noqa: SLF001
+    cleanup = updater._dashboard_cleanup_task  # noqa: SLF001
+    if cleanup is not None:
+        await cleanup
+        await asyncio.sleep(0)
+
+    assert updater._message is replacement  # noqa: SLF001
+    assert not replacement.deleted
+    assert old.deleted
+    assert replacement.id not in updater._pending_dashboard_deletes  # noqa: SLF001
+    assert replacement.id not in updater._pending_dashboard_delete_ids  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_timed_out_accepted_initial_send_is_reconciled_before_retry(
+    monkeypatch, tmp_path
+):
+    import bot as bot_module
+
+    class AcceptedThenLostInitialChannel(_FakeChannel):
+        def __init__(self):
+            super().__init__([])
+            self.history_calls = 0
+
+        async def history(self, limit=50, **_kwargs):
+            self.history_calls += 1
+            if self.history_calls == 3:
+                raise RuntimeError("temporary history failure")
+            if self.history_calls >= 4:
+                for message in reversed([*self.messages, *self.sent]):
+                    yield message
+
+        async def send(self, **kwargs):
+            message = await super().send(**kwargs)
+            if len(self.sent) == 1:
+                await asyncio.Event().wait()
+            return message
+
+    channel = AcceptedThenLostInitialChannel()
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
+
+    def prepare(updater):
+        updater._running = True  # noqa: SLF001
+        updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)  # noqa: SLF001
+        monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+        monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(
+            updater, "_post_alert_events", lambda _results: asyncio.sleep(0)
+        )
+
+    first = DashboardUpdater(settings)
+    prepare(first)
+    with pytest.raises(TimeoutError):
+        await first._tick(channel)  # noqa: SLF001
+    assert len(channel.sent) == 1
+    assert first._rollover_uncertain_since is not None  # noqa: SLF001
+    assert first._dashboard_send_nonce is not None  # noqa: SLF001
+
+    restarted = DashboardUpdater(settings)
+    prepare(restarted)
+    assert restarted._rollover_uncertain_since is not None  # noqa: SLF001
+    assert (  # noqa: SLF001
+        restarted._dashboard_send_nonce == first._dashboard_send_nonce
+    )
+
+    # A failed strict scan must keep the send blocked, not fall through to the
+    # best-effort ensure path and create a second dashboard.
+    await restarted._tick(channel)  # noqa: SLF001
+    assert len(channel.sent) == 1
+    assert restarted._message is None  # noqa: SLF001
+    assert restarted._rollover_uncertain_since is not None  # noqa: SLF001
+
+    await restarted._tick(channel)  # noqa: SLF001
+    assert len(channel.sent) == 1
+    assert restarted._message is channel.sent[0]  # noqa: SLF001
+    assert restarted._rollover_uncertain_since is None  # noqa: SLF001
+    assert restarted._dashboard_send_nonce is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_initial_send_nonce_deduplicates_before_history_is_visible(
+    monkeypatch, tmp_path
+):
+    import bot as bot_module
+
+    class DelayedHistoryChannel(_FakeChannel):
+        def __init__(self):
+            super().__init__([])
+            self.by_nonce = {}
+            self.attempt_nonces = []
+
+        async def history(self, limit=50, **_kwargs):
+            for message in self.messages:
+                yield message
+
+        async def send(self, **kwargs):
+            nonce = kwargs["nonce"]
+            self.attempt_nonces.append(nonce)
+            if nonce in self.by_nonce:
+                return self.by_nonce[nonce]
+            message = await super().send(**kwargs)
+            self.by_nonce[nonce] = message
+            await asyncio.Event().wait()
+
+    channel = DelayedHistoryChannel()
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
+
+    def prepare(updater):
+        updater._running = True  # noqa: SLF001
+        updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)  # noqa: SLF001
+        monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+        monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+        monkeypatch.setattr(
+            updater, "_post_alert_events", lambda _results: asyncio.sleep(0)
+        )
+
+    first = DashboardUpdater(settings)
+    prepare(first)
+    with pytest.raises(TimeoutError):
+        await first._tick(channel)  # noqa: SLF001
+
+    nonce = first._dashboard_send_nonce  # noqa: SLF001
+    assert nonce is not None
+    assert channel.attempt_nonces == [nonce]
+    assert len(channel.sent) == 1
+
+    restarted = DashboardUpdater(settings)
+    prepare(restarted)
+    assert restarted._dashboard_send_nonce == nonce  # noqa: SLF001
+
+    await restarted._tick(channel)  # noqa: SLF001
+
+    assert channel.attempt_nonces == [nonce, nonce]
+    assert len(channel.sent) == 1
+    assert restarted._message is channel.sent[0]  # noqa: SLF001
+    assert restarted._rollover_uncertain_since is None  # noqa: SLF001
+    assert restarted._dashboard_send_nonce is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_rollover_nonce_deduplicates_before_history_is_visible(
+    monkeypatch, tmp_path
+):
+    import bot as bot_module
+
+    class DelayedHistoryChannel(_FakeChannel):
+        def __init__(self, messages):
+            super().__init__(messages)
+            self.by_nonce = {}
+            self.attempt_nonces = []
+
+        async def send(self, **kwargs):
+            nonce = kwargs["nonce"]
+            self.attempt_nonces.append(nonce)
+            if nonce in self.by_nonce:
+                return self.by_nonce[nonce]
+            message = await super().send(**kwargs)
+            self.by_nonce[nonce] = message
+            await asyncio.Event().wait()
+
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=100,
+        created_at=datetime.now(UTC) - timedelta(minutes=56),
+    )
+    channel = DelayedHistoryChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._message = old  # noqa: SLF001
+    updater._thread = _FakeThread()  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    nonce = updater._dashboard_send_nonce  # noqa: SLF001
+    assert nonce is not None
+    assert channel.attempt_nonces == [nonce]
+    assert len(channel.sent) == 1
+    assert not old.deleted
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert channel.attempt_nonces == [nonce, nonce]
+    assert len(channel.sent) == 1
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    assert updater._rollover_uncertain_since is None  # noqa: SLF001
+    assert updater._dashboard_send_nonce is None  # noqa: SLF001
+    assert old.deleted
+
+
+@pytest.mark.asyncio
+async def test_send_nonce_keeps_original_window_and_stops_after_retry_horizon(
+    monkeypatch, tmp_path
+):
+    import bot as bot_module
+
+    class DelayedHistoryChannel(_FakeChannel):
+        def __init__(self):
+            super().__init__([])
+            self.by_nonce = {}
+            self.attempt_nonces = []
+            self.visible = False
+
+        async def history(self, limit=50, **_kwargs):
+            if self.visible:
+                for message in self.sent:
+                    yield message
+
+        async def send(self, **kwargs):
+            nonce = kwargs["nonce"]
+            self.attempt_nonces.append(nonce)
+            if nonce not in self.by_nonce:
+                self.by_nonce[nonce] = await super().send(**kwargs)
+            await asyncio.Event().wait()
+
+    now = [1_000.0]
+    monkeypatch.setattr(bot_module.time, "time", lambda: now[0])
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
+    channel = DelayedHistoryChannel()
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    with pytest.raises(TimeoutError):
+        await updater._tick(channel)  # noqa: SLF001
+    nonce = updater._dashboard_send_nonce  # noqa: SLF001
+    started_at = updater._rollover_uncertain_since  # noqa: SLF001
+    assert started_at == 1_000.0
+
+    for retry_at in (1_030.0, 1_060.0):
+        now[0] = retry_at
+        with pytest.raises(TimeoutError):
+            await updater._tick(channel)  # noqa: SLF001
+        assert updater._rollover_uncertain_since == started_at  # noqa: SLF001
+
+    now[0] = 1_121.0
+    await updater._tick(channel)  # noqa: SLF001
+    assert channel.attempt_nonces == [nonce, nonce, nonce]
+    assert updater._dashboard_send_nonce == nonce  # noqa: SLF001
+    assert updater._rollover_uncertain_since == started_at  # noqa: SLF001
+
+    channel.visible = True
+    now[0] = 1_130.0
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert len(channel.sent) == 1
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    assert updater._dashboard_send_nonce is None  # noqa: SLF001
+    assert updater._rollover_uncertain_since is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_dashboard_send_is_never_attempted_without_persisted_recovery_state(
+    monkeypatch,
+):
+    import bot as bot_module
+
+    channel = _FakeChannel([])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+    monkeypatch.setattr(
+        bot_module,
+        "_store_dashboard_runtime_state",
+        lambda _settings, _state: False,
+    )
+
+    with pytest.raises(RuntimeError, match="create deferred"):
+        await updater._tick(channel)  # noqa: SLF001
+    assert not channel.sent
+
+    with pytest.raises(RuntimeError, match="retry deferred"):
+        await updater._tick(channel)  # noqa: SLF001
+    assert not channel.sent
+
+
+@pytest.mark.asyncio
+async def test_first_explicit_send_rejection_starts_a_fresh_episode(monkeypatch):
+    import bot as bot_module
+
+    class ExplicitRejection(Exception):
+        status = 403
+
+    class RejectOnceChannel(_FakeChannel):
+        def __init__(self):
+            super().__init__([])
+            self.attempts = 0
+
+        async def send(self, **kwargs):
+            self.attempts += 1
+            bot_module._note_dashboard_send_wire_attempt(  # noqa: SLF001
+                "POST",
+                SimpleNamespace(path="/api/v10/channels/123/messages"),
+            )
+            if self.attempts == 1:
+                raise ExplicitRejection("missing permissions")
+            return await super().send(**kwargs)
+
+    channel = RejectOnceChannel()
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    with pytest.raises(ExplicitRejection):
+        await updater._tick(channel)  # noqa: SLF001
+    assert updater._dashboard_send_nonce is None  # noqa: SLF001
+    assert updater._rollover_uncertain_since is None  # noqa: SLF001
+
+    await updater._tick(channel)  # noqa: SLF001
+    assert channel.attempts == 2
+    assert len(channel.sent) == 1
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_internal_retry_then_rejection_retains_original_send_nonce(monkeypatch):
+    import bot as bot_module
+
+    class ExplicitRejection(Exception):
+        status = 403
+
+    class CommitThenRetryRejectedChannel(_FakeChannel):
+        def __init__(self):
+            super().__init__([])
+            self.application_nonces = []
+            self.wire_nonces = []
+            self.committed = None
+
+        async def history(self, limit=50, **_kwargs):
+            for message in ():
+                yield message
+
+        async def send(self, **kwargs):
+            nonce = kwargs["nonce"]
+            self.application_nonces.append(nonce)
+            if self.committed is None:
+                self.committed = _FakeMessage(
+                    _FakeAuthor(bot=True),
+                    kwargs.get("content", ""),
+                    id=1001,
+                )
+                self.committed.nonce = nonce
+                self.sent.append(self.committed)
+                for _ in range(2):
+                    self.wire_nonces.append(nonce)
+                    bot_module._note_dashboard_send_wire_attempt(  # noqa: SLF001
+                        "POST",
+                        SimpleNamespace(path="/api/v10/channels/123/messages"),
+                    )
+                raise ExplicitRejection("retry lost permissions")
+
+            self.wire_nonces.append(nonce)
+            bot_module._note_dashboard_send_wire_attempt(  # noqa: SLF001
+                "POST",
+                SimpleNamespace(path="/api/v10/channels/123/messages"),
+            )
+            assert nonce == self.committed.nonce
+            return self.committed
+
+    channel = CommitThenRetryRejectedChannel()
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    with pytest.raises(ExplicitRejection):
+        await updater._tick(channel)  # noqa: SLF001
+    nonce = updater._dashboard_send_nonce  # noqa: SLF001
+    assert nonce is not None
+    assert channel.wire_nonces == [nonce, nonce]
+
+    await updater._tick(channel)  # noqa: SLF001
+    assert channel.application_nonces == [nonce, nonce]
+    assert channel.wire_nonces == [nonce, nonce, nonce]
+    assert len(channel.sent) == 1
+    assert updater._dashboard_send_nonce is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_restart_fetches_confirmed_initial_message_hidden_from_history(
+    monkeypatch,
+    tmp_path,
+):
+    import bot as bot_module
+
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    first_channel = _FakeChannel([])
+    first = DashboardUpdater(settings)
+    first._running = True  # noqa: SLF001
+    first._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(first, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(first, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(first, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await first._tick(first_channel)  # noqa: SLF001
+    confirmed = first._message  # noqa: SLF001
+    persisted = bot_module._load_dashboard_runtime_state(settings)  # noqa: SLF001
+    assert persisted["dashboard_message_id"] == confirmed.id
+
+    class HiddenConfirmedChannel(_FakeChannel):
+        async def history(self, limit=50, **_kwargs):
+            for message in ():
+                yield message
+
+        async def fetch_message(self, message_id):
+            assert message_id == confirmed.id
+            return confirmed
+
+    restart_channel = HiddenConfirmedChannel([])
+    restarted = DashboardUpdater(settings)
+    restarted._running = True  # noqa: SLF001
+    restarted._snapshot = bot_module.CollectionSnapshot({}, 2, 0.0)
+    monkeypatch.setattr(restarted, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(restarted, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(
+        restarted,
+        "_post_alert_events",
+        lambda _results: asyncio.sleep(0),
+    )
+
+    await restarted._tick(restart_channel)  # noqa: SLF001
+
+    assert restarted._message is confirmed  # noqa: SLF001
+    assert not restart_channel.sent
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_confirmed_message_fetch_blocks_new_create(
+    monkeypatch,
+    tmp_path,
+):
+    import bot as bot_module
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "pending_dashboard_message_ids": [],
+            "dashboard_message_id": 1001,
+        },
+    )
+
+    class FailingFetchChannel(_FakeChannel):
+        async def history(self, limit=50, **_kwargs):
+            for message in ():
+                yield message
+
+        async def fetch_message(self, _message_id):
+            raise RuntimeError("temporary canonical fetch failure")
+
+    channel = FailingFetchChannel([])
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert not updater._dashboard_messages_reconciled  # noqa: SLF001
+    assert updater._persisted_dashboard_message_id == 1001  # noqa: SLF001
+    assert not channel.sent
+
+
+@pytest.mark.asyncio
+async def test_unreconciled_fallback_cannot_replace_confirmed_ownership(
+    monkeypatch,
+    tmp_path,
+):
+    import bot as bot_module
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    stale = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=50,
+    )
+    confirmed = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=100,
+    )
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "pending_dashboard_message_ids": [stale.id],
+            "dashboard_message_id": confirmed.id,
+        },
+    )
+
+    class DelayedCanonicalChannel(_FakeChannel):
+        def __init__(self):
+            super().__init__([stale])
+            self.canonical_fetches = 0
+
+        async def fetch_message(self, message_id):
+            if message_id == confirmed.id:
+                self.canonical_fetches += 1
+                if self.canonical_fetches == 1:
+                    raise RuntimeError("temporary canonical fetch failure")
+                return confirmed
+            if message_id == stale.id:
+                return stale
+            return await super().fetch_message(message_id)
+
+    channel = DelayedCanonicalChannel()
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._message = stale  # noqa: SLF001 - provisional startup fallback
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    thread_calls = []
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(
+        updater,
+        "_ensure_thread",
+        lambda: thread_calls.append(True) or asyncio.sleep(0),
+    )
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    persisted = bot_module._load_dashboard_runtime_state(settings)  # noqa: SLF001
+    assert persisted["dashboard_message_id"] == confirmed.id
+    assert persisted["pending_dashboard_message_ids"] == [stale.id]
+    assert not thread_calls
+    assert not channel.sent
+
+    await updater._tick(channel)  # noqa: SLF001
+    cleanup = updater._dashboard_cleanup_task  # noqa: SLF001
+    if cleanup is not None:
+        await cleanup
+        await asyncio.sleep(0)
+
+    assert channel.canonical_fetches == 2
+    assert updater._message is confirmed  # noqa: SLF001
+    assert stale.deleted
+    assert not channel.sent
+
+
+@pytest.mark.asyncio
+async def test_missing_confirmed_message_allows_fresh_create(monkeypatch, tmp_path):
+    import bot as bot_module
+
+    class MissingMessage(Exception):
+        status = 404
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "pending_dashboard_message_ids": [],
+            "dashboard_message_id": 1001,
+        },
+    )
+
+    class MissingConfirmedChannel(_FakeChannel):
+        async def history(self, limit=50, **_kwargs):
+            for message in ():
+                yield message
+
+        async def fetch_message(self, _message_id):
+            raise MissingMessage("confirmed dashboard was deleted")
+
+    channel = MissingConfirmedChannel([])
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert len(channel.sent) == 1
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    persisted = bot_module._load_dashboard_runtime_state(settings)  # noqa: SLF001
+    assert persisted["dashboard_message_id"] == channel.sent[0].id
+
+
+@pytest.mark.asyncio
+async def test_unobserved_rejection_conservatively_retains_send_nonce(monkeypatch):
+    import bot as bot_module
+
+    class ExplicitRejection(Exception):
+        status = 403
+
+    class UntracedRejectChannel(_FakeChannel):
+        async def send(self, **_kwargs):
+            raise ExplicitRejection("transport provenance unavailable")
+
+    channel = UntracedRejectChannel([])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    with pytest.raises(ExplicitRejection):
+        await updater._tick(channel)  # noqa: SLF001
+
+    assert updater._dashboard_send_nonce is not None  # noqa: SLF001
+    assert updater._rollover_uncertain_since is not None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_first_explicit_rollover_rejection_can_retry(monkeypatch):
+    import bot as bot_module
+
+    class ExplicitRejection(Exception):
+        status = 403
+
+    class RejectOnceChannel(_FakeChannel):
+        def __init__(self, messages):
+            super().__init__(messages)
+            self.attempts = 0
+
+        async def send(self, **kwargs):
+            self.attempts += 1
+            bot_module._note_dashboard_send_wire_attempt(  # noqa: SLF001
+                "POST",
+                SimpleNamespace(path="/api/v10/channels/123/messages"),
+            )
+            if self.attempts == 1:
+                raise ExplicitRejection("missing permissions")
+            return await super().send(**kwargs)
+
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=100,
+        created_at=datetime.now(UTC) - timedelta(minutes=56),
+    )
+    channel = RejectOnceChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = old  # noqa: SLF001
+    updater._thread = _FakeThread()  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+    assert channel.attempts == 1
+    assert updater._dashboard_send_nonce is None  # noqa: SLF001
+    assert updater._message is old  # noqa: SLF001
+    assert not old.deleted
+
+    await updater._tick(channel)  # noqa: SLF001
+    assert channel.attempts == 2
+    assert len(channel.sent) == 1
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    assert old.deleted
+
+
+@pytest.mark.asyncio
+async def test_replay_rejection_cannot_clear_a_prior_ambiguous_send(monkeypatch):
+    import bot as bot_module
+
+    class ExplicitRejection(Exception):
+        status = 403
+
+    class LostThenRejectedChannel(_FakeChannel):
+        def __init__(self):
+            super().__init__([])
+            self.attempts = 0
+
+        async def history(self, limit=50, **_kwargs):
+            for message in self.messages:
+                yield message
+
+        async def send(self, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                await super().send(**kwargs)
+                await asyncio.Event().wait()
+            raise ExplicitRejection("permissions changed after ambiguous send")
+
+    channel = LostThenRejectedChannel()
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError):
+        await updater._tick(channel)  # noqa: SLF001
+    nonce = updater._dashboard_send_nonce  # noqa: SLF001
+    started_at = updater._rollover_uncertain_since  # noqa: SLF001
+
+    with pytest.raises(ExplicitRejection):
+        await updater._tick(channel)  # noqa: SLF001
+    assert updater._dashboard_send_nonce == nonce  # noqa: SLF001
+    assert updater._rollover_uncertain_since == started_at  # noqa: SLF001
+
+    monkeypatch.setattr(bot_module, "DASHBOARD_SEND_NONCE_RETRY_SECONDS", 0)
+    await updater._tick(channel)  # noqa: SLF001
+    assert channel.attempts == 2
+    assert len(channel.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_restarted_hidden_rollover_retires_predecessor_and_edits_current_payload(
+    monkeypatch, tmp_path
+):
+    import bot as bot_module
+
+    class HiddenRolloverChannel(_FakeChannel):
+        def __init__(self, messages):
+            super().__init__(messages)
+            self.by_nonce = {}
+            self.attempt_nonces = []
+
+        async def history(self, limit=50, **_kwargs):
+            for message in ():
+                yield message
+
+        async def send(self, **kwargs):
+            nonce = kwargs["nonce"]
+            self.attempt_nonces.append(nonce)
+            if nonce in self.by_nonce:
+                return self.by_nonce[nonce]
+            message = await super().send(**kwargs)
+            self.by_nonce[nonce] = message
+            await asyncio.Event().wait()
+
+    old = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=100,
+        created_at=datetime.now(UTC) - timedelta(minutes=56),
+    )
+    channel = HiddenRolloverChannel([old])
+    first_payload = DashboardPayload(
+        embeds=[bot_module.discord.Embed(title="first")]
+    )
+    current_payload = DashboardPayload(
+        embeds=[bot_module.discord.Embed(title="current")]
+    )
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
+
+    first = DashboardUpdater(settings)
+    first._running = True  # noqa: SLF001
+    first._message = old  # noqa: SLF001
+    first._thread = _FakeThread()  # noqa: SLF001
+    first._dashboard_messages_reconciled = True  # noqa: SLF001
+    first._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(first, "_snapshot_payload", lambda: first_payload)
+    monkeypatch.setattr(first, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(first, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await first._tick(channel)  # noqa: SLF001
+    nonce = first._dashboard_send_nonce  # noqa: SLF001
+    assert nonce is not None
+    assert first._dashboard_send_predecessor_id == old.id  # noqa: SLF001
+    assert not old.deleted
+
+    restarted = DashboardUpdater(settings)
+    restarted._running = True  # noqa: SLF001
+    restarted._snapshot = bot_module.CollectionSnapshot({}, 2, 0.0)
+    monkeypatch.setattr(restarted, "_snapshot_payload", lambda: current_payload)
+    monkeypatch.setattr(restarted, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(
+        restarted, "_post_alert_events", lambda _results: asyncio.sleep(0)
+    )
+
+    await restarted._tick(channel)  # noqa: SLF001
+    cleanup = restarted._dashboard_cleanup_task  # noqa: SLF001
+    if cleanup is not None:
+        await cleanup
+        await asyncio.sleep(0)
+
+    assert channel.attempt_nonces == [nonce, nonce]
+    assert len(channel.sent) == 1
+    assert restarted._message is channel.sent[0]  # noqa: SLF001
+    assert restarted._message.embeds[0].title == "current"  # noqa: SLF001
+    assert restarted._last_payload_fingerprint == _payload_fingerprint(  # noqa: SLF001
+        current_payload
+    )
+    assert restarted._dashboard_send_nonce is None  # noqa: SLF001
+    assert restarted._dashboard_send_predecessor_id is None  # noqa: SLF001
+    assert old.deleted
+
+
+@pytest.mark.asyncio
+async def test_nonce_replay_cannot_replace_a_newer_canonical_dashboard(monkeypatch):
+    import bot as bot_module
+
+    nonce = 123456
+    replay = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=1001,
+    )
+    replay.nonce = nonce
+    newer = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=2000,
+    )
+
+    class ReplayChannel(_FakeChannel):
+        async def send(self, **kwargs):
+            self.send_kwargs.append(kwargs)
+            return replay
+
+    channel = ReplayChannel([newer])
+    payload = DashboardPayload(embeds=[bot_module.discord.Embed(title="current")])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._message = newer  # noqa: SLF001
+    updater._dashboard_messages_reconciled = True  # noqa: SLF001
+    updater._dashboard_send_retry_ready = True  # noqa: SLF001
+    updater._dashboard_send_nonce = nonce  # noqa: SLF001
+    updater._rollover_uncertain_since = bot_module.time.time()  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+    cleanup = updater._dashboard_cleanup_task  # noqa: SLF001
+    if cleanup is not None:
+        await cleanup
+        await asyncio.sleep(0)
+
+    assert updater._message is newer  # noqa: SLF001
+    assert not newer.deleted
+    assert newer.edits == 1
+    assert replay.deleted
+    assert updater._last_payload_fingerprint == _payload_fingerprint(payload)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciles_uncertain_send_before_creating(monkeypatch, tmp_path):
+    import bot as bot_module
+
+    class WindowOnlyChannel(_FakeChannel):
+        async def history(self, limit=50, **kwargs):
+            if kwargs.get("after") is not None:
+                yield replacement
+
+    replacement = _FakeMessage(
+        _FakeAuthor(bot=True),
+        DASHBOARD_MESSAGE_MARKER,
+        id=200,
+        created_at=datetime.now(UTC),
+    )
+    channel = WindowOnlyChannel([])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "pending_dashboard_message_ids": [],
+            "rollover_uncertain_since": datetime.now(UTC).timestamp(),
+        },
+    )
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert updater._message is replacement  # noqa: SLF001
+    assert updater._rollover_uncertain_since is None  # noqa: SLF001
+    assert replacement.edits == 1
+    assert not channel.sent
+
+
+@pytest.mark.asyncio
+async def test_discord_global_gate_self_recovers_if_retry_is_cancelled(
+    monkeypatch,
+):
+    import bot as bot_module
+
+    event = asyncio.Event()
+    event.set()
+    http = SimpleNamespace(max_ratelimit_timeout=None, _global_over=event)
+    monkeypatch.setattr(bot_module, "DISCORD_MAX_RATELIMIT_RETRY_SECONDS", 0.01)
+
+    # The first configuration precedes login; discord.py's static_login then
+    # replaces the Event, and on_ready must wrap that replacement again.
+    bot_module._configure_discord_http_deadlines(http)  # noqa: SLF001
+    login_event = asyncio.Event()
+    login_event.set()
+    http._global_over = login_event
+    bot_module._configure_discord_http_deadlines(http)  # noqa: SLF001
+
+    assert isinstance(
+        http._global_over, bot_module._CancellationSafeDiscordGlobalGate  # noqa: SLF001
+    )
+    assert http._global_over._event is login_event  # noqa: SLF001
+    http._global_over.clear()
+    assert not http._global_over.is_set()
+    await asyncio.sleep(0.02)
+
+    assert http.max_ratelimit_timeout == 0.01
+    assert http._global_over.is_set()
+
+
+@pytest.mark.asyncio
+async def test_first_rollover_captures_existing_status_thread(monkeypatch, tmp_path):
+    import bot as bot_module
+
+    thread = _FakeThread()
+    thread.id = 100
+    old = _ThreadedMessage(thread)
+    old.id = 100
+    old.created_at = datetime.now(UTC) - timedelta(minutes=56)
+    channel = _FakeChannel([old])
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._message = old  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert old.deleted
+    assert updater._message is channel.sent[0]  # noqa: SLF001
+    assert updater._thread is thread  # noqa: SLF001
+    assert updater._status_thread_id == thread.id  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_edit_log_keeps_payload_generation_when_new_snapshot_publishes(monkeypatch, caplog):
     import bot as bot_module
 
@@ -340,7 +1686,7 @@ async def test_edit_log_keeps_payload_generation_when_new_snapshot_publishes(mon
 
 
 @pytest.mark.asyncio
-async def test_pending_retained_map_waits_for_settlement_then_updates(monkeypatch, caplog):
+async def test_pending_retained_map_does_not_suppress_changed_dashboard(monkeypatch, caplog):
     import discord
 
     import bot as bot_module
@@ -353,7 +1699,10 @@ async def test_pending_retained_map_waits_for_settlement_then_updates(monkeypatc
     monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
     old = b"old-map"
     fresh = b"fresh-map"
-    old_payload = DashboardPayload(files=[ImageAsset(traffic_map_filename(old), old)])
+    old_payload = DashboardPayload(
+        files=[ImageAsset(traffic_map_filename(old), old)],
+        embeds=[discord.Embed(title="old source")],
+    )
     fresh_payload = DashboardPayload(files=[ImageAsset(traffic_map_filename(fresh), fresh)])
     current_payload = old_payload
     monkeypatch.setattr(updater, "_snapshot_payload", lambda: current_payload)
@@ -368,7 +1717,21 @@ async def test_pending_retained_map_waits_for_settlement_then_updates(monkeypatc
         stale_providers=frozenset({"traffic_map"}),
     )
     await updater._tick(object())  # noqa: SLF001
-    assert not edits
+    assert len(edits) == 1
+
+    # A replacement capture can be pending for several ticks.  Changed
+    # non-map data must still be presented with the retained last-good map.
+    current_payload = DashboardPayload(
+        files=[ImageAsset(traffic_map_filename(old), old)],
+        embeds=[discord.Embed(title="changed source")],
+    )
+    updater._snapshot = bot_module.CollectionSnapshot(
+        {"traffic_map": (old, [])}, 2, 0.0,
+        stale_providers=frozenset({"traffic_map"}),
+    )
+    await updater._tick(object())  # noqa: SLF001
+    assert len(edits) == 2
+    assert edits[-1].embeds[0].title == "changed source"
 
     current_payload = fresh_payload
     updater._snapshot = bot_module.CollectionSnapshot(
@@ -377,7 +1740,9 @@ async def test_pending_retained_map_waits_for_settlement_then_updates(monkeypatc
     )
     with caplog.at_level("INFO", logger="bot"):
         await updater._tick(object())  # noqa: SLF001
-    assert len(edits) == 1
+    assert len(edits) == 3
+    # The log is paired with the snapshot that supplied this payload (gen 2),
+    # even though the next ordinary collection has not yet settled.
     assert "collection_generation=2" in caplog.text
     assert traffic_map_filename(fresh) in caplog.text
 
@@ -392,16 +1757,17 @@ async def test_pending_retained_map_waits_for_settlement_then_updates(monkeypatc
         settled_providers=frozenset({"traffic_map"}),
     )
     await updater._tick(object())  # noqa: SLF001
-    assert len(edits) == 2
+    assert len(edits) == 4
 
 
 @pytest.mark.asyncio
-async def test_map_gate_uses_snapshot_paired_with_payload_during_message_resolution(monkeypatch):
+async def test_snapshot_payload_pairing_survives_message_resolution(monkeypatch):
     import bot as bot_module
     from dashboard.render import traffic_map_filename
 
     updater = DashboardUpdater(_fake_settings())
     updater._running = True  # noqa: SLF001
+    updater._dashboard_messages_reconciled = True  # noqa: SLF001
     old = b"old-map"
     old_payload = DashboardPayload(files=[ImageAsset(traffic_map_filename(old), old)])
     updater._snapshot = bot_module.CollectionSnapshot(
@@ -414,7 +1780,7 @@ async def test_map_gate_uses_snapshot_paired_with_payload_during_message_resolut
     resolving = asyncio.Event()
     release = asyncio.Event()
 
-    async def resolve(_channel, _payload, view=None):
+    async def resolve(_channel, _payload, view=None, **_kwargs):
         resolving.set()
         await release.wait()
         return _FakeMessage(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
@@ -430,7 +1796,10 @@ async def test_map_gate_uses_snapshot_paired_with_payload_during_message_resolut
     )
     release.set()
     await tick
-    assert not edits
+    assert len(edits) == 1
+    # The payload was captured before the await and must remain the payload
+    # presented by this tick, even though a newer snapshot became available.
+    assert edits[0] is old_payload
 
 
 @pytest.mark.asyncio
@@ -816,7 +2185,7 @@ async def test_independent_map_keeps_retained_traffic_and_important_road_overlay
 
 
 @pytest.mark.asyncio
-async def test_old_independent_map_cannot_publish_as_a_newer_generation(monkeypatch):
+async def test_late_independent_map_merges_into_newest_collection(monkeypatch):
     import bot as bot_module
 
     first_collection_done = asyncio.Event()
@@ -865,10 +2234,72 @@ async def test_old_independent_map_cannot_publish_as_a_newer_generation(monkeypa
     map_release.set()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert "traffic_map" not in updater._snapshot.results  # noqa: SLF001
+    assert updater._snapshot.results["traffic_map"] == (  # noqa: SLF001
+        b"old-generation-map", []
+    )
 
     second_collection_release.set()
     await updater.stop()
+
+
+@pytest.mark.asyncio
+async def test_replaced_independent_map_completion_cannot_overwrite_current_task():
+    import bot as bot_module
+
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._collection_generation = 2  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot(
+        {"weather": (None, [], None)}, 2, 0.0
+    )
+    stale = asyncio.create_task(asyncio.sleep(0, result=(b"stale-map", [])))
+    current = asyncio.create_task(asyncio.sleep(0, result=(b"current-map", [])))
+    await asyncio.gather(stale, current)
+    updater._map_task = current  # noqa: SLF001
+    updater._map_generation = 1  # noqa: SLF001
+
+    updater._map_finished(stale, 1)  # noqa: SLF001
+    assert updater._snapshot.results.get("traffic_map") is None  # noqa: SLF001
+    assert updater._map_task is current  # noqa: SLF001
+
+    updater._map_finished(current, 1)  # noqa: SLF001
+    assert updater._snapshot.results["traffic_map"] == (  # noqa: SLF001
+        b"current-map", []
+    )
+
+
+@pytest.mark.asyncio
+async def test_collection_fallback_keeps_returned_non_map_after_independent_map():
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True  # noqa: SLF001
+    updater._collection_generation = 1  # noqa: SLF001
+
+    # The independent map completion may publish before an alternate
+    # collector returns its aggregate dictionary.  The fallback must retain
+    # that map while still publishing providers absent from settled_providers.
+    updater._publish_provider_result(  # noqa: SLF001
+        0, "traffic_map", (b"independent-map", []), independent_map=True
+    )
+    collection = asyncio.create_task(
+        asyncio.sleep(
+            0,
+            result={
+                "traffic_map": (b"returned-map", []),
+                "weather": (None, [], None),
+            },
+        )
+    )
+    await collection
+    updater._collection_task = collection  # noqa: SLF001
+    updater._collection_finished(collection)  # noqa: SLF001
+
+    assert updater._snapshot.results["traffic_map"] == (  # noqa: SLF001
+        b"independent-map", []
+    )
+    assert updater._snapshot.results["weather"] == (None, [], None)  # noqa: SLF001
+    assert updater._snapshot.settled_providers == frozenset({  # noqa: SLF001
+        "traffic_map", "weather"
+    })
 
 
 @pytest.mark.asyncio
@@ -1360,6 +2791,216 @@ async def test_updater_fetches_archived_thread_with_discord_py_23_shape():
     assert message.fetched_ids == [message.id]
     assert message.created_threads == 0
     assert thread.edits == [{"archived": False}]
+
+
+@pytest.mark.asyncio
+async def test_updater_recovers_persisted_status_thread_after_rollover(tmp_path):
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    thread = _FakeThread()
+    thread.id = 321
+    first = DashboardUpdater(settings)
+    first._message = _ThreadedMessage(thread)  # noqa: SLF001
+
+    await first._ensure_thread()  # noqa: SLF001
+
+    fetched_ids = []
+
+    async def fetch_channel(channel_id):
+        fetched_ids.append(channel_id)
+        return thread
+
+    replacement = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=999
+    )
+    replacement.guild = SimpleNamespace(fetch_channel=fetch_channel)
+    restarted = DashboardUpdater(settings)
+    restarted._message = replacement  # noqa: SLF001
+
+    await restarted._ensure_thread()  # noqa: SLF001
+
+    assert fetched_ids == [thread.id]
+    assert restarted._thread is thread  # noqa: SLF001
+    assert restarted._status_thread_id == thread.id  # noqa: SLF001
+    assert replacement.id != thread.id
+
+
+def test_updater_ignores_non_object_runtime_state(tmp_path):
+    import bot as bot_module
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    bot_module._dashboard_runtime_state_path(settings.cache_dir).write_text(  # noqa: SLF001
+        "[]", encoding="utf-8"
+    )
+
+    updater = DashboardUpdater(settings)
+
+    assert updater._status_thread_id is None  # noqa: SLF001
+    assert not updater._pending_dashboard_delete_ids  # noqa: SLF001
+
+
+def test_failed_thread_state_write_is_retried(monkeypatch, tmp_path):
+    import bot as bot_module
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    updater = DashboardUpdater(settings)
+    thread = _FakeThread()
+    thread.id = 321
+    outcomes = iter([False, True])
+    writes = []
+
+    def store(_settings, state):
+        writes.append(state)
+        return next(outcomes)
+
+    monkeypatch.setattr(bot_module, "_store_dashboard_runtime_state", store)
+
+    updater._remember_status_thread(thread)  # noqa: SLF001
+    assert updater._persisted_status_thread_id is None  # noqa: SLF001
+    updater._remember_status_thread(thread)  # noqa: SLF001
+
+    assert len(writes) == 2
+    assert updater._persisted_status_thread_id == thread.id  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_updater_reconciles_interrupted_rollover_without_new_copy():
+    old = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=100
+    )
+    replacement = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=200
+    )
+    channel = _FakeChannel([old, replacement])
+    updater = DashboardUpdater(_fake_settings())
+    updater._message = old  # noqa: SLF001
+    updater._last_payload_fingerprint = "belongs-to-old"  # noqa: SLF001
+
+    await updater._reconcile_dashboard_messages(channel)  # noqa: SLF001
+    cleanup = updater._dashboard_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    await cleanup
+    await asyncio.sleep(0)
+
+    assert updater._message is replacement  # noqa: SLF001
+    assert updater._last_payload_fingerprint is None  # noqa: SLF001
+    assert old.deleted
+    assert len(channel.sent) == 0
+    assert not updater._pending_dashboard_deletes  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_updater_recovers_persisted_stale_message_outside_history(tmp_path):
+    import bot as bot_module
+
+    class HiddenStaleChannel(_FakeChannel):
+        def __init__(self, messages, hidden):
+            super().__init__(messages)
+            self.hidden = hidden
+
+        async def fetch_message(self, message_id):
+            if message_id in self.hidden:
+                return self.hidden[message_id]
+            return await super().fetch_message(message_id)
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    old = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=100
+    )
+    current = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=200
+    )
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "pending_dashboard_message_ids": [old.id],
+        },
+    )
+    channel = HiddenStaleChannel([current], {old.id: old})
+    updater = DashboardUpdater(settings)
+    updater._message = current  # noqa: SLF001
+
+    await updater._reconcile_dashboard_messages(channel)  # noqa: SLF001
+    cleanup = updater._dashboard_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    await cleanup
+    await asyncio.sleep(0)
+
+    assert old.deleted
+    assert not updater._pending_dashboard_delete_ids  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_persisted_stale_fetch_failure_retries_next_reconciliation(tmp_path):
+    import bot as bot_module
+
+    class FailOnceStaleChannel(_FakeChannel):
+        def __init__(self, messages, stale):
+            super().__init__(messages)
+            self.stale = stale
+            self.fetch_attempts = 0
+
+        async def fetch_message(self, message_id):
+            if message_id == self.stale.id:
+                self.fetch_attempts += 1
+                if self.fetch_attempts == 1:
+                    raise RuntimeError("temporary fetch failure")
+                return self.stale
+            return await super().fetch_message(message_id)
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    stale = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=100
+    )
+    current = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=200
+    )
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "pending_dashboard_message_ids": [stale.id],
+        },
+    )
+    channel = FailOnceStaleChannel([current], stale)
+    updater = DashboardUpdater(settings)
+    updater._message = current  # noqa: SLF001
+
+    await updater._reconcile_dashboard_messages(channel)  # noqa: SLF001
+    assert not updater._dashboard_messages_reconciled  # noqa: SLF001
+    assert stale.id in updater._pending_dashboard_delete_ids  # noqa: SLF001
+
+    await updater._reconcile_dashboard_messages(channel)  # noqa: SLF001
+    cleanup = updater._dashboard_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    await cleanup
+    await asyncio.sleep(0)
+
+    assert channel.fetch_attempts == 2
+    assert stale.deleted
+    assert not updater._pending_dashboard_delete_ids  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_does_not_delete_same_message_fetched_twice():
+    resolved = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=200
+    )
+    history_copy = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=200
+    )
+    channel = _FakeChannel([history_copy])
+    updater = DashboardUpdater(_fake_settings())
+    updater._message = resolved  # noqa: SLF001
+
+    await updater._reconcile_dashboard_messages(channel)  # noqa: SLF001
+    await asyncio.sleep(0)
+
+    assert updater._message is history_copy  # noqa: SLF001
+    assert not resolved.deleted
+    assert not history_copy.deleted
+    assert updater._dashboard_cleanup_task is None  # noqa: SLF001
+    assert not updater._pending_dashboard_deletes  # noqa: SLF001
 
 
 @pytest.mark.asyncio

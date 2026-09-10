@@ -589,6 +589,10 @@ class ProbeRouteGeneration:
     generation: int
     collected_at: datetime
     observed_checkpoint_indices: frozenset[int] = frozenset()
+    # Revision of every successful fixed-checkpoint response in this atomic
+    # generation, including responses whose ETA list was empty.  ``rows``
+    # cannot represent those successful-empty responses by itself.
+    checkpoint_revisions: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.observed_checkpoint_indices:
@@ -598,6 +602,25 @@ class ProbeRouteGeneration:
                 frozenset(
                     int(row.index) for row in self.rows if hasattr(row, "index")
                 ),
+            )
+        if not self.checkpoint_revisions:
+            revisions = {}
+            for row in self.rows:
+                index = getattr(row, "index", None)
+                revision = getattr(row, "refresh_generation", None)
+                if (
+                    isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and isinstance(revision, int)
+                    and not isinstance(revision, bool)
+                    and index >= 0
+                    and revision > 0
+                ):
+                    revisions[index] = max(revisions.get(index, 0), revision)
+            object.__setattr__(
+                self,
+                "checkpoint_revisions",
+                tuple(sorted(revisions.items())),
             )
 
 
@@ -619,6 +642,8 @@ class ProbeEtaSnapshot:
     collected_at: datetime
     positioning_rows: tuple[ProbeEta, ...] | None = None
     positioning_checkpoints: frozenset[tuple[str, str, str, int]] = frozenset()
+    probe_attempt_generation: int = 0
+    attempted_checkpoints: frozenset[tuple[str, str, str, int]] = frozenset()
 
     @property
     def rows(self) -> tuple[ProbeEta, ...]:
@@ -735,12 +760,22 @@ _probe_cache = ProbeEtaCache()
 
 _probe_cold_cursor = 0
 _probe_priority_cursor = 0
+_probe_group_service_debt: dict[str, int] = {}
+_probe_failed_groups: set[str] = set()
+_probe_priority_owed: set[str] = set()
 _probe_background_cursor = 0
+_probe_background_gmb_cursor = 0
 _probe_generation = 0
+_probe_attempt_generation = 0
+_probe_attempted_checkpoints: frozenset[tuple[str, str, str, int]] = frozenset()
 _probe_route_generations: dict[tuple[str, str, str], _StoredProbeGeneration] = {}
 _probe_group_versions: dict[str, int] = {}
 _probe_group_rows: dict[str, tuple[ProbeEta, ...]] = {}
 _probe_route_published_versions: dict[tuple[str, str, str], dict[str, int]] = {}
+# A generation can be evicted while the shared group cache remains populated.
+# Keep the route-local floor so a cold rebootstrap cannot combine those old
+# group values into a seemingly complete generation.
+_probe_route_version_floors: dict[tuple[str, str, str], dict[str, int]] = {}
 
 # data.etagmb.gov.hk rate-limits bursts with 403s. GMB groups are capped per
 # cycle and the whole GMB sweep backs off for a cooldown when a 403 appears;
@@ -1022,7 +1057,9 @@ async def _refresh_probe_etas(
     rate-limits (HTTP 403), serving last-good cache meanwhile.
     """
     global _probe_cold_cursor, _probe_priority_cursor, _probe_background_cursor
+    global _probe_priority_owed
     global _probe_generation
+    global _probe_attempt_generation, _probe_attempted_checkpoints
     if not probes:
         return []
     unique: dict[str, Any] = {}
@@ -1031,6 +1068,17 @@ async def _refresh_probe_etas(
     baseline_keys = {
         _probe_cache_key(probe) for probe in (generation_probes or probes)
     }
+
+    # A physical request may represent aliases that are not in this caller's
+    # active subset. Keep those aliases in the attempt token when the caller
+    # supplies the complete generation topology.
+    attempt_universe: dict[str, list[Any]] = {}
+    for probe in (*probes, *(generation_probes or ())):
+        key = _probe_topology_key(probe)
+        if not any(_probe_topology_key(existing) == key
+                   for existing in attempt_universe.setdefault(
+                       _fetch_group_key(probe), [])):
+            attempt_universe[_fetch_group_key(probe)].append(probe)
 
     # Fetch-group table: one raw request serves every probe in its bucket.
     groups: dict[str, list[Any]] = {}
@@ -1056,11 +1104,36 @@ async def _refresh_probe_etas(
         group_key = _fetch_group_key(probe)
         if group_key not in baseline_routes.setdefault(route_key, []):
             baseline_routes[route_key].append(group_key)
-    for route_key, published_groups in tuple(_probe_route_published_versions.items()):
+    known_routes = (
+        set(_probe_route_published_versions)
+        | set(_probe_route_generations)
+        | set(_probe_route_version_floors)
+    )
+    for route_key in known_routes:
         current_groups = set(baseline_routes.get(route_key, ()))
-        if current_groups != set(published_groups):
+        if not current_groups:
+            # Route removal must not leave a floor that could affect a future
+            # route with the same key; shared group state is intentionally kept.
             _probe_route_published_versions.pop(route_key, None)
             _probe_route_generations.pop(route_key, None)
+            _probe_route_version_floors.pop(route_key, None)
+            continue
+        published_groups = _probe_route_published_versions.get(route_key)
+        floor_groups = _probe_route_version_floors.get(route_key)
+        known_groups = published_groups if published_groups is not None else floor_groups
+        if known_groups is not None and current_groups != set(known_groups):
+            _probe_route_published_versions.pop(route_key, None)
+            _probe_route_generations.pop(route_key, None)
+            _probe_route_version_floors.pop(route_key, None)
+        _probe_route_version_floors.setdefault(
+            route_key,
+            {group: _probe_group_versions.get(group, 0) for group in current_groups},
+        )
+    for route_key, current_groups in baseline_routes.items():
+        _probe_route_version_floors.setdefault(
+            route_key,
+            {group: _probe_group_versions.get(group, 0) for group in current_groups},
+        )
     gmb_paused = time.monotonic() < _gmb_cooldown_until
 
     def selectable(group_key: str) -> bool:
@@ -1095,6 +1168,21 @@ async def _refresh_probe_etas(
                 break
         if is_priority:
             priority_groups.append(group_key)
+    _probe_priority_owed.intersection_update(priority_groups)
+    # A numeric cursor is not stable when either ring is rebuilt from moving
+    # marker boundaries: insertion/removal can move a continuously required
+    # group behind the cursor indefinitely. Track service debt by physical
+    # fetch group instead. Older unserved groups always outrank new groups,
+    # while the key tie-break keeps selection deterministic. Keep debt while
+    # a group is anywhere in the current fetch universe so priority/background
+    # transitions cannot reset its due state.
+    for stale_group in set(_probe_group_service_debt) - active_groups:
+        _probe_group_service_debt.pop(stale_group, None)
+        _probe_failed_groups.discard(stale_group)
+    for group_key in group_keys:
+        _probe_group_service_debt[group_key] = (
+            _probe_group_service_debt.get(group_key, 0) + 1
+        )
     baseline_group_keys = {key for values in baseline_routes.values() for key in values}
     background_groups = [
         key for key in group_keys
@@ -1103,10 +1191,13 @@ async def _refresh_probe_etas(
     # During bootstrap, complete every route's fixed baseline as quickly as
     # the per-cycle budgets allow. Once published, active frontiers lead and
     # remaining capacity refreshes the baseline for lifecycle changes.
+    cold_route_keys = [
+        route_key for route_key in baseline_routes
+        if route_key not in _probe_route_generations
+    ]
     cold_groups = [
         key for key in group_keys
-        if any(route_key not in _probe_route_published_versions for route_key in baseline_routes
-               if key in baseline_routes[route_key])
+        if any(key in baseline_routes[route_key] for route_key in cold_route_keys)
     ]
     def select_ring(
         ring: list[str],
@@ -1114,12 +1205,27 @@ async def _refresh_probe_etas(
         *,
         total_limit: int = cycle_budget,
         gmb_limit: int = GMB_GROUPS_PER_CYCLE,
+        by_service_debt: bool = False,
     ) -> int:
         """Select one fair pass and return the slot after its last useful item."""
         nonlocal used_gmb
         if not ring:
             return 0
-        start = cursor % len(ring)
+        if by_service_debt:
+            ring = sorted(
+                ring,
+                key=lambda key: (
+                    -_probe_group_service_debt.get(key, 0),
+                    not key.startswith("GMB:"),
+                    key,
+                ),
+            )
+            # The debt ordering is itself the fairness schedule. Applying the
+            # old positional cursor after sorting would reintroduce starvation
+            # when membership changes between sweeps.
+            start = 0
+        else:
+            start = cursor % len(ring)
         next_cursor = start
         deferred_cursor: int | None = None
         for offset in range(len(ring)):
@@ -1148,44 +1254,443 @@ async def _refresh_probe_etas(
         # by this ring's cap; resume there on the next source cycle.
         return deferred_cursor if deferred_cursor is not None else next_cursor
 
-    # A cold route has no trustworthy marker cardinality yet. Complete those
-    # sparse baselines first, then spend the same sweep on current marker
-    # boundaries/midpoints. Once bootstrapped, reserve half of the outstanding
-    # sparse lifecycle ring so sustained marker traffic cannot hide a new bus;
-    # both rings therefore clear within two cycles when their union fits.
-    _probe_cold_cursor = select_ring(cold_groups, _probe_cold_cursor)
-    remaining_background = [
+    def select_priority_ring(
+        ring: list[str],
+        *,
+        total_limit: int,
+        gmb_limit: int,
+        owed_groups: set[str] | None = None,
+    ) -> None:
+        """Select the most overdue priority groups for one resource ring."""
+        nonlocal used_gmb
+        slots = max(0, min(cycle_budget, total_limit) - len(selected_groups))
+        if not slots:
+            return
+        ordered = sorted(
+            (key for key in ring if key not in selected_set),
+            key=lambda key: (
+                key not in (owed_groups or ()),
+                -_probe_group_service_debt.get(key, 0),
+                not key.startswith("GMB:"),
+                key,
+            ),
+        )
+        for key in ordered:
+            if len(selected_groups) >= min(cycle_budget, total_limit):
+                break
+            if key not in selectable_keys:
+                continue
+            if key.startswith("GMB:") and used_gmb >= min(
+                GMB_GROUPS_PER_CYCLE, gmb_limit
+            ):
+                continue
+            selected_groups.append(key)
+            selected_set.add(key)
+            used_gmb += int(key.startswith("GMB:"))
+
+    # Before any marker exists, finish sparse cold baselines as quickly as the
+    # caps allow. Once live priorities exist, retain one lifecycle slot and
+    # leave the rest to the active/completion allocator below. Cold discovery
+    # owns that slot until an attempted failure makes older warm work eligible;
+    # a genuinely one-slot resource still alternates lifecycle and active work.
+    selectable_priorities = [
+        key for key in priority_groups if key in selectable_keys
+    ]
+    selectable_priority_owed = (
+        _probe_priority_owed & set(selectable_priorities)
+    )
+    owed_total = len(selectable_priority_owed)
+    owed_gmb = sum(key.startswith("GMB:") for key in selectable_priority_owed)
+    owed_fits_cycle = (
+        owed_total <= cycle_budget and owed_gmb <= GMB_GROUPS_PER_CYCLE
+    )
+    priority_population_fits_with_cold = (
+        len(selectable_priorities) <= 2 * max(0, cycle_budget - 1)
+        and sum(key.startswith("GMB:") for key in selectable_priorities)
+        <= 2 * max(0, GMB_GROUPS_PER_CYCLE - 1)
+    )
+    priority_group_set = set(priority_groups)
+    cold_group_set = set(cold_groups)
+    eligible_cold_groups = (
+        cold_group_set - priority_group_set
+        if selectable_priorities else cold_group_set
+    )
+    cold_route_blocks = []
+    for route_key in cold_route_keys:
+        route_groups = list(dict.fromkeys(baseline_routes[route_key]))
+        floor = _probe_route_version_floors.get(route_key, {})
+        current_groups = set()
+        missing_groups = []
+        for group_key in route_groups:
+            group_version = _probe_group_versions.get(group_key, 0)
+            route_probes = [
+                probe for probe in groups.get(group_key, ())
+                if (
+                    (probe.operator, probe.route, probe.bound) == route_key
+                    and _probe_cache_key(probe) in baseline_keys
+                )
+            ]
+            cache_current = bool(route_probes) and all(
+                _probe_cache.get(_probe_cache_key(probe)) is not None
+                and _probe_cache.revision(_probe_cache_key(probe)) == group_version
+                for probe in route_probes
+            )
+            if group_version > floor.get(group_key, 0) and cache_current:
+                current_groups.add(group_key)
+            elif group_key in eligible_cold_groups:
+                missing_groups.append(group_key)
+        if not missing_groups:
+            continue
+        missing_groups.sort(
+            key=lambda key: (-_probe_group_service_debt.get(key, 0), key)
+        )
+        route_debt = max(
+            (_probe_group_service_debt.get(key, 0) for key in missing_groups),
+            default=0,
+        )
+        cold_route_blocks.append((
+            bool(current_groups),
+            len(missing_groups),
+            route_debt,
+            route_key,
+            missing_groups,
+        ))
+    cold_route_blocks.sort(
+        key=lambda item: (-item[2], not item[0], item[1], item[3])
+    )
+    cold_ring = []
+    cold_ring_seen = set()
+    for *_route_state, route_group_block in cold_route_blocks:
+        for group_key in route_group_block:
+            if group_key not in cold_ring_seen:
+                cold_ring.append(group_key)
+                cold_ring_seen.add(group_key)
+    selectable_cold = [key for key in cold_ring if key in selectable_keys]
+    early_warm_ring = [
+        key for key in background_groups if key not in cold_group_set
+    ]
+
+    def remaining_debt(ring: list[str]) -> int:
+        return max(
+            (
+                _probe_group_service_debt.get(key, 0)
+                for key in ring
+                if key in selectable_keys and key not in selected_set
+            ),
+            default=-1,
+        )
+
+    lifecycle_total_limit = cycle_budget
+    lifecycle_gmb_limit = GMB_GROUPS_PER_CYCLE
+    if selectable_priorities and selectable_cold:
+        cold_phase = _probe_priority_cursor % 2
+        lifecycle_total_limit = min(1, cycle_budget)
+        if cycle_budget == 1 and not cold_phase:
+            lifecycle_total_limit = 0
+        gmb_priority_waiting = any(
+            key.startswith("GMB:") for key in selectable_priorities
+        )
+        lifecycle_gmb_limit = min(1, GMB_GROUPS_PER_CYCLE)
+        if GMB_GROUPS_PER_CYCLE == 1 and gmb_priority_waiting and not cold_phase:
+            lifecycle_gmb_limit = 0
+        if owed_fits_cycle and priority_population_fits_with_cold:
+            lifecycle_total_limit = min(
+                lifecycle_total_limit,
+                max(0, cycle_budget - owed_total),
+            )
+            lifecycle_gmb_limit = min(
+                lifecycle_gmb_limit,
+                max(0, GMB_GROUPS_PER_CYCLE - owed_gmb),
+            )
+        _probe_priority_cursor += 1
+    if selectable_cold:
+        cold_leader = next(
+            (key for key in cold_ring if key in selectable_keys), None
+        )
+        failed_cold_yields = (
+            cold_leader in _probe_failed_groups
+            and remaining_debt(early_warm_ring) > remaining_debt(cold_ring)
+        )
+        if failed_cold_yields:
+            _probe_background_cursor = select_ring(
+                early_warm_ring,
+                _probe_background_cursor,
+                total_limit=lifecycle_total_limit,
+                gmb_limit=lifecycle_gmb_limit,
+                by_service_debt=True,
+            )
+        else:
+            _probe_cold_cursor = select_ring(
+                cold_ring,
+                0,
+                total_limit=lifecycle_total_limit,
+                gmb_limit=lifecycle_gmb_limit,
+            )
+    lifecycle_selected = bool(selected_groups)
+    # When priorities coexist, still-cold work belongs exclusively to the
+    # bounded cold tier above. In particular, a GMB group deferred by the
+    # cap-one alternator must not re-enter through generic background work.
+    background_ring = [
         key for key in background_groups
+        if not (selectable_priorities and key in cold_group_set)
+    ]
+    remaining_background = [
+        key for key in background_ring
         if key not in selected_set and key in selectable_keys
     ]
-    background_reserve = min(
-        cycle_budget, (len(remaining_background) + 1) // 2
-    )
-    if priority_groups:
-        # Keep at least half of the overall cycle available to active
-        # frontiers.  Unused priority slots are still filled by the following
-        # background ring, so this is a reserve cap rather than wasted quota.
-        background_reserve = min(background_reserve, cycle_budget // 2)
-    gmb_background = sum(key.startswith("GMB:") for key in remaining_background)
-    gmb_background_reserve = min(
-        GMB_GROUPS_PER_CYCLE, (gmb_background + 1) // 2
-    )
-    if any(key.startswith("GMB:") for key in priority_groups):
-        gmb_background_reserve = min(
-            gmb_background_reserve,
-            cycle_budget // 2,
-            GMB_GROUPS_PER_CYCLE // 2,
+    selectable_background = [
+        key for key in remaining_background if key in selectable_keys
+    ]
+    selectable_priority = [
+        key for key in priority_groups
+        if key in selectable_keys and key not in selected_set
+    ]
+    remaining_total_capacity = max(0, cycle_budget - len(selected_groups))
+    remaining_gmb_capacity = max(0, GMB_GROUPS_PER_CYCLE - used_gmb)
+    gmb_count = sum(key.startswith("GMB:") for key in selectable_priority)
+    other_count = len(selectable_priority) - gmb_count
+    gmb_active_floor = (gmb_count + 1) // 2
+    other_active_floor = (other_count + 1) // 2
+    priority_owed = _probe_priority_owed & set(selectable_priority)
+    owed_priority_gmb = sum(key.startswith("GMB:") for key in priority_owed)
+    owed_priority_other = len(priority_owed) - owed_priority_gmb
+    if owed_fits_cycle:
+        gmb_active_floor = max(
+            gmb_active_floor,
+            owed_priority_gmb,
         )
-    _probe_priority_cursor = select_ring(
-        priority_groups,
-        _probe_priority_cursor,
+        other_active_floor = max(
+            other_active_floor,
+            owed_priority_other,
+        )
+    # A published route is pending only after at least one fixed group has
+    # advanced while another remains behind its published version. Select one
+    # oldest feasible route coherently so partial evidence cannot publish.
+    pending_routes: list[tuple[tuple[str, str, str], list[str], float]] = []
+    for route_key, published in _probe_route_published_versions.items():
+        # Cold routes own full rebootstrap; an inconsistent public/published
+        # state must never enter completion with an unbounded synthetic age.
+        if route_key not in _probe_route_generations:
+            continue
+        route_groups = baseline_routes.get(route_key, ())
+        missing = [
+            key for key in route_groups
+            if _probe_group_versions.get(key, 0) <= published.get(key, 0)
+        ]
+        advanced = any(
+            _probe_group_versions.get(key, 0) > published.get(key, 0)
+            for key in route_groups
+        )
+        if missing and advanced:
+            age = _probe_route_generations.get(route_key)
+            pending_routes.append((route_key, missing, age.published_monotonic if age else float("inf")))
+    pending_routes.sort(key=lambda item: (item[2], item[0]))
+    completion_groups: list[str] = []
+    completion_total_reserve = completion_gmb_reserve = 0
+    active_floor = gmb_active_floor + other_active_floor
+    for _route_key, missing, _age in pending_routes:
+        missing = [key for key in missing if key in selectable_keys and key not in selected_set]
+        missing_gmb = sum(key.startswith("GMB:") for key in missing)
+        if (len(missing) <= max(0, remaining_total_capacity - active_floor)
+                and missing_gmb <= max(0, remaining_gmb_capacity - gmb_active_floor)):
+            completion_groups = list(dict.fromkeys(missing))
+            completion_total_reserve = len(completion_groups)
+            completion_gmb_reserve = missing_gmb
+            break
+    # Reserve a lifecycle slot only when active priorities actually overflow
+    # the current sweep. A one-slot sweep remains useful to active probes.
+    background_reserve = int(
+        not completion_groups
+        and not lifecycle_selected
+        and bool(selectable_background)
+        and max(
+            (_probe_group_service_debt.get(key, 0) for key in selectable_background),
+            default=-1,
+        ) >= max(
+            (_probe_group_service_debt.get(key, 0) for key in selectable_priority),
+            default=-1,
+        )
+        and (
+            not owed_fits_cycle
+            or remaining_total_capacity - 1 >= len(priority_owed)
+        )
+        and (
+            len(selectable_priority) > remaining_total_capacity
+            or (len(selectable_priority) == remaining_total_capacity
+                and remaining_total_capacity - 1 >= active_floor)
+        )
+        and remaining_total_capacity > 1
+    )
+    gmb_background_reserve = int(
+        not completion_groups
+        and not lifecycle_selected
+        and
+        any(key.startswith("GMB:") for key in selectable_background)
+        and max(
+            (_probe_group_service_debt.get(key, 0)
+             for key in selectable_background if key.startswith("GMB:")),
+            default=-1,
+        ) >= max(
+            (_probe_group_service_debt.get(key, 0)
+             for key in selectable_priority if key.startswith("GMB:")),
+            default=-1,
+        )
+        and (
+            not owed_fits_cycle
+            or remaining_gmb_capacity - 1 >= owed_priority_gmb
+        )
+        and (
+            gmb_count > remaining_gmb_capacity
+            or (gmb_count == remaining_gmb_capacity
+                and remaining_gmb_capacity - 1 >= gmb_active_floor)
+        )
+        and remaining_gmb_capacity > 1
+    )
+    active_total_capacity = max(
+        0, remaining_total_capacity - background_reserve - completion_total_reserve
+    )
+    active_gmb_capacity = max(
+        0, remaining_gmb_capacity - gmb_background_reserve - completion_gmb_reserve
+    )
+    # Choose an exact quota under the total and GMB caps. Carry from the prior
+    # source frame is the deadline; then keep both resource populations split
+    # as close to halves as possible so their complement fits the next frame.
+    # Service debt decides only within a resource, never the resource split.
+    gmb_priority = [key for key in selectable_priority if key.startswith("GMB:")]
+    other_priority = [
+        key for key in selectable_priority if not key.startswith("GMB:")
+    ]
+    def priority_order(key: str) -> tuple[bool, int, str]:
+        return (
+            key not in priority_owed,
+            -_probe_group_service_debt.get(key, 0),
+            key,
+        )
+
+    gmb_candidates = sorted(gmb_priority, key=priority_order)
+    other_candidates = sorted(other_priority, key=priority_order)
+    owed_gmb_count = sum(key in priority_owed for key in gmb_priority)
+    owed_other_count = sum(key in priority_owed for key in other_priority)
+    target_slots = min(
+        active_total_capacity,
+        min(len(gmb_priority), active_gmb_capacity) + len(other_priority),
+    )
+    minimum_gmb = max(0, target_slots - len(other_priority))
+    maximum_gmb = min(len(gmb_priority), active_gmb_capacity, target_slots)
+    quota_options = []
+    for gmb_quota in range(minimum_gmb, maximum_gmb + 1):
+        other_quota = target_slots - gmb_quota
+        missed_owed = (
+            max(0, owed_gmb_count - gmb_quota)
+            + max(0, owed_other_count - other_quota)
+        )
+        half_distance = (
+            abs(len(gmb_priority) - 2 * gmb_quota)
+            + abs(len(other_priority) - 2 * other_quota)
+        )
+        selected_debts = tuple(sorted(
+            [
+                *(_probe_group_service_debt.get(key, 0)
+                  for key in gmb_candidates[:gmb_quota]),
+                *(_probe_group_service_debt.get(key, 0)
+                  for key in other_candidates[:other_quota]),
+            ],
+            reverse=True,
+        ))
+        selected_owed_debts = tuple(
+            debt
+            for debt, key in sorted(
+                (
+                    (_probe_group_service_debt.get(key, 0), key)
+                    for key in [
+                        *gmb_candidates[:gmb_quota],
+                        *other_candidates[:other_quota],
+                    ]
+                    if key in priority_owed
+                ),
+                reverse=True,
+            )
+        )
+        quota_options.append((
+            (
+                -missed_owed,
+                selected_owed_debts,
+                -half_distance,
+                gmb_quota,
+                selected_debts,
+            ),
+            gmb_quota,
+            other_quota,
+        ))
+    _, gmb_quota, other_quota = max(
+        quota_options,
+        default=((0, (), 0, 0, ()), 0, 0),
+    )
+    select_priority_ring(
+        gmb_priority,
+        total_limit=len(selected_groups) + gmb_quota,
+        gmb_limit=used_gmb + gmb_quota,
+        owed_groups=priority_owed,
+    )
+    select_priority_ring(
+        other_priority,
+        total_limit=len(selected_groups) + other_quota,
+        gmb_limit=used_gmb,
+        owed_groups=priority_owed,
+    )
+    select_ring(
+        completion_groups, 0,
         total_limit=max(0, cycle_budget - background_reserve),
         gmb_limit=max(0, GMB_GROUPS_PER_CYCLE - gmb_background_reserve),
     )
+    global _probe_background_gmb_cursor
+    if gmb_background_reserve:
+        gmb_background = [
+            key for key in background_ring if key.startswith("GMB:")
+        ]
+        _probe_background_gmb_cursor = select_ring(
+            gmb_background, _probe_background_gmb_cursor,
+            total_limit=len(selected_groups) + 1,
+            gmb_limit=used_gmb + 1,
+            by_service_debt=True,
+        )
+    elif background_reserve:
+        _probe_background_cursor = select_ring(
+            background_ring, _probe_background_cursor,
+            total_limit=len(selected_groups) + 1,
+            by_service_debt=True,
+        )
+    # A resource reservation can consume one slot while its priority quota is
+    # already capped, leaving another total slot unused. Refill that slack
+    # from the oldest remaining priority groups without exceeding either cap.
+    remaining_priority = [
+        key for key in selectable_priority if key not in selected_set
+    ]
+    select_priority_ring(
+        remaining_priority,
+        total_limit=cycle_budget,
+        gmb_limit=GMB_GROUPS_PER_CYCLE,
+        owed_groups=priority_owed,
+    )
+    # Cold groups do not participate in the ordinary background reservation,
+    # but may consume capacity left after every active/completion/lifecycle
+    # tier. Prefer coherent cold publication on an age tie; once older warm
+    # work exists, let it lead this opportunistic fill so failed cold anchors
+    # cannot starve already-published route refreshes. The bounded lifecycle
+    # slot and every active/carry reservation remain unaffected.
+    warm_slack_first = (
+        remaining_debt(background_ring) > remaining_debt(cold_ring)
+    )
+    if warm_slack_first:
+        _probe_background_cursor = select_ring(
+            background_ring, _probe_background_cursor, by_service_debt=True
+        )
+    _probe_cold_cursor = select_ring(cold_ring, 0)
     _probe_background_cursor = select_ring(
-        background_groups, _probe_background_cursor
+        background_ring, _probe_background_cursor, by_service_debt=True
     )
     if not selected_groups:
+        _probe_priority_owed = set(priority_groups)
         return [
             eta
             for key in unique
@@ -1196,6 +1701,7 @@ async def _refresh_probe_etas(
     selected_other = [key for key in selected_groups if not key.startswith("GMB:")]
     selected_gmb = [key for key in selected_groups if key.startswith("GMB:")]
     successful: dict[str, bool] = {}
+    attempted_groups: set[str] = set()
     refreshed_rows: dict[str, tuple[ProbeEta, ...]] = {}
     async def refresh_group(group_key: str) -> bool:
         global _gmb_cooldown_until
@@ -1206,6 +1712,7 @@ async def _refresh_probe_etas(
         now = _probe_wall_clock()
         if group_key.startswith("GMB:") and time.monotonic() < _gmb_cooldown_until:
             return True
+        attempted_groups.add(group_key)
         try:
             raw = await _fetch_raw_stop_eta(client, probes_in_group[0])
         except FetchError as exc:
@@ -1227,18 +1734,31 @@ async def _refresh_probe_etas(
             successful[group_key] = False
             return False
         global _probe_generation
-        _probe_generation += 1
-        group_generation = _probe_generation
+        group_generation = _probe_generation + 1
         group_rows: list[ProbeEta] = []
-        for probe in probes_in_group:
-            key = _probe_cache_key(probe)
-            parsed = [
-                replace(row, refresh_generation=group_generation)
-                for row in _parse_probe_etas(probe, raw, now)
-            ]
+        parsed_by_key: list[tuple[str, list[ProbeEta]]] = []
+        try:
+            for probe in probes_in_group:
+                key = _probe_cache_key(probe)
+                parsed = [
+                    replace(row, refresh_generation=group_generation)
+                    for row in _parse_probe_etas(probe, raw, now)
+                ]
+                parsed_by_key.append((key, parsed))
+                group_rows.extend(parsed)
+        except Exception as exc:  # noqa: BLE001
+            # The HTTP attempt still counts as service, but a malformed body
+            # must not partly replace one physical group's last-good cache or
+            # prevent later groups from completing their service pages.
+            log.warning(
+                "probe ETA parse failed for %s: %s", group_key, type(exc).__name__
+            )
+            successful[group_key] = False
+            return False
+        _probe_generation = group_generation
+        for key, parsed in parsed_by_key:
             _probe_cache.set(key, parsed, revision=group_generation)
             refreshed_rows[key] = tuple(parsed)
-            group_rows.extend(parsed)
         _probe_group_versions[group_key] = group_generation
         _probe_group_rows[group_key] = tuple(group_rows)
         successful[group_key] = True
@@ -1251,6 +1771,27 @@ async def _refresh_probe_etas(
     for group_key in selected_gmb:
         if await refresh_group(group_key):
             break
+
+    # Only requests that actually started count as service. A GMB 403 stops
+    # the sequential sweep, leaving later selected groups due for the next
+    # sweep instead of falsely clearing their debt.
+    for group_key in attempted_groups:
+        _probe_group_service_debt[group_key] = 0
+        if successful.get(group_key):
+            _probe_failed_groups.discard(group_key)
+        else:
+            _probe_failed_groups.add(group_key)
+    _probe_priority_owed = set(priority_groups) - attempted_groups
+    if attempted_groups:
+        _probe_attempt_generation += 1
+        _probe_attempted_checkpoints = frozenset(
+            (
+                str(probe.operator), str(probe.route), str(probe.bound),
+                int(probe.index),
+            )
+            for group_key in attempted_groups
+            for probe in attempt_universe.get(group_key, ())
+        )
 
     # Publish complete route generations atomically. Empty successful entries
     # are valid observations; failed or rate-limited groups retain the prior
@@ -1267,17 +1808,52 @@ async def _refresh_probe_etas(
         route_groups = generation_groups[route_key]
         if not all(key in _probe_group_versions for key in route_groups):
             continue
-        previous = _probe_route_published_versions.get(route_key, {})
-        if previous and not all(_probe_group_versions[key] > previous.get(key, 0)
-                                for key in route_groups):
+        previous = _probe_route_published_versions.get(route_key)
+        if route_key in _probe_route_generations and previous is None:
+            # Do not manufacture a publication from an inconsistent state.
+            continue
+        floor = _probe_route_version_floors.setdefault(
+            route_key,
+            {key: _probe_group_versions.get(key, 0) for key in route_groups},
+        )
+        required = floor if route_key not in _probe_route_generations else (previous or {})
+        if not all(_probe_group_versions[key] > required.get(key, 0)
+                   for key in route_groups):
             continue
         route_probes = tuple(
             probe for probe in unique.values()
             if ((probe.operator, probe.route, probe.bound) == route_key
                 and _probe_cache_key(probe) in baseline_keys)
         )
-        rows = tuple(eta for probe in route_probes
-                     for eta in (_probe_cache.get(_probe_cache_key(probe)) or ()))
+        # Version advancement is not sufficient after cache TTL eviction:
+        # every fixed probe must still have the exact response represented by
+        # its current shared-group revision. Capture each cache entry once so
+        # validation and publication cannot disagree; [] is valid evidence.
+        captured_cache: dict[str, list[ProbeEta]] = {}
+        captured_revisions: dict[str, int] = {}
+        cache_valid = True
+        for probe in route_probes:
+            cache_key = _probe_cache_key(probe)
+            cached = _probe_cache.get(cache_key)
+            group_key = _fetch_group_key(probe)
+            revision = _probe_cache.revision(cache_key)
+            if (
+                cached is None
+                or revision != _probe_group_versions.get(group_key, 0)
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision <= 0
+            ):
+                cache_valid = False
+                break
+            captured_cache.setdefault(cache_key, cached)
+            captured_revisions.setdefault(cache_key, revision)
+        if not cache_valid:
+            continue
+        rows = tuple(
+            eta for probe in route_probes
+            for eta in captured_cache[_probe_cache_key(probe)]
+        )
         _probe_generation += 1
         public = ProbeRouteGeneration(
             route_key=route_key,
@@ -1285,10 +1861,19 @@ async def _refresh_probe_etas(
             generation=_probe_generation,
             collected_at=collected_at,
             observed_checkpoint_indices=frozenset(p.index for p in route_probes),
+            checkpoint_revisions=tuple(sorted(
+                (
+                    int(probe.index),
+                    captured_revisions[_probe_cache_key(probe)],
+                )
+                for probe in route_probes
+            )),
         )
-        _probe_route_published_versions[route_key] = {
+        published_versions = {
             key: _probe_group_versions[key] for key in route_groups
         }
+        _probe_route_published_versions[route_key] = published_versions
+        _probe_route_version_floors[route_key] = dict(published_versions)
         _probe_route_generations[route_key] = _StoredProbeGeneration(
             public=public,
             topology_keys=frozenset(_probe_topology_key(probe) for probe in route_probes),
@@ -1301,6 +1886,10 @@ async def _refresh_probe_etas(
             key=lambda key: _probe_route_generations[key].published_monotonic,
         )
         _probe_route_generations.pop(oldest, None)
+        # A route without its public generation must re-bootstrap as cold;
+        # retaining its published versions would make pending age unbounded
+        # and allow lifecycle work to lose its fair scheduling position.
+        _probe_route_published_versions.pop(oldest, None)
 
     collected: list[ProbeEta] = []
     for key in unique:
@@ -1332,6 +1921,7 @@ async def fetch_probe_snapshot(
             >= PROBE_GENERATION_TTL_SECONDS
         ):
             _probe_route_generations.pop(stale_key, None)
+            _probe_route_published_versions.pop(stale_key, None)
     requested = {(p.operator, p.route, p.bound) for p in probes}
     requested_topology: dict[
         tuple[str, str, str], tuple[frozenset[tuple[Any, ...]], frozenset[str]]
@@ -1359,6 +1949,7 @@ async def fetch_probe_snapshot(
             >= PROBE_GENERATION_TTL_SECONDS
         ):
             _probe_route_generations.pop(key, None)
+            _probe_route_published_versions.pop(key, None)
             continue
         aged_rows = tuple(
             replace(
@@ -1395,4 +1986,6 @@ async def fetch_probe_snapshot(
         routes=tuple(routes), collected_at=collected_at,
         positioning_rows=tuple(positioning),
         positioning_checkpoints=frozenset(positioning_checkpoints),
+        probe_attempt_generation=_probe_attempt_generation,
+        attempted_checkpoints=_probe_attempted_checkpoints,
     )

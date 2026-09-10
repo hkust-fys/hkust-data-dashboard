@@ -1,7 +1,8 @@
 """HKUST Campus Dashboard bot entry point.
 
-Executable lifecycle: shared session + providers, concurrent fetches, one
-persistent dashboard message edited in place, dev-webhook and dry-run modes.
+Executable lifecycle: shared session + providers, concurrent fetches, one live
+dashboard message edited in place and safely rolled before Discord's old-message
+cap, dev-webhook and dry-run modes.
 
 Imports must have no filesystem/network/package-installation/bot-launch side
 effects; all side effects live under ``main()``.
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import copy
 import hashlib
 import inspect
@@ -20,11 +22,14 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import discord
 from dotenv import load_dotenv
@@ -51,7 +56,108 @@ from dashboard.runtime import startup_preflight
 
 log = logging.getLogger(__name__)
 DASHBOARD_MESSAGE_MARKER = "HKUST Campus Dashboard"
+DASHBOARD_MESSAGE_ROLLOVER_SECONDS = 55 * 60
+DASHBOARD_DISCORD_TIMEOUT_SECONDS = 4.0
+DASHBOARD_SEND_NONCE_RETRY_SECONDS = 2 * 60
+DISCORD_MAX_RATELIMIT_RETRY_SECONDS = 0.25
+DASHBOARD_RUNTIME_STATE_FILENAME = "dashboard-runtime-state.json"
 TRACKED_ROADS_WAIT_SECONDS = 5.0
+
+
+@dataclass
+class _DashboardSendAttemptEvidence:
+    """Wire-level evidence for one application-level dashboard create."""
+
+    wire_attempts: int = 0
+
+
+_active_dashboard_send_evidence: contextvars.ContextVar[
+    _DashboardSendAttemptEvidence | None
+] = contextvars.ContextVar("active_dashboard_send_evidence", default=None)
+
+
+def _note_dashboard_send_wire_attempt(method: object, url: object) -> None:
+    """Count one Discord create-message request in the active send episode."""
+    evidence = _active_dashboard_send_evidence.get()
+    if evidence is None or str(method).upper() != "POST":
+        return
+    path = getattr(url, "path", None)
+    if isinstance(path, str) and re.fullmatch(
+        r"(?:/api/v\d+)?/channels/\d+/messages",
+        path,
+    ):
+        evidence.wire_attempts += 1
+
+
+def _dashboard_http_trace_config():
+    """Build the aiohttp trace that exposes discord.py's internal retries."""
+    import aiohttp
+
+    trace = aiohttp.TraceConfig()
+
+    async def request_started(_session, _trace_context, params) -> None:
+        _note_dashboard_send_wire_attempt(params.method, params.url)
+
+    trace.on_request_start.append(request_started)
+    return trace
+
+
+async def _observe_dashboard_send(
+    operation,
+    evidence: _DashboardSendAttemptEvidence,
+):
+    token = _active_dashboard_send_evidence.set(evidence)
+    try:
+        return await operation
+    finally:
+        _active_dashboard_send_evidence.reset(token)
+
+
+class _CancellationSafeDiscordGlobalGate:
+    """Ensure discord.py cannot strand its global 429 gate on cancellation."""
+
+    def __init__(self, event: asyncio.Event, maximum_retry: float) -> None:
+        self._event = event
+        self._maximum_retry = maximum_retry
+        self._reset_handle: asyncio.TimerHandle | None = None
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    async def wait(self) -> bool:
+        return await self._event.wait()
+
+    def clear(self) -> None:
+        self._event.clear()
+        if self._reset_handle is not None:
+            self._reset_handle.cancel()
+        # HTTPClient rejects retry_after values above this maximum before it
+        # clears the gate.  If cancellation interrupts an allowed sleep, this
+        # fallback opens the gate once that maximum has elapsed.
+        self._reset_handle = asyncio.get_running_loop().call_later(
+            self._maximum_retry,
+            self.set,
+        )
+
+    def set(self) -> None:
+        if self._reset_handle is not None:
+            self._reset_handle.cancel()
+            self._reset_handle = None
+        self._event.set()
+
+
+def _configure_discord_http_deadlines(http) -> None:
+    """Reject long 429 sleeps and make the library's global gate recoverable."""
+    http.max_ratelimit_timeout = DISCORD_MAX_RATELIMIT_RETRY_SECONDS
+    global_gate = getattr(http, "_global_over", None)
+    if global_gate is not None and not isinstance(
+        global_gate, _CancellationSafeDiscordGlobalGate
+    ):
+        http._global_over = _CancellationSafeDiscordGlobalGate(  # noqa: SLF001
+            global_gate,
+            DISCORD_MAX_RATELIMIT_RETRY_SECONDS,
+        )
+
 
 def _setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -687,22 +793,44 @@ def _is_dashboard_message(message, expected_author) -> bool:
     )
 
 
-async def _find_dashboard_message(channel, expected_author=None) -> object | None:
-    """Scan recent history for this bot's latest dashboard message.
+async def _scan_dashboard_messages(
+    channel,
+    expected_author=None,
+    *,
+    after: datetime | None = None,
+    before: datetime | None = None,
+) -> list[object]:
+    """Strictly scan history for this bot's dashboard messages."""
+    expected_author = expected_author or getattr(
+        getattr(channel, "guild", None), "me", None
+    )
+    history_options = {"limit": None, "after": after, "before": before}
+    if after is None and before is None:
+        history_options = {"limit": 50}
+    return [
+        message
+        async for message in channel.history(**history_options)
+        if _is_dashboard_message(message, expected_author)
+    ]
+
+
+async def _find_dashboard_messages(channel, expected_author=None) -> list[object]:
+    """Best-effort scan for this bot's dashboard messages, newest first.
 
     Author ID plus the stable marker avoid taking over another message from
     this bot (for example an alert or command response) in the same channel.
     """
-    expected_author = expected_author or getattr(
-        getattr(channel, "guild", None), "me", None
-    )
     try:
-        async for message in channel.history(limit=50):
-            if _is_dashboard_message(message, expected_author):
-                return message
+        return await _scan_dashboard_messages(channel, expected_author)
     except Exception as exc:  # noqa: BLE001
         log.warning("history scan failed: %s", exc)
-    return None
+    return []
+
+
+async def _find_dashboard_message(channel, expected_author=None) -> object | None:
+    """Return this bot's latest exact dashboard marker, if present."""
+    messages = await _find_dashboard_messages(channel, expected_author)
+    return messages[0] if messages else None
 
 
 async def _resolve_dashboard_message(
@@ -710,7 +838,8 @@ async def _resolve_dashboard_message(
     configured_message_id: int | None,
     expected_author,
 ) -> object | None:
-    """Validate a configured message, otherwise fall back to history scan."""
+    """Resolve the newest live dashboard, validating any configured fallback."""
+    configured = None
     if configured_message_id:
         try:
             configured = await channel.fetch_message(configured_message_id)
@@ -721,22 +850,45 @@ async def _resolve_dashboard_message(
                 exc,
             )
         else:
-            if _is_dashboard_message(configured, expected_author):
-                return configured
-            log.warning(
-                "configured message %s is not this bot's exact dashboard marker; scanning",
-                configured_message_id,
-            )
-    return await _find_dashboard_message(channel, expected_author)
+            if not _is_dashboard_message(configured, expected_author):
+                log.warning(
+                    "configured message %s is not this bot's exact dashboard marker; "
+                    "scanning",
+                    configured_message_id,
+                )
+                configured = None
+    messages = await _find_dashboard_messages(channel, expected_author)
+    if messages:
+        # A rollover can complete immediately before a restart.  History order
+        # is authoritative here so a stale configured starter cannot win over
+        # the newer, fully populated dashboard.
+        return messages[0]
+    return configured
 
 
-async def _ensure_dashboard_message(channel, payload: DashboardPayload, view=None) -> object:
+async def _ensure_dashboard_message(
+    channel,
+    payload: DashboardPayload,
+    view=None,
+    *,
+    nonce: int | None = None,
+    attempt_evidence: _DashboardSendAttemptEvidence | None = None,
+) -> object:
     """Reuse the known message or find/create exactly one."""
-    message = await _find_dashboard_message(channel)
-    if message is not None:
-        return message
+    if nonce is None:
+        message = await _find_dashboard_message(channel)
+        if message is not None:
+            return message
     # create exactly one
-    message = await channel.send(content=DASHBOARD_MESSAGE_MARKER, view=view)
+    evidence = attempt_evidence or _DashboardSendAttemptEvidence()
+    message = await _observe_dashboard_send(
+        channel.send(
+            content=DASHBOARD_MESSAGE_MARKER,
+            view=view,
+            nonce=nonce,
+        ),
+        evidence,
+    )
     log.info("created dashboard message %s in %s", message.id, getattr(channel, "id", "?"))
     return message
 
@@ -778,6 +930,57 @@ def _payload_fingerprint(payload: DashboardPayload) -> str:
     return hashlib.sha256(serialized).hexdigest()
 
 
+def _dashboard_runtime_state_path(cache_dir: str) -> Path:
+    return Path(cache_dir) / DASHBOARD_RUNTIME_STATE_FILENAME
+
+
+def _load_dashboard_runtime_state(settings: Settings) -> dict[str, object]:
+    """Load rollover state only when it belongs to this announce channel."""
+    try:
+        raw = json.loads(
+            _dashboard_runtime_state_path(settings.cache_dir).read_text(
+                encoding="utf-8"
+            )
+        )
+        if not isinstance(raw, dict):
+            return {}
+        if raw.get("announce_channel_id") != settings.announce_channel_id:
+            return {}
+        return raw
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _store_dashboard_runtime_state(
+    settings: Settings,
+    state: dict[str, object],
+) -> bool:
+    """Atomically retain thread and incomplete-rollover recovery state."""
+    path = _dashboard_runtime_state_path(settings.cache_dir)
+    temporary = path.with_name(f"{path.name}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(state, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        log.warning("could not persist dashboard runtime state: %s", exc)
+        return False
+    return True
+
+
+async def _bounded_discord(operation):
+    """Keep one Discord request/retry chain within a presentation period."""
+    return await asyncio.wait_for(
+        operation,
+        timeout=DASHBOARD_DISCORD_TIMEOUT_SECONDS,
+    )
+
+
 async def _apply_payload(message, payload: DashboardPayload, view=None):
     """Edit atomically, retaining already-uploaded content-addressed images."""
     embeds = [e for e in payload.embeds if e is not None]
@@ -804,6 +1007,95 @@ async def _apply_payload(message, payload: DashboardPayload, view=None):
         attachments=attachments,
         view=view,
     )
+
+
+def _dashboard_message_needs_rollover(message, now: float | None = None) -> bool:
+    """Return whether an edit risks Discord's quota for old messages."""
+    created_at = getattr(message, "created_at", None)
+    if created_at is None:
+        return False
+    try:
+        created_timestamp = float(created_at.timestamp())
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+    current_timestamp = time.time() if now is None else float(now)
+    return current_timestamp - created_timestamp >= DASHBOARD_MESSAGE_ROLLOVER_SECONDS
+
+
+def _is_old_dashboard_edit_cap(exc: BaseException) -> bool:
+    """Recognize Discord's old-message edit quota response."""
+    return getattr(exc, "code", None) == 30046
+
+
+def _is_discord_not_found(exc: BaseException) -> bool:
+    return isinstance(exc, discord.NotFound) or getattr(exc, "status", None) == 404
+
+
+def _is_definitive_discord_send_rejection(exc: BaseException) -> bool:
+    """Return whether Discord explicitly rejected this particular POST."""
+    status = getattr(exc, "status", None)
+    return bool(
+        isinstance(status, int)
+        and not isinstance(status, bool)
+        and 400 <= status < 500
+        and status != 408
+    )
+
+
+async def _send_payload(
+    channel,
+    payload: DashboardPayload,
+    view=None,
+    *,
+    nonce: int | None = None,
+    attempt_evidence: _DashboardSendAttemptEvidence | None = None,
+):
+    """Create a complete dashboard message without exposing a blank frame."""
+    evidence = attempt_evidence or _DashboardSendAttemptEvidence()
+    return await _observe_dashboard_send(
+        channel.send(
+            content=DASHBOARD_MESSAGE_MARKER,
+            embeds=[embed for embed in payload.embeds if embed is not None],
+            files=[discord_file(asset) for asset in payload.files],
+            view=view,
+            nonce=nonce,
+        ),
+        evidence,
+    )
+
+
+async def _rollover_dashboard_message(
+    channel,
+    message,
+    payload: DashboardPayload,
+    view=None,
+    *,
+    nonce: int | None = None,
+    attempt_evidence: _DashboardSendAttemptEvidence | None = None,
+):
+    """Create the successor, then retire the old dashboard when possible."""
+    replacement = await _bounded_discord(
+        _send_payload(
+            channel,
+            payload,
+            view=view,
+            nonce=nonce,
+            attempt_evidence=attempt_evidence,
+        )
+    )
+    stale_message = None
+    try:
+        await _bounded_discord(message.delete())
+    except Exception as exc:  # noqa: BLE001
+        if not _is_discord_not_found(exc):
+            # The complete replacement is now canonical.  Retain the old
+            # object for bounded background cleanup instead of rolling back an
+            # uncertain delete (which could leave the channel blank) or
+            # creating another successor on the next tick.
+            stale_message = message
+            log.warning("old dashboard cleanup deferred: %s", exc)
+    log.info("rolled dashboard message before Discord old-message edit cap")
+    return replacement, stale_message
 
 
 # --------------------------------------------------------------------------
@@ -850,6 +1142,62 @@ class DashboardUpdater:
         self._pending_alert_messages: deque[str] = deque()
         self._message = None
         self._thread = None
+        runtime_state = _load_dashboard_runtime_state(settings)
+        loaded_message_id = runtime_state.get("dashboard_message_id")
+        self._persisted_dashboard_message_id = (
+            loaded_message_id
+            if isinstance(loaded_message_id, int)
+            and not isinstance(loaded_message_id, bool)
+            and loaded_message_id > 0
+            else None
+        )
+        loaded_thread_id = runtime_state.get("status_thread_id")
+        if not isinstance(loaded_thread_id, int) or loaded_thread_id <= 0:
+            loaded_thread_id = None
+        self._status_thread_id = loaded_thread_id or settings.dashboard_message_id
+        self._persisted_status_thread_id = loaded_thread_id
+        pending_ids = runtime_state.get("pending_dashboard_message_ids", [])
+        self._pending_dashboard_delete_ids = {
+            item
+            for item in pending_ids
+            if isinstance(item, int) and not isinstance(item, bool) and item > 0
+        } if isinstance(pending_ids, list) else set()
+        uncertain_since = runtime_state.get("rollover_uncertain_since")
+        self._rollover_uncertain_since = (
+            float(uncertain_since)
+            if isinstance(uncertain_since, (int, float))
+            and not isinstance(uncertain_since, bool)
+            and uncertain_since > 0
+            else None
+        )
+        send_nonce = runtime_state.get("dashboard_send_nonce")
+        self._dashboard_send_nonce = (
+            send_nonce
+            if isinstance(send_nonce, int)
+            and not isinstance(send_nonce, bool)
+            and 0 < send_nonce < 2**63
+            and self._rollover_uncertain_since is not None
+            else None
+        )
+        predecessor_id = runtime_state.get("dashboard_send_predecessor_id")
+        self._dashboard_send_predecessor_id = (
+            predecessor_id
+            if self._dashboard_send_nonce is not None
+            and isinstance(predecessor_id, int)
+            and not isinstance(predecessor_id, bool)
+            and predecessor_id > 0
+            else None
+        )
+        # Any episode surviving a process boundary has an attempt whose
+        # server-side outcome was not durably resolved.
+        self._dashboard_send_had_ambiguous_attempt = (
+            self._dashboard_send_nonce is not None
+        )
+        self._dashboard_send_retry_ready = False
+        self._dashboard_messages_reconciled = False
+        self._pending_dashboard_deletes: dict[int, object] = {}
+        self._dashboard_cleanup_task: asyncio.Task | None = None
+        self._rollover_task: asyncio.Task | None = None
         self._loop_task: asyncio.Task | None = None
         self._running = False
         self._start_lock = asyncio.Lock()
@@ -892,6 +1240,541 @@ class DashboardUpdater:
             and not self._loop_task.done()
         )
 
+    def _persist_dashboard_runtime_state(self) -> bool:
+        state: dict[str, object] = {
+            "announce_channel_id": self.settings.announce_channel_id,
+            "pending_dashboard_message_ids": sorted(
+                self._pending_dashboard_delete_ids
+            ),
+        }
+        if self._status_thread_id is not None:
+            state["status_thread_id"] = self._status_thread_id
+        if self._persisted_dashboard_message_id is not None:
+            state["dashboard_message_id"] = self._persisted_dashboard_message_id
+        if self._rollover_uncertain_since is not None:
+            state["rollover_uncertain_since"] = self._rollover_uncertain_since
+        if self._dashboard_send_nonce is not None:
+            state["dashboard_send_nonce"] = self._dashboard_send_nonce
+        if self._dashboard_send_predecessor_id is not None:
+            state["dashboard_send_predecessor_id"] = (
+                self._dashboard_send_predecessor_id
+            )
+        return _store_dashboard_runtime_state(self.settings, state)
+
+    def _mark_rollover_send_uncertain(self) -> bool:
+        if self._dashboard_send_nonce is None:
+            if self._dashboard_messages_reconciled:
+                current_message_id = self._dashboard_message_id(self._message)
+                if current_message_id is not None:
+                    self._persisted_dashboard_message_id = current_message_id
+            self._dashboard_send_nonce = secrets.randbits(63) or 1
+            self._rollover_uncertain_since = time.time()
+            predecessor_id = getattr(self._message, "id", None)
+            self._dashboard_send_predecessor_id = (
+                predecessor_id
+                if isinstance(predecessor_id, int)
+                and not isinstance(predecessor_id, bool)
+                and predecessor_id > 0
+                else None
+            )
+            self._dashboard_send_had_ambiguous_attempt = False
+        self._dashboard_send_retry_ready = False
+        self._dashboard_messages_reconciled = False
+        return self._persist_dashboard_runtime_state()
+
+    def _clear_rollover_send_uncertainty(self) -> None:
+        if (
+            self._rollover_uncertain_since is None
+            and self._dashboard_send_nonce is None
+            and self._dashboard_send_predecessor_id is None
+        ):
+            return
+        self._rollover_uncertain_since = None
+        self._dashboard_send_nonce = None
+        self._dashboard_send_predecessor_id = None
+        self._dashboard_send_had_ambiguous_attempt = False
+        self._dashboard_send_retry_ready = False
+        self._persist_dashboard_runtime_state()
+
+    def _record_dashboard_send_failure(
+        self,
+        exc: BaseException,
+        attempt_evidence: _DashboardSendAttemptEvidence | None = None,
+    ) -> None:
+        """Resolve proven single-wire rejections; retain ambiguous episodes."""
+        if (
+            _is_definitive_discord_send_rejection(exc)
+            and attempt_evidence is not None
+            and attempt_evidence.wire_attempts == 1
+            and not self._dashboard_send_had_ambiguous_attempt
+        ):
+            self._clear_rollover_send_uncertainty()
+            self._dashboard_messages_reconciled = False
+            return
+        self._dashboard_send_had_ambiguous_attempt = True
+        self._dashboard_send_retry_ready = False
+        self._dashboard_messages_reconciled = False
+        self._persist_dashboard_runtime_state()
+
+    @staticmethod
+    def _dashboard_message_id(message) -> int | None:
+        message_id = getattr(message, "id", None)
+        return (
+            message_id
+            if isinstance(message_id, int)
+            and not isinstance(message_id, bool)
+            and message_id > 0
+            else None
+        )
+
+    @staticmethod
+    def _dashboard_message_key(message) -> int:
+        message_id = DashboardUpdater._dashboard_message_id(message)
+        return message_id if message_id is not None else id(message)
+
+    def _queue_dashboard_delete(self, message) -> None:
+        if message is None:
+            return
+        key = self._dashboard_message_key(message)
+        if (
+            self._message is not None
+            and key == self._dashboard_message_key(self._message)
+        ):
+            return
+        self._pending_dashboard_deletes[key] = message
+        if isinstance(getattr(message, "id", None), int):
+            self._pending_dashboard_delete_ids.add(key)
+            self._persist_dashboard_runtime_state()
+
+    async def _reconcile_dashboard_messages(self, channel) -> None:
+        """Adopt the newest dashboard and queue crash leftovers for cleanup."""
+        if self._dashboard_messages_reconciled:
+            return
+        self._dashboard_send_retry_ready = False
+        expected_author = getattr(getattr(channel, "guild", None), "me", None)
+        persisted_message = None
+        persisted_message_id = self._persisted_dashboard_message_id
+        pending_delete_keys = {
+            *self._pending_dashboard_delete_ids,
+            *self._pending_dashboard_deletes,
+        }
+        if persisted_message_id in pending_delete_keys:
+            if self._dashboard_message_id(self._message) == persisted_message_id:
+                self._message = None
+            self._persisted_dashboard_message_id = None
+            persisted_message_id = None
+            self._persist_dashboard_runtime_state()
+        if persisted_message_id is not None:
+            current_message_id = self._dashboard_message_id(self._message)
+            if (
+                current_message_id == persisted_message_id
+                and _is_dashboard_message(self._message, expected_author)
+            ):
+                persisted_message = self._message
+            else:
+                try:
+                    persisted_message = await _bounded_discord(
+                        channel.fetch_message(persisted_message_id)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_discord_not_found(exc):
+                        log.warning(
+                            "persisted canonical dashboard fetch deferred: %s",
+                            exc,
+                        )
+                        return
+                    self._persisted_dashboard_message_id = None
+                    if current_message_id == persisted_message_id:
+                        self._message = None
+                    self._persist_dashboard_runtime_state()
+                else:
+                    if not _is_dashboard_message(
+                        persisted_message,
+                        expected_author,
+                    ):
+                        self._persisted_dashboard_message_id = None
+                        persisted_message = None
+                        if current_message_id == persisted_message_id:
+                            self._message = None
+                        self._persist_dashboard_runtime_state()
+        try:
+            messages = await _bounded_discord(
+                _scan_dashboard_messages(channel, expected_author)
+            )
+            if self._rollover_uncertain_since is not None:
+                uncertain_at = datetime.fromtimestamp(
+                    self._rollover_uncertain_since, UTC
+                )
+                messages.extend(
+                    await _bounded_discord(
+                        _scan_dashboard_messages(
+                            channel,
+                            expected_author,
+                            after=uncertain_at - timedelta(minutes=1),
+                            before=uncertain_at
+                            + timedelta(
+                                seconds=DASHBOARD_SEND_NONCE_RETRY_SECONDS
+                                + DASHBOARD_DISCORD_TIMEOUT_SECONDS
+                            ),
+                        )
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("dashboard reconciliation deferred: %s", exc)
+            return
+        if persisted_message is not None:
+            messages.append(persisted_message)
+        unique_messages: dict[int, object] = {}
+        for message in messages:
+            unique_messages.setdefault(self._dashboard_message_key(message), message)
+        history_messages = sorted(
+            unique_messages.values(),
+            key=self._dashboard_message_key,
+            reverse=True,
+        )
+        previous = self._message
+        previous_key = (
+            self._dashboard_message_key(previous)
+            if previous is not None
+            else None
+        )
+        pending_delete_keys = {
+            *self._pending_dashboard_delete_ids,
+            *self._pending_dashboard_deletes,
+        }
+        canonical_candidates = [
+            message
+            for message in history_messages
+            if self._dashboard_message_key(message) not in pending_delete_keys
+        ]
+        if previous is not None and previous_key not in pending_delete_keys:
+            canonical_candidates.append(previous)
+        if canonical_candidates:
+            self._message = max(
+                canonical_candidates,
+                key=self._dashboard_message_key,
+            )
+        elif previous_key in pending_delete_keys:
+            self._message = None
+        canonical_key = (
+            self._dashboard_message_key(self._message)
+            if self._message is not None
+            else None
+        )
+        self._persisted_dashboard_message_id = self._dashboard_message_id(
+            self._message
+        )
+        if canonical_key != previous_key:
+            self._last_payload_fingerprint = None
+        if canonical_key is not None:
+            self._pending_dashboard_deletes.pop(canonical_key, None)
+            self._pending_dashboard_delete_ids.discard(canonical_key)
+        for stale in [*history_messages, previous]:
+            if stale is not None:
+                self._queue_dashboard_delete(stale)
+
+        pending_nonce = self._dashboard_send_nonce
+        nonce_resolved = pending_nonce is not None and any(
+            str(getattr(message, "nonce", "")) == str(pending_nonce)
+            for message in [*history_messages, previous]
+            if message is not None
+        )
+        predecessor_id = self._dashboard_send_predecessor_id
+        if (
+            nonce_resolved
+            and predecessor_id is not None
+            and predecessor_id != canonical_key
+        ):
+            self._pending_dashboard_delete_ids.add(predecessor_id)
+
+        unresolved_pending_id = False
+        for message_id in tuple(self._pending_dashboard_delete_ids):
+            if message_id == canonical_key:
+                self._pending_dashboard_delete_ids.discard(message_id)
+                continue
+            if message_id in self._pending_dashboard_deletes:
+                continue
+            try:
+                stale = await _bounded_discord(channel.fetch_message(message_id))
+            except Exception as exc:  # noqa: BLE001
+                if _is_discord_not_found(exc):
+                    self._pending_dashboard_delete_ids.discard(message_id)
+                else:
+                    log.warning(
+                        "persisted stale dashboard fetch deferred: %s", exc
+                    )
+                    unresolved_pending_id = True
+                continue
+            if _is_dashboard_message(stale, expected_author):
+                self._queue_dashboard_delete(stale)
+            else:
+                self._pending_dashboard_delete_ids.discard(message_id)
+
+        if pending_nonce is None:
+            # Backward compatibility for timestamp-only recovery state written
+            # before dashboard sends acquired an idempotency nonce.
+            self._rollover_uncertain_since = None
+            self._dashboard_send_predecessor_id = None
+        elif nonce_resolved:
+            self._rollover_uncertain_since = None
+            self._dashboard_send_nonce = None
+            self._dashboard_send_predecessor_id = None
+            self._dashboard_send_had_ambiguous_attempt = False
+        else:
+            started_at = self._rollover_uncertain_since or 0.0
+            nonce_age = max(0.0, time.time() - started_at)
+            self._dashboard_send_retry_ready = (
+                not unresolved_pending_id
+                and nonce_age < DASHBOARD_SEND_NONCE_RETRY_SECONDS
+            )
+        self._dashboard_messages_reconciled = (
+            not unresolved_pending_id
+            and (
+                pending_nonce is None
+                or nonce_resolved
+                or self._dashboard_send_retry_ready
+            )
+        )
+        self._persist_dashboard_runtime_state()
+        self._start_dashboard_cleanup_if_idle()
+
+    async def _retry_uncertain_dashboard_send(
+        self,
+        channel,
+        payload: DashboardPayload,
+    ) -> object:
+        """Resolve one recent ambiguous create with its original nonce."""
+        nonce = self._dashboard_send_nonce
+        if nonce is None or not self._dashboard_send_retry_ready:
+            raise RuntimeError("dashboard send retry is not reconciled")
+        if not self._persist_dashboard_runtime_state():
+            self._dashboard_send_retry_ready = False
+            self._dashboard_messages_reconciled = False
+            raise RuntimeError(
+                "cannot persist dashboard-send recovery state; retry deferred"
+            )
+        previous = self._message
+        predecessor_id = self._dashboard_send_predecessor_id
+        self._dashboard_send_retry_ready = False
+        self._dashboard_messages_reconciled = False
+        # On failure, retain the immutable first-attempt timestamp and nonce;
+        # the next tick must scan the same history window before retrying.
+        replacement = await _bounded_discord(
+            _send_payload(
+                channel,
+                payload,
+                view=self.live_view,
+                nonce=nonce,
+            )
+        )
+
+        candidates = [
+            message
+            for message in (previous, replacement)
+            if message is not None
+        ]
+        self._message = max(candidates, key=self._dashboard_message_key)
+        self._persisted_dashboard_message_id = self._dashboard_message_id(
+            self._message
+        )
+        # A nonce replay returns the payload accepted by the original POST,
+        # which may predate this tick. Let the normal edit path apply and hash
+        # the current payload before claiming its fingerprint.
+        self._last_payload_fingerprint = None
+        for stale in candidates:
+            self._queue_dashboard_delete(stale)
+
+        canonical_key = self._dashboard_message_key(self._message)
+        known_keys = {self._dashboard_message_key(message) for message in candidates}
+        if predecessor_id is not None and predecessor_id != canonical_key:
+            if predecessor_id not in known_keys:
+                try:
+                    predecessor = await _bounded_discord(
+                        channel.fetch_message(predecessor_id)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_discord_not_found(exc):
+                        log.warning(
+                            "rollover predecessor fetch deferred: %s",
+                            exc,
+                        )
+                        self._pending_dashboard_delete_ids.add(predecessor_id)
+                else:
+                    expected_author = getattr(
+                        getattr(channel, "guild", None), "me", None
+                    )
+                    if _is_dashboard_message(predecessor, expected_author):
+                        self._queue_dashboard_delete(predecessor)
+            elif predecessor_id not in self._pending_dashboard_deletes:
+                self._pending_dashboard_delete_ids.add(predecessor_id)
+        unresolved_predecessor = (
+            predecessor_id is not None
+            and predecessor_id != canonical_key
+            and predecessor_id not in self._pending_dashboard_deletes
+            and predecessor_id in self._pending_dashboard_delete_ids
+        )
+        self._clear_rollover_send_uncertainty()
+        self._dashboard_messages_reconciled = not unresolved_predecessor
+        self._persist_dashboard_runtime_state()
+        self._start_dashboard_cleanup_if_idle()
+        return self._message
+
+    async def _delete_stale_dashboard(self, key: int, message) -> int:
+        if key == self._persisted_dashboard_message_id:
+            return key
+        try:
+            await _bounded_discord(message.delete())
+        except Exception as exc:  # noqa: BLE001
+            if not _is_discord_not_found(exc):
+                raise
+        return key
+
+    def _dashboard_cleanup_finished(self, task: asyncio.Task) -> None:
+        if self._dashboard_cleanup_task is task:
+            self._dashboard_cleanup_task = None
+        if task.cancelled():
+            return
+        try:
+            key = task.result()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("stale dashboard cleanup failed; will retry: %s", exc)
+            return
+        self._pending_dashboard_deletes.pop(key, None)
+        self._pending_dashboard_delete_ids.discard(key)
+        self._persist_dashboard_runtime_state()
+
+    def _start_dashboard_cleanup_if_idle(self) -> None:
+        task = self._dashboard_cleanup_task
+        if task is not None and not task.done():
+            return
+        if task is not None:
+            self._dashboard_cleanup_finished(task)
+        if self._persisted_dashboard_message_id is not None:
+            canonical_key = self._persisted_dashboard_message_id
+            self._pending_dashboard_deletes.pop(canonical_key, None)
+            self._pending_dashboard_delete_ids.discard(canonical_key)
+        if not self._pending_dashboard_deletes:
+            return
+        self._persist_dashboard_runtime_state()
+        key, message = next(iter(self._pending_dashboard_deletes.items()))
+        task = asyncio.create_task(self._delete_stale_dashboard(key, message))
+        self._dashboard_cleanup_task = task
+        task.add_done_callback(self._dashboard_cleanup_finished)
+
+    def _adopt_dashboard_rollover(
+        self,
+        result: tuple[object, object | None],
+        fingerprint: str,
+    ) -> object:
+        replacement, stale = result
+        self._message = replacement
+        self._persisted_dashboard_message_id = self._dashboard_message_id(
+            replacement
+        )
+        self._last_payload_fingerprint = fingerprint
+        if stale is not None:
+            # Persist cleanup ownership before clearing the send episode. If
+            # either write fails, a restart retains at least one recovery path
+            # to the predecessor instead of orphaning it outside history.
+            self._queue_dashboard_delete(stale)
+        self._clear_rollover_send_uncertainty()
+        if stale is not None:
+            self._start_dashboard_cleanup_if_idle()
+        return replacement
+
+    async def _rollover_dashboard(
+        self,
+        channel,
+        payload: DashboardPayload,
+        fingerprint: str,
+    ) -> object:
+        """Finish and adopt one bounded rollover even if the loop is stopped."""
+        if self._dashboard_send_nonce is not None:
+            raise RuntimeError(
+                "uncertain dashboard send must reconcile before rollover"
+            )
+        if not self._mark_rollover_send_uncertain():
+            raise RuntimeError(
+                "cannot persist rollover recovery state; replacement deferred"
+            )
+        attempt_evidence = _DashboardSendAttemptEvidence()
+        task = asyncio.create_task(
+            _rollover_dashboard_message(
+                channel,
+                self._message,
+                payload,
+                view=self.live_view,
+                nonce=self._dashboard_send_nonce,
+                attempt_evidence=attempt_evidence,
+            )
+        )
+        self._rollover_task = task
+        try:
+            try:
+                result = await asyncio.shield(task)
+            except asyncio.CancelledError as cancelled:
+                # Do not abandon a fully-sent successor during shutdown.  Each
+                # underlying request has its own short deadline, so completing
+                # the ownership handoff is bounded.
+                try:
+                    result = await asyncio.shield(task)
+                except Exception as exc:  # noqa: BLE001
+                    self._record_dashboard_send_failure(exc, attempt_evidence)
+                    log.warning("dashboard rollover did not complete during stop: %s", exc)
+                else:
+                    self._adopt_dashboard_rollover(result, fingerprint)
+                raise cancelled
+            return self._adopt_dashboard_rollover(result, fingerprint)
+        except Exception as exc:
+            # The POST may have committed before its response was lost.  A
+            # strict time-window history reconciliation must succeed before
+            # another replacement can be attempted.
+            self._record_dashboard_send_failure(exc, attempt_evidence)
+            raise
+        finally:
+            if task.done() and self._rollover_task is task:
+                self._rollover_task = None
+
+    async def _stored_status_thread(self):
+        """Resolve the persisted status thread independently of message ID."""
+        thread_id = self._status_thread_id
+        if thread_id is None or self._message is None:
+            return None
+        fetch_channel = getattr(
+            getattr(self._message, "guild", None), "fetch_channel", None
+        )
+        if fetch_channel is None:
+            return None
+        try:
+            thread = await _bounded_discord(fetch_channel(thread_id))
+        except Exception as exc:  # noqa: BLE001
+            if _is_discord_not_found(exc):
+                return None
+            raise
+        parent_id = getattr(thread, "parent_id", None)
+        if parent_id is not None and parent_id != self.settings.announce_channel_id:
+            log.warning("persisted status thread belongs to another channel; ignoring")
+            return None
+        return thread
+
+    def _remember_status_thread(self, thread) -> None:
+        thread_id = getattr(thread, "id", None)
+        if not isinstance(thread_id, int) or thread_id <= 0:
+            return
+        self._status_thread_id = thread_id
+        if (
+            thread_id != self._persisted_status_thread_id
+            and self._persist_dashboard_runtime_state()
+        ):
+            self._persisted_status_thread_id = thread_id
+
+    async def _status_thread_ready_for_rollover(self) -> bool:
+        """Capture the old starter's thread identity before replacing it."""
+        if self._thread is not None or self._status_thread_id is not None:
+            return True
+        await self._ensure_thread()
+        return self._thread is not None or self._status_thread_id is not None
+
     async def _ensure_thread(self) -> None:
         """Create the updates thread under the dashboard message once."""
         if self._message is None:
@@ -900,7 +1783,11 @@ class DashboardUpdater:
             # Public thread IDs equal their starter-message IDs.  Archived
             # threads are absent from ``channel.threads``, so resolve the
             # thread through its dashboard message before trying to create it.
-            thread = self._thread or getattr(self._message, "thread", None)
+            thread = self._thread
+            if thread is None:
+                thread = await self._stored_status_thread()
+            if thread is None:
+                thread = getattr(self._message, "thread", None)
             if thread is None:
                 thread = next(
                     (
@@ -916,7 +1803,7 @@ class DashboardUpdater:
                 fetch_thread = getattr(self._message, "fetch_thread", None)
                 if fetch_thread is not None:
                     try:
-                        thread = await fetch_thread()
+                        thread = await _bounded_discord(fetch_thread())
                     except discord.NotFound:
                         thread = None
                 else:
@@ -929,17 +1816,22 @@ class DashboardUpdater:
                     )
                     if fetch_channel is not None:
                         try:
-                            thread = await fetch_channel(self._message.id)
+                            thread = await _bounded_discord(
+                                fetch_channel(self._message.id)
+                            )
                         except discord.NotFound:
                             thread = None
             if thread is None:
-                thread = await self._message.create_thread(
-                    name="status updates", auto_archive_duration=10080
+                thread = await _bounded_discord(
+                    self._message.create_thread(
+                        name="status updates", auto_archive_duration=10080
+                    )
                 )
                 log.info("created status thread %s", thread.id)
             if getattr(thread, "archived", False):
-                await thread.edit(archived=False)
+                await _bounded_discord(thread.edit(archived=False))
             self._thread = thread
+            self._remember_status_thread(thread)
         except Exception as exc:  # noqa: BLE001
             self._thread = None
             log.warning("could not resolve status thread: %s", exc)
@@ -949,7 +1841,7 @@ class DashboardUpdater:
         while self._pending_alert_messages and self._thread is not None:
             text = self._pending_alert_messages[0]
             try:
-                await self._thread.send(content=text)
+                await _bounded_discord(self._thread.send(content=text))
             except Exception as exc:  # noqa: BLE001
                 # Force a fresh resolve/unarchive on the next presentation tick.
                 self._thread = None
@@ -1103,7 +1995,12 @@ class DashboardUpdater:
             log.warning("background map refresh failed: %s", type(exc).__name__)
             value = exc
         if generation is not None:
-            self._publish_provider_result(generation, "traffic_map", value)
+            # A map capture is an independent single-flight stream.  Its task
+            # identity was checked above, so an ordinary collection starting
+            # while it was running does not make this newest map obsolete.
+            self._publish_provider_result(
+                generation, "traffic_map", value, independent_map=True
+            )
 
     def _collection_finished(self, task: asyncio.Task) -> None:
         """Publish a completed collection without blocking the presenter."""
@@ -1124,13 +2021,43 @@ class DashboardUpdater:
 
         # ``collect_all`` publishes providers individually.  This fallback is
         # retained for alternate collectors that do not invoke the callback.
-        if self._snapshot is None or self._snapshot.generation < self._collection_generation:
-            for name, value in fresh.items():
-                self._publish_provider_result(self._collection_generation, name, value)
+        # An independent map may have advanced the snapshot while this
+        # collector was finishing, so use settled-provider identity instead
+        # of comparing only snapshot generations.
+        snapshot = self._snapshot
+        settled = (
+            snapshot.settled_providers
+            if snapshot is not None
+            and snapshot.generation == self._collection_generation
+            else frozenset()
+        )
+        for name, value in fresh.items():
+            if name not in settled:
+                self._publish_provider_result(
+                    self._collection_generation, name, value
+                )
 
-    def _publish_provider_result(self, generation: int, name: str, value: object) -> None:
+    def _publish_provider_result(
+        self,
+        generation: int,
+        name: str,
+        value: object,
+        *,
+        independent_map: bool = False,
+    ) -> None:
         """Atomically merge one provider into the current last-good snapshot."""
-        if not self._running or generation != self._collection_generation:
+        if not self._running:
+            return
+        if independent_map:
+            if name != "traffic_map":
+                return
+            # The single-flight task identity in ``_map_finished`` is the
+            # freshness fence.  Publish into the newest ordinary snapshot,
+            # retaining every provider value that arrived since map start.
+            generation = self._collection_generation
+        elif generation != self._collection_generation:
+            # Ordinary callbacks from a cancelled/replaced collection must not
+            # overwrite a newer generation.
             return
         previous = self._snapshot
         merged: dict[str, object] = {}
@@ -1194,56 +2121,141 @@ class DashboardUpdater:
             self._last_good_payload = payload
             return
 
-        # ensure message exists (create once)
-        if self._message is None:
-            self._message = await _ensure_dashboard_message(
-                channel, payload, view=self.live_view
+        # Reconcile persisted uncertain sends before any create.  This strict
+        # path can recover a committed replacement outside recent history.
+        await self._reconcile_dashboard_messages(channel)
+        self._start_dashboard_cleanup_if_idle()
+        if self._dashboard_send_nonce is not None:
+            if not self._dashboard_send_retry_ready:
+                # A failed scan, unresolved cleanup, or expired nonce window
+                # cannot authorize another possibly creating request.
+                return
+            self._message = await self._retry_uncertain_dashboard_send(
+                channel,
+                payload,
             )
-        map_pending = bool(
-            payload_snapshot is not None
-            and "traffic_map" in payload_snapshot.results
-            and "traffic_map" in payload_snapshot.stale_providers
-            and "traffic_map" not in payload_snapshot.settled_providers
-        )
-        if not map_pending:
-            fingerprint = _payload_fingerprint(payload)
+        elif self._rollover_uncertain_since is not None:
+            # Legacy timestamp-only state still requires one successful scan.
+            return
+        if self._message is None and not self._dashboard_messages_reconciled:
+            return
+        # Ensure the message only after reconciliation proves that no prior
+        # uncertain create needs adoption.
+        if self._message is None:
+            if not self._mark_rollover_send_uncertain():
+                raise RuntimeError(
+                    "cannot persist dashboard-send recovery state; create deferred"
+                )
+            attempt_evidence = _DashboardSendAttemptEvidence()
             try:
-                if fingerprint != self._last_payload_fingerprint:
-                    edited_message = await _apply_payload(
-                        self._message, payload, view=self.live_view
+                self._message = await _bounded_discord(
+                    _ensure_dashboard_message(
+                        channel,
+                        payload,
+                        view=self.live_view,
+                        nonce=self._dashboard_send_nonce,
+                        attempt_evidence=attempt_evidence,
                     )
-                    if edited_message is not None:
-                        # discord.py 2.x returns the edited Message rather than
-                        # mutating this object in place. Retain it so its
-                        # Attachment objects can be passed through next time.
-                        self._message = edited_message
-                    self._last_payload_fingerprint = fingerprint
-                    map_asset = next(
-                        (asset for asset in payload.files
-                         if asset.filename == traffic_map_filename(asset.data)),
-                        None,
-                    )
-                    if map_asset is not None:
-                        map_hash = hashlib.sha256(map_asset.data).hexdigest()[:12]
-                        log.info(
-                            "dashboard edit succeeded collection_generation=%s "
-                            "payload_fingerprint=%s traffic_map_sha256=%s "
-                            "traffic_map_filename=%s",
-                            payload_generation, fingerprint[:12], map_hash, map_asset.filename,
+                )
+            except asyncio.CancelledError as exc:
+                self._record_dashboard_send_failure(exc, attempt_evidence)
+                raise
+            except Exception as exc:
+                # The initial POST has the same accepted-but-response-lost
+                # ambiguity as a rollover. Keep the persisted timestamp and
+                # require a strict history reconciliation before another send.
+                self._record_dashboard_send_failure(exc, attempt_evidence)
+                raise
+            self._persisted_dashboard_message_id = self._dashboard_message_id(
+                self._message
+            )
+            self._clear_rollover_send_uncertainty()
+        fingerprint = _payload_fingerprint(payload)
+        try:
+            if fingerprint != self._last_payload_fingerprint:
+                rollover = (
+                    self._dashboard_messages_reconciled
+                    and _dashboard_message_needs_rollover(self._message)
+                )
+                rollover_ready = (
+                    not rollover
+                    or await self._status_thread_ready_for_rollover()
+                )
+                try:
+                    if (
+                        rollover
+                        and rollover_ready
+                        and not self._pending_dashboard_delete_ids
+                    ):
+                        edited_message = await self._rollover_dashboard(
+                            channel,
+                            payload,
+                            fingerprint,
                         )
                     else:
-                        log.info(
-                            "dashboard edit succeeded collection_generation=%s "
-                            "payload_fingerprint=%s traffic_map_sha256=none "
-                            "traffic_map_filename=none",
-                            payload_generation, fingerprint[:12],
+                        if rollover and not rollover_ready:
+                            log.warning(
+                                "dashboard rollover deferred until its status "
+                                "thread identity can be retained"
+                            )
+                        elif rollover:
+                            log.warning(
+                                "dashboard rollover deferred until stale-message "
+                                "cleanup succeeds"
+                            )
+                        edited_message = await _bounded_discord(
+                            _apply_payload(
+                                self._message, payload, view=self.live_view
+                            )
                         )
+                except Exception as edit_exc:
+                    if (
+                        rollover
+                        or self._pending_dashboard_delete_ids
+                        or not self._dashboard_messages_reconciled
+                        or not _is_old_dashboard_edit_cap(edit_exc)
+                    ):
+                        raise
+                    if not await self._status_thread_ready_for_rollover():
+                        raise
+                    edited_message = await self._rollover_dashboard(
+                        channel,
+                        payload,
+                        fingerprint,
+                    )
+                if edited_message is not None:
+                    # discord.py 2.x returns the edited Message rather than
+                    # mutating this object in place. Retain it so its
+                    # Attachment objects can be passed through next time.
+                    self._message = edited_message
+                self._last_payload_fingerprint = fingerprint
+                map_asset = next(
+                    (asset for asset in payload.files
+                     if asset.filename == traffic_map_filename(asset.data)),
+                    None,
+                )
+                if map_asset is not None:
+                    map_hash = hashlib.sha256(map_asset.data).hexdigest()[:12]
+                    log.info(
+                        "dashboard edit succeeded collection_generation=%s "
+                        "payload_fingerprint=%s traffic_map_sha256=%s "
+                        "traffic_map_filename=%s",
+                        payload_generation, fingerprint[:12], map_hash, map_asset.filename,
+                    )
+                else:
+                    log.info(
+                        "dashboard edit succeeded collection_generation=%s "
+                        "payload_fingerprint=%s traffic_map_sha256=none "
+                        "traffic_map_filename=none",
+                        payload_generation, fingerprint[:12],
+                    )
                 self._last_good_payload = payload
-            except Exception as exc:  # noqa: BLE001
-                log.warning("edit failed (keeping last good): %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("edit failed (keeping last good): %s", exc)
 
         # status thread + alerts (create the thread after the message exists)
-        await self._ensure_thread()
+        if self._dashboard_messages_reconciled:
+            await self._ensure_thread()
         await self._process_alert_snapshot()
 
     async def stop(self) -> None:
@@ -1259,6 +2271,18 @@ class DashboardUpdater:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._loop_task
             self._loop_task = None
+        rollover_task = self._rollover_task
+        if rollover_task is not None and not rollover_task.done():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.shield(rollover_task)
+        self._rollover_task = None
+        cleanup_task = self._dashboard_cleanup_task
+        if cleanup_task is not None and not cleanup_task.done():
+            cleanup_task.cancel()
+        if cleanup_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await cleanup_task
+        self._dashboard_cleanup_task = None
         collection_task = self._collection_task
         if collection_task is not None and not collection_task.done():
             collection_task.cancel()
@@ -1296,7 +2320,17 @@ async def run_discord_bot(settings: Settings) -> None:
     # content, which is always visible without the privileged Message Content
     # intent. This avoids requiring the portal toggle.
     intents = discord.Intents.default()
-    bot = commands.Bot(command_prefix="d.", intents=intents, help_command=None)
+    bot = commands.Bot(
+        command_prefix="d.",
+        intents=intents,
+        help_command=None,
+        http_trace=_dashboard_http_trace_config(),
+        max_ratelimit_timeout=DISCORD_MAX_RATELIMIT_RETRY_SECONDS,
+    )
+    # discord.py clamps the constructor option to 30 seconds.  Set the desired
+    # bound now for login; ``on_ready`` wraps the Event that ``static_login``
+    # creates afterward.
+    bot.http.max_ratelimit_timeout = DISCORD_MAX_RATELIMIT_RETRY_SECONDS
 
     updater = DashboardUpdater(settings)
     # Persistent component: survives restarts via the custom_id registration.
@@ -1304,6 +2338,9 @@ async def run_discord_bot(settings: Settings) -> None:
 
     @bot.event
     async def on_ready() -> None:
+        # ``static_login`` replaces the global-rate-limit Event, so install the
+        # cancellation-safe wrapper only after login and before dashboard I/O.
+        _configure_discord_http_deadlines(bot.http)
         log.info("Logged in as %s", bot.user)
         if updater.is_running:
             log.info("dashboard update loop already active after reconnect")
@@ -1323,7 +2360,8 @@ async def run_discord_bot(settings: Settings) -> None:
         # Resolve the message once (configured ID or history scan).
         message = await _resolve_dashboard_message(
             channel,
-            settings.dashboard_message_id,
+            updater._persisted_dashboard_message_id  # noqa: SLF001
+            or settings.dashboard_message_id,
             bot.user,
         )
         updater._message = message  # noqa: SLF001

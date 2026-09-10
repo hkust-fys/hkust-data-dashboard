@@ -6,7 +6,11 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from dashboard.maps.marker_audit import audit_gmb_marker_pairs, audit_marker_positions
+from dashboard.maps.marker_audit import (
+    _verified_gate_index,
+    audit_gmb_marker_pairs,
+    audit_marker_positions,
+)
 from dashboard.maps.positions import BusEstimate, estimate_bus_positions
 from dashboard.maps.renderer import (
     MAP_HEIGHT,
@@ -226,6 +230,23 @@ async def fetch_traffic_map(
                       if route_lines else [])
             priority_provider = getattr(tracker, "poll_priorities", None)
             priorities = priority_provider() if callable(priority_provider) else None
+            lifecycle_provider = getattr(tracker, "poll_lifecycle_routes", None)
+            lifecycle_routes = (
+                lifecycle_provider() if callable(lifecycle_provider) else ()
+            )
+            if lifecycle_routes:
+                promoted = {
+                    route_key: set(indices)
+                    for route_key, indices in (priorities or {}).items()
+                }
+                for probe in baseline_probes:
+                    route_key = (probe.operator, probe.route, probe.bound)
+                    if route_key in lifecycle_routes:
+                        promoted.setdefault(route_key, set()).add(probe.index)
+                priorities = {
+                    route_key: frozenset(indices)
+                    for route_key, indices in promoted.items()
+                }
             probes = list(baseline_probes)
             seen = {(p.operator, p.route, p.bound, p.index) for p in probes}
             for line in route_lines:
@@ -273,6 +294,7 @@ async def fetch_traffic_map(
         audit_estimates: list[BusEstimate] = []
         authoritative = _authoritative_etas(groups or [], route_lines)
         probe_etas = []
+        observed_for_frame: dict[tuple[str, str, str], object] = {}
         if probe_task is not None:
             if isinstance(probe_result, BaseException):
                 log.warning("probe ETA estimation failed: %s", type(probe_result).__name__)
@@ -288,16 +310,25 @@ async def fetch_traffic_map(
                 for operator, route, bound, index in getattr(
                         snapshot, "positioning_checkpoints", ()):
                     observed_positions.setdefault((operator, route, bound), set()).add(index)
+                observed_for_frame = observed_positions or {
+                    tuple(route.route_key): route.observed_checkpoint_indices
+                    for route in getattr(snapshot, "complete_routes", ())
+                }
                 try:
+                    verified_gate_indices = {}
+                    for line in route_lines:
+                        gate_index = _verified_gate_index(line)
+                        if gate_index is not None:
+                            verified_gate_indices[
+                                (str(line.operator), str(line.route), str(line.bound))
+                            ] = gate_index
                     estimates = estimate_bus_positions(
                         probe_etas,
                         route_lines,
                         _destination_map(groups or [], route_lines),
                         authoritative,
-                        observed_checkpoint_indices=observed_positions or {
-                            tuple(route.route_key): route.observed_checkpoint_indices
-                            for route in getattr(snapshot, "complete_routes", ())
-                        },
+                        observed_checkpoint_indices=observed_for_frame,
+                        verified_gate_indices=verified_gate_indices,
                     )
                     audit_estimates = list(estimates)
                 except Exception as exc:  # noqa: BLE001
@@ -312,6 +343,7 @@ async def fetch_traffic_map(
             audit = audit_marker_positions(
                 probe_etas, authoritative, audit_estimates, route_lines,
                 frame_id=frame_id, seed=frame_id,
+                observed_checkpoint_indices=observed_for_frame,
             )
             marker_pairs = audit.get("gmb_marker_pairs", ())
             log.info(

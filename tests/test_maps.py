@@ -212,6 +212,58 @@ async def test_probe_selection_receives_verified_gate_ids_as_mandatory_anchors(m
 
 
 @pytest.mark.asyncio
+async def test_estimator_receives_geometry_verified_gate_occurrences(monkeypatch):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+
+    line = RouteLine(
+        "11S",
+        "GMB",
+        "seq-1",
+        [
+            Stop("origin", "Origin", 22.33, 114.25),
+            Stop("20013011", "HKUST South", 22.331, 114.251),
+            Stop("terminus", "Terminus", 22.332, 114.252),
+        ],
+    )
+    seen = {}
+
+    async def geometry(*_args, **_kwargs):
+        return RouteGeometry(routes=[line])
+
+    def select(*_args, **_kwargs):
+        return [
+            SimpleNamespace(
+                operator="GMB",
+                route="11S",
+                bound="seq-1",
+                stop_id="20013011",
+                route_id=2004826,
+                sequence=1,
+                index=1,
+            )
+        ]
+
+    async def snapshot(*_args, **_kwargs):
+        return _probe_snapshot()
+
+    def estimate(*_args, **kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
+    monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
+    monkeypatch.setattr(maps, "select_probe_stops", select)
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", snapshot)
+    monkeypatch.setattr(maps, "estimate_bus_positions", estimate)
+    monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
+
+    await maps.fetch_traffic_map(object())
+
+    assert seen["verified_gate_indices"] == {("GMB", "11S", "seq-1"): 1}
+
+
+@pytest.mark.asyncio
 async def test_active_priority_adds_supplement_without_changing_sparse_baseline(monkeypatch):
     import dashboard.maps as maps
     from dashboard.providers.route_geometry import RouteGeometry
@@ -235,7 +287,10 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
 
     class Tracker:
         def poll_priorities(self):
-            return {("KMB", "91", "outbound"): {4}}
+            return {("KMB", "91", "outbound"): {4, 6}}
+
+        def poll_lifecycle_routes(self):
+            return frozenset({("KMB", "91", "outbound")})
 
         async def update(self, _snapshot, estimates, _lines):
             return estimates
@@ -249,7 +304,10 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
 
     baseline = seen["generation_probes"]
     assert [probe.index for probe in baseline] == [0, 3, 5, 8]
-    assert [probe.index for probe in seen["probes"]] == [0, 3, 5, 8, 4]
+    assert [probe.index for probe in seen["probes"]] == [0, 3, 5, 8, 4, 6]
+    assert seen["priorities"] == {
+        ("KMB", "91", "outbound"): frozenset({0, 3, 4, 5, 6, 8})
+    }
     assert seen["wait_for_refresh"] is False
 
 
@@ -289,22 +347,33 @@ async def test_marker_audit_receives_stateless_candidates_when_tracker_changes_o
     async def geometry(*_args, **_kwargs):
         return RouteGeometry(routes=[RouteLine("91", "KMB", "outbound", [])])
     async def snapshot(*_args, **_kwargs):
-        return _probe_snapshot()
+        return SimpleNamespace(
+            rows=(), positioning_rows=(), complete_routes=(), routes=(),
+            positioning_checkpoints=frozenset({("KMB", "91", "outbound", 7)}),
+            collected_at=None,
+        )
     class Tracker:
         async def update(self, *_args, **_kwargs):
             return [changed]
     def audit(*args, **kwargs):
         audited["estimates"] = args[2]
+        audited["audit_observed"] = kwargs["observed_checkpoint_indices"]
         return {"checks": [], "issues": [], "stats": {"markers": 0}, "ok": True,
                 "gmb_marker_pairs": ()}
+    def estimate(*_args, **kwargs):
+        audited["estimate_observed"] = kwargs["observed_checkpoint_indices"]
+        return [candidate]
     monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
     monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
     monkeypatch.setattr(maps, "fetch_probe_snapshot", snapshot)
-    monkeypatch.setattr(maps, "estimate_bus_positions", lambda *_args, **_kwargs: [candidate])
+    monkeypatch.setattr(maps, "estimate_bus_positions", estimate)
     monkeypatch.setattr(maps, "audit_marker_positions", audit)
     monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
     await maps.fetch_traffic_map(object(), tracker=Tracker())
     assert audited["estimates"] == [candidate]
+    assert audited["audit_observed"] == audited["estimate_observed"] == {
+        ("KMB", "91", "outbound"): {7}
+    }
 
 
 def test_marker_issue_warning_key_is_deduplicated_and_bounded():

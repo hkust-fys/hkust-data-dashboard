@@ -179,6 +179,38 @@ async def test_origin_specific_pacing_override():
     assert started[1] - started[0] >= 0.025
 
 
+def test_gmb_default_origin_pacing_override():
+    client = HttpClient(object())
+
+    assert client.gmb_eta_request_interval_seconds == 1.5
+    assert client._origin_interval("https://data.etagmb.gov.hk/eta/stop/1") == 1.5  # noqa: SLF001
+    assert client._origin_interval("https://data.etagmb.gov.hk/eta/route-stop/1/2") == 1.5  # noqa: SLF001
+    assert client._origin_interval("https://data.etagmb.gov.hk/route-stop/1/2") == 0.2  # noqa: SLF001
+    assert client._origin_interval("https://data.etagmb.gov.hk/stop/1") == 0.2  # noqa: SLF001
+    assert client._origin_interval("https://other.example/eta/stop/1") == 0.06  # noqa: SLF001
+
+
+def test_gmb_eta_pacing_is_configurable():
+    client = HttpClient(object(), gmb_eta_request_interval_seconds=0)
+    assert client._origin_interval("https://data.etagmb.gov.hk/eta/stop/1") == 0.2  # noqa: SLF001
+    disabled = HttpClient(
+        object(),
+        origin_request_interval_seconds=0,
+        origin_request_interval_overrides_seconds={"data.etagmb.gov.hk": 0},
+        gmb_eta_request_interval_seconds=0,
+    )
+    assert disabled._origin_interval("https://data.etagmb.gov.hk/eta/stop/1") == 0  # noqa: SLF001
+    custom = HttpClient(object(), gmb_eta_request_interval_seconds=0.04)
+    assert custom._origin_interval("https://data.etagmb.gov.hk/eta/stop/1") == 0.2  # noqa: SLF001
+    custom = HttpClient(
+        object(),
+        origin_request_interval_seconds=0,
+        origin_request_interval_overrides_seconds={"data.etagmb.gov.hk": 0},
+        gmb_eta_request_interval_seconds=0.04,
+    )
+    assert custom._origin_interval("https://data.etagmb.gov.hk/eta/stop/1") == 0.04  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_http_403_is_not_retried():
     class ForbiddenResponse:

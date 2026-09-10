@@ -383,7 +383,7 @@ async def test_one_sided_and_replayed_boundary_candidates_cannot_reacquire():
 
 
 @pytest.mark.asyncio
-async def test_priority_cap_keeps_forward_scouts_and_terminal_with_legacy_low_priorities():
+async def test_forward_search_suppresses_legacy_low_priorities():
     line = _line(stops=60)
     candidate = _manual(2.5, evidence=((2, BASE.timestamp(), 10), (3, (BASE + timedelta(minutes=1)).timestamp(), 11)), priorities=range(41))
     tracker = MarkerTracker()
@@ -391,8 +391,7 @@ async def test_priority_cap_keeps_forward_scouts_and_terminal_with_legacy_low_pr
     empty = [_probe(2, None, 12, arrival=False), _probe(3, None, 13, arrival=False)]
     await tracker.update(_snapshot(1, empty), [], [line])
     priorities = tracker.poll_priorities()[KEY]
-    assert len(priorities) == 32
-    assert {4, 5, 7, 59}.issubset(priorities)
+    assert priorities == frozenset({4, 31, 59})
 
 
 @pytest.mark.asyncio

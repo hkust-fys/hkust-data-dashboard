@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -649,6 +649,9 @@ def audit_marker_positions(
     frame_id: int = 0,
     seed: object | None = None,
     tolerance: float = 2.0,
+    observed_checkpoint_indices: (
+        Mapping[RouteKey, Collection[int]] | Collection[int] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Audit all marker/source relationships represented by one map frame."""
     lines = {_key(line): line for line in route_lines}
@@ -692,13 +695,38 @@ def audit_marker_positions(
         authoritative_input_index[id(row)] = row_index
         indexed_authoritative_by_key[_key(row)].append((row_index, row))
 
+    verified_gate_indices = {
+        key: gate_index
+        for key, line in lines.items()
+        if (gate_index := _verified_gate_index(line)) is not None
+    }
+    observed_by_route: dict[RouteKey, frozenset[int]] = {}
+    if observed_checkpoint_indices is not None:
+        if isinstance(observed_checkpoint_indices, Mapping):
+            observed_by_route = {
+                tuple(key): frozenset(indices)
+                for key, indices in observed_checkpoint_indices.items()
+            }
+        else:
+            observed_by_route = {
+                key: frozenset(observed_checkpoint_indices) for key in lines
+            }
     gate_plan = _plan_gate_associations(
         list(probe_etas),
         list(authoritative_etas),
         set(lines),
+        verified_gate_indices,
+        observed_by_route,
     )
     departed_gate_inputs = gate_plan.departed_gate_inputs
     undeparted_probe_inputs = gate_plan.undeparted_probe_inputs
+
+    def probe_track_identity(row_index: int) -> tuple[str, int] | None:
+        provisional = gate_plan.provisional_gate_tracks.get(row_index)
+        if provisional is not None:
+            return "provisional-gate", provisional
+        passed = gate_plan.passed_track_ids.get(row_index)
+        return ("passed", passed) if passed is not None else None
 
     for key, rows in probe_rows_by_key.items():
         gate_index = gate_plan.verified_gate_index.get(key)
@@ -708,6 +736,7 @@ def audit_marker_positions(
         for row in rows:
             if (
                 row.row_index in undeparted_probe_inputs
+                or row.row_index in gate_plan.provisional_undeparted_inputs
                 or row.row_index in gate_plan.superseded_probe_inputs
             ):
                 excluded_by_key[key].append(row)
@@ -765,13 +794,14 @@ def audit_marker_positions(
             if not row.scheduled:
                 evidence_by_key[key].append(row)
                 continue
-            track_id = gate_plan.passed_track_ids.get(row.row_index)
+            track_id = probe_track_identity(row.row_index)
             corroborated = row.row_index in gate_assigned_rows or any(
                 other.checkpoint != row.checkpoint
                 and (
-                    gate_plan.passed_track_ids.get(other.row_index) == track_id
+                    probe_track_identity(other.row_index) == track_id
                     if track_id is not None
-                    else gate_plan.passed_track_ids.get(other.row_index) is None
+                    else other.row_index not in gate_plan.provisional_gate_tracks
+                    and gate_plan.passed_track_ids.get(other.row_index) is None
                     and abs(other.raw_position - row.raw_position) <= 2.2
                 )
                 for other in effective_rows

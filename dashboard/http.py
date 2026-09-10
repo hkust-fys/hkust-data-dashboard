@@ -44,10 +44,13 @@ RETRY_BASE_DELAY = 0.5
 RETRY_MAX_DELAY = 8.0
 RETRY_ATTEMPTS = 3
 ORIGIN_REQUEST_INTERVAL_SECONDS = 0.06
+# A live GMB ETA burst returned 403 despite staying within 20 starts per 30s.
+# One shared origin clock spaces ETA starts so the 21st cannot start before the
+# first leaves that window. Metadata keeps its faster, separately paced loader
+# so a cold route-geometry refresh can still finish within its provider budget.
+GMB_ETA_REQUEST_INTERVAL_SECONDS = 1.5
 ORIGIN_REQUEST_INTERVAL_OVERRIDES_SECONDS = {
-    # The GMB host returns 403 for short bursts well below our generic pace.
-    # Five starts/second keeps gate, probe, and route-metadata calls on one
-    # shared origin budget.
+    # Keep GMB metadata requests on one shared origin budget.
     "data.etagmb.gov.hk": 0.2,
 }
 
@@ -118,12 +121,14 @@ class HttpClient:
         retry_attempts: int = RETRY_ATTEMPTS,
         origin_request_interval_seconds: float = ORIGIN_REQUEST_INTERVAL_SECONDS,
         origin_request_interval_overrides_seconds: dict[str, float] | None = None,
+        gmb_eta_request_interval_seconds: float = GMB_ETA_REQUEST_INTERVAL_SECONDS,
     ) -> None:
         self.session = session
         self.timeout_seconds = timeout_seconds
         self.cache = cache or TtlCache()
         self.retry_attempts = retry_attempts
         self.origin_request_interval_seconds = max(0.0, origin_request_interval_seconds)
+        self.gmb_eta_request_interval_seconds = max(0.0, gmb_eta_request_interval_seconds)
         self.origin_request_interval_overrides_seconds = dict(
             ORIGIN_REQUEST_INTERVAL_OVERRIDES_SECONDS
         )
@@ -134,15 +139,24 @@ class HttpClient:
         self._origin_locks: dict[str, asyncio.Lock] = {}
         self._origin_next_request: dict[str, float] = {}
 
+    def _origin_interval(self, url: str) -> float:
+        """Return pacing for a URL, with stricter pacing for GMB ETA calls."""
+        parsed = urlsplit(url)
+        origin = parsed.netloc.lower()
+        interval = max(
+            self.origin_request_interval_seconds,
+            self.origin_request_interval_overrides_seconds.get(origin, 0.0),
+        )
+        if origin == "data.etagmb.gov.hk" and parsed.path.startswith("/eta/"):
+            interval = max(interval, self.gmb_eta_request_interval_seconds)
+        return interval
+
     # -- low-level ---------------------------------------------------------
 
     async def _pace_origin(self, url: str) -> None:
         """Space requests to one HTTP origin while leaving other origins free."""
         origin = urlsplit(url).netloc.lower()
-        interval = max(
-            self.origin_request_interval_seconds,
-            self.origin_request_interval_overrides_seconds.get(origin, 0.0),
-        )
+        interval = self._origin_interval(url)
         if not interval:
             return
         lock = self._origin_locks.setdefault(origin, asyncio.Lock())

@@ -1,20 +1,30 @@
 """Estimated bus position tests: ladder-collapsed vehicle reconstruction."""
 
+from collections import Counter
+from copy import copy
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
+from dashboard.maps import positions as positions_module
 from dashboard.maps.marker_audit import audit_marker_positions
 from dashboard.maps.positions import (
     BusEstimate,
     _align_gate_arrivals,
+    _atomic_kmb_frontier_certificate,
+    _eta_guided_priority_indices,
     _passed_row_position,
     _path_segment_length,
     _plan_gate_associations,
     _quantize_position,
     _separate_common_stop_departures,
     estimate_bus_positions,
+    rebuild_estimate_from_probe_fragments,
+    rebuild_estimate_from_probe_sources,
 )
-from dashboard.models import EtaKind
+from dashboard.models import EtaKind, Operator
 from dashboard.providers.route_geometry import RouteLine, Stop
+from dashboard.providers.transit import ProbeEtaSnapshot, ProbeRouteGeneration
 
 
 class Probe:
@@ -31,6 +41,7 @@ class Probe:
         cache_age_seconds=None,
         signed_minutes=None,
         refresh_generation=0,
+        arrival_at=None,
     ):
         self.operator = operator
         self.route = route
@@ -42,6 +53,7 @@ class Probe:
         self.cache_age_seconds = cache_age_seconds
         self.signed_minutes = signed_minutes
         self.refresh_generation = refresh_generation
+        self.arrival_at = arrival_at
 
 
 class AuthoritativeProbe(Probe):
@@ -63,6 +75,1713 @@ def _line(operator="KMB", route="X", bound="outbound", stop_count=6):
     return RouteLine(route, operator, bound, stops, path, offsets)
 
 
+def _atomic_gate_frontier_fixture(frame, *, reverse=False):
+    key = ("KMB", "91", "inbound")
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    if frame == 25:
+        clock = 54.94625
+        gate_minutes = (10, 27)
+        groups = [
+            ((0, 0), (3, 542), (4, 768), (6, 990), (7, 1111), (8, 1230), (16, 1787),
+             (20, 2139), (21, 2201), (22, 2268), (29, 2543), (30, 2561), (31, 2612),
+             (32, 2653), (33, 2757)),
+            ((6, -18), (7, 104), (8, 224), (16, 786), (20, 1139), (21, 1199),
+             (22, 1264), (29, 1527), (30, 1545), (31, 1588), (32, 1629), (33, 1732)),
+            ((20, -29), (21, 30), (22, 98), (29, 373), (30, 391), (31, 441),
+             (32, 482), (33, 586)),
+        ]
+        positions = (0.30413053505535054, 6.597920081967214, 21.36685661764706)
+        brackets = ((0, 3), (6, 7), (21, 22))
+    else:
+        clock = 84.906763
+        gate_minutes = (9, 25)
+        groups = [
+            ((1, 22), (2, 178), (4, 662), (5, 793), (7, 1015), (11, 1285),
+             (16, 1696), (22, 2160), (24, 2251), (25, 2277), (26, 2322),
+             (31, 2484), (32, 2526), (33, 2629)),
+            ((7, 60), (11, 327), (16, 743), (22, 1222), (24, 1312), (25, 1338),
+             (26, 1383), (31, 1546), (32, 1588), (33, 1690)),
+            ((22, -18), (24, 60), (25, 86), (26, 145), (31, 312), (32, 353), (33, 457)),
+        ]
+        positions = (1.4032484807692307, 7.373135026217229, 24.95795242307692)
+        brackets = ((1, 2), (7, 11), (24, 25))
+    probes = []
+    expected_rows = []
+    group_kinds = (
+        (EtaKind.SCHEDULED, EtaKind.REALTIME, EtaKind.REALTIME)
+        if frame == 25
+        else (EtaKind.REALTIME,) * len(groups)
+    )
+    for group, kind in zip(groups, group_kinds, strict=True):
+        owned = []
+        for index, seconds in group:
+            signed = (seconds - clock) / 60
+            row = Probe(*key, index, max(0, signed), kind=kind, signed_minutes=signed,
+                        cache_age_seconds=9.2, refresh_generation=frame,
+                        arrival_at=base + timedelta(seconds=seconds))
+            owned.append(row)
+            probes.append(row)
+        expected_rows.append(owned)
+    # Successful-empty rows remain full snapshot boundary context, while the
+    # 37/33 active source tokens include only live observations and gate roots.
+    for index in (0, 15):
+        if not any(row.index == index for row in probes):
+            probes.append(Probe(*key, index, None, cache_age_seconds=9.2,
+                                refresh_generation=frame))
+    gates = [Probe(*key, 15, minutes) for minutes in gate_minutes]
+    if reverse:
+        probes.reverse()
+        gates.reverse()
+    when = base + timedelta(seconds=clock + 9.2)
+    snapshot = ProbeEtaSnapshot((ProbeRouteGeneration(key, tuple(probes), frame, when),), when)
+    return snapshot, gates, expected_rows, positions, brackets
+
+
+def _kmb_91_sparse_gate_partition_fixture(frame, *, reverse=False):
+    """Exact active rows from live frames 12/16 of the 2026-09-09 audit."""
+    key = ("KMB", "91", "inbound")
+    if frame == 12:
+        revision = 129
+        age = 9.843999999997322
+        gate_specs = (
+            (4.0, EtaKind.REALTIME),
+            (26.0, EtaKind.SCHEDULED),
+            (54.0, EtaKind.SCHEDULED),
+        )
+        row_specs = (
+            (1, 0.0, -0.26748093333333334, EtaKind.SCHEDULED,
+             "2026-09-09T17:47:13+08:00"),
+            (2, 2.3825190666666667, 2.3825190666666667, EtaKind.SCHEDULED,
+             "2026-09-09T17:49:52+08:00"),
+            (3, 6.349185733333333, 6.349185733333333, EtaKind.SCHEDULED,
+             "2026-09-09T17:53:50+08:00"),
+            (4, 10.4658524, 10.4658524, EtaKind.SCHEDULED,
+             "2026-09-09T17:57:57+08:00"),
+            (9, 19.149185733333336, 19.149185733333336, EtaKind.SCHEDULED,
+             "2026-09-09T18:06:38+08:00"),
+            (10, 19.632519066666667, 19.632519066666667, EtaKind.SCHEDULED,
+             "2026-09-09T18:07:07+08:00"),
+            (11, 0.0, -1.1674809333333334, EtaKind.REALTIME,
+             "2026-09-09T17:46:19+08:00"),
+            (11, 20.98251906666667, 20.98251906666667, EtaKind.SCHEDULED,
+             "2026-09-09T18:08:28+08:00"),
+            (12, 0.0, -0.30081426666666666, EtaKind.REALTIME,
+             "2026-09-09T17:47:11+08:00"),
+            (12, 21.83251906666667, 21.83251906666667, EtaKind.SCHEDULED,
+             "2026-09-09T18:09:19+08:00"),
+            (13, 1.2991857333333334, 1.2991857333333334, EtaKind.REALTIME,
+             "2026-09-09T17:48:47+08:00"),
+            (13, 23.432519066666668, 23.432519066666668, EtaKind.SCHEDULED,
+             "2026-09-09T18:10:55+08:00"),
+            (16, 5.4658524, 5.4658524, EtaKind.REALTIME,
+             "2026-09-09T17:52:57+08:00"),
+            (16, 27.58251906666667, 27.58251906666667, EtaKind.SCHEDULED,
+             "2026-09-09T18:15:04+08:00"),
+            (31, 0.0, -0.9341476, EtaKind.REALTIME,
+             "2026-09-09T17:46:33+08:00"),
+            (31, 20.58251906666667, 20.58251906666667, EtaKind.REALTIME,
+             "2026-09-09T18:08:04+08:00"),
+            (31, 42.23251906666667, 42.23251906666667, EtaKind.SCHEDULED,
+             "2026-09-09T18:29:43+08:00"),
+            (32, 0.0, -0.2508142666666667, EtaKind.REALTIME,
+             "2026-09-09T17:47:14+08:00"),
+            (32, 21.265852400000004, 21.265852400000004, EtaKind.REALTIME,
+             "2026-09-09T18:08:45+08:00"),
+            (32, 42.89918573333333, 42.89918573333333, EtaKind.SCHEDULED,
+             "2026-09-09T18:30:23+08:00"),
+            (33, 1.3325190666666666, 1.3325190666666666, EtaKind.REALTIME,
+             "2026-09-09T17:48:49+08:00"),
+            (33, 22.8158524, 22.8158524, EtaKind.REALTIME,
+             "2026-09-09T18:10:18+08:00"),
+            (33, 44.48251906666667, 44.48251906666667, EtaKind.SCHEDULED,
+             "2026-09-09T18:31:58+08:00"),
+        )
+        expected = (1.1009362012578616, 12.188008916666666, 32.15840901052631)
+    elif frame == 16:
+        revision = 177
+        age = 9.26600000000326
+        gate_specs = (
+            (3.0, EtaKind.REALTIME),
+            (25.0, EtaKind.REALTIME),
+            (53.0, EtaKind.SCHEDULED),
+        )
+        row_specs = (
+            (1, 0.0, -0.9338833833333333, EtaKind.REALTIME,
+             "2026-09-09T17:47:13+08:00"),
+            (2, 1.7161166166666668, 1.7161166166666668, EtaKind.REALTIME,
+             "2026-09-09T17:49:52+08:00"),
+            (11, 20.316116616666665, 20.316116616666665, EtaKind.REALTIME,
+             "2026-09-09T18:08:28+08:00"),
+            (12, 0.0, -0.95055005, EtaKind.REALTIME,
+             "2026-09-09T17:47:12+08:00"),
+            (12, 21.166116616666667, 21.166116616666667, EtaKind.REALTIME,
+             "2026-09-09T18:09:19+08:00"),
+            (13, 0.6327832833333333, 0.6327832833333333, EtaKind.REALTIME,
+             "2026-09-09T17:48:47+08:00"),
+            (13, 22.766116616666668, 22.766116616666668, EtaKind.REALTIME,
+             "2026-09-09T18:10:55+08:00"),
+            (16, 4.79944995, 4.79944995, EtaKind.REALTIME,
+             "2026-09-09T17:52:57+08:00"),
+            (16, 26.916116616666667, 26.916116616666667, EtaKind.REALTIME,
+             "2026-09-09T18:15:04+08:00"),
+            (31, 19.832783283333335, 19.832783283333335, EtaKind.REALTIME,
+             "2026-09-09T18:07:59+08:00"),
+            (31, 41.56611661666667, 41.56611661666667, EtaKind.REALTIME,
+             "2026-09-09T18:29:43+08:00"),
+            (32, 0.0, -1.0838833833333332, EtaKind.REALTIME,
+             "2026-09-09T17:47:04+08:00"),
+            (32, 20.516116616666668, 20.516116616666668, EtaKind.REALTIME,
+             "2026-09-09T18:08:40+08:00"),
+            (32, 42.23278328333333, 42.23278328333333, EtaKind.REALTIME,
+             "2026-09-09T18:30:23+08:00"),
+            (33, 0.49944995, 0.49944995, EtaKind.REALTIME,
+             "2026-09-09T17:48:39+08:00"),
+            (33, 22.066116616666665, 22.066116616666665, EtaKind.REALTIME,
+             "2026-09-09T18:10:13+08:00"),
+            (33, 43.81611661666667, 43.81611661666667, EtaKind.REALTIME,
+             "2026-09-09T18:31:58+08:00"),
+        )
+        expected = (1.352408823899371, 12.6003474, 32.68455792631579)
+    else:
+        raise AssertionError(frame)
+    probes = [
+        Probe(
+            *key,
+            index,
+            minutes,
+            kind=kind,
+            cache_age_seconds=age,
+            signed_minutes=signed,
+            refresh_generation=revision,
+            arrival_at=datetime.fromisoformat(arrival),
+        )
+        for index, minutes, signed, kind, arrival in row_specs
+    ]
+    gates = [
+        AuthoritativeProbe(*key, 15, minutes, kind)
+        for minutes, kind in gate_specs
+    ]
+    if reverse:
+        probes.reverse()
+        gates.reverse()
+    return probes, gates, expected
+
+
+@pytest.mark.parametrize("frame", [12, 16])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_sparse_atomic_kmb_gate_partition_does_not_duplicate_one_bus(frame, reverse):
+    probes, gates, expected = _kmb_91_sparse_gate_partition_fixture(
+        frame, reverse=reverse,
+    )
+    estimates = estimate_bus_positions(
+        probes,
+        [_line("KMB", "91", "inbound", stop_count=34)],
+        authoritative_etas=gates,
+        observed_checkpoint_indices={("KMB", "91", "inbound"): range(34)},
+    )
+
+    assert [estimate.position for estimate in estimates] == pytest.approx(expected)
+    probe_sources = [
+        source
+        for estimate in estimates
+        for source in estimate.source_observations
+        if source[0] == "probe"
+    ]
+    assert Counter(probe_sources) == Counter(
+        ("probe", index) for index in range(len(probes))
+    )
+    assert len(estimates) == 3
+    upstream, middle, front = estimates
+    revision = {12: 129, 16: 177}[frame]
+    assert (16, datetime.fromisoformat("2026-09-09T18:15:04+08:00").timestamp(), revision) \
+        in upstream.checkpoint_evidence
+    assert (31, datetime.fromisoformat("2026-09-09T18:29:43+08:00").timestamp(), revision) \
+        in upstream.checkpoint_evidence
+    assert (16, datetime.fromisoformat("2026-09-09T17:52:57+08:00").timestamp(), revision) \
+        in middle.checkpoint_evidence
+    middle_tail = "2026-09-09T18:08:04+08:00" if frame == 12 \
+        else "2026-09-09T18:07:59+08:00"
+    assert (31, datetime.fromisoformat(middle_tail).timestamp(), revision) \
+        in middle.checkpoint_evidence
+    front_stop = 31 if frame == 12 else 32
+    front_arrival = "2026-09-09T17:46:33+08:00" if frame == 12 \
+        else "2026-09-09T17:47:04+08:00"
+    assert (
+        front_stop,
+        datetime.fromisoformat(front_arrival).timestamp(),
+        revision,
+    ) in front.checkpoint_evidence
+
+    def gate_minutes(estimate):
+        return {
+            gates[source[1]].minutes
+            for source in estimate.source_observations
+            if source[0] == "gate"
+        }
+
+    assert gate_minutes(middle) == {min(gate.minutes for gate in gates)}
+    assert gate_minutes(upstream) == {sorted(gate.minutes for gate in gates)[1]}
+    assert gate_minutes(front) == set()
+
+
+def _live_frame_atomic_root_arguments(frame=12, *, reverse=False):
+    probes, gates, _expected = _kmb_91_sparse_gate_partition_fixture(
+        frame, reverse=reverse,
+    )
+    checkpoint = 31
+    return (
+        ("KMB", "91", "inbound"),
+        list(enumerate(gates)),
+        [(index, row) for index, row in enumerate(probes) if row.index == checkpoint],
+        list(enumerate(probes)),
+        15,
+        checkpoint,
+    )
+
+
+def test_atomic_fresh_root_alignment_is_unique_same_class_rank_shift():
+    key, gates, current, route_rows, gate_index, checkpoint = \
+        _live_frame_atomic_root_arguments()
+
+    pairs = positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        current,
+        route_rows,
+        gate_index=gate_index,
+        checkpoint=checkpoint,
+    )
+
+    rows = dict(current)
+    gate_by_source = dict(gates)
+    assert [rows[probe].arrival_at.isoformat() for probe, _gate in pairs] == [
+        "2026-09-09T18:08:04+08:00",
+        "2026-09-09T18:29:43+08:00",
+    ]
+    assert [gate_by_source[gate].minutes for _probe, gate in pairs] == [4.0, 26.0]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "cross_class",
+        "beyond_grace",
+        "mixed_revision",
+        "stale",
+        "tie",
+        "source_alias",
+        "route",
+    ],
+)
+def test_atomic_fresh_root_alignment_fails_closed(invalid):
+    key, gates, current, route_rows, gate_index, checkpoint = \
+        _live_frame_atomic_root_arguments()
+    rows = dict(current)
+    middle_source = next(
+        source
+        for source, row in current
+        if row.arrival_at.isoformat() == "2026-09-09T18:08:04+08:00"
+    )
+    if invalid == "cross_class":
+        rows[middle_source].kind = EtaKind.SCHEDULED
+    elif invalid == "beyond_grace":
+        rows[middle_source].minutes = 19.74
+        rows[middle_source].signed_minutes = 19.74
+    elif invalid == "mixed_revision":
+        rows[middle_source].refresh_generation += 1
+    elif invalid == "stale":
+        rows[middle_source].cache_age_seconds = 60.0
+    elif invalid == "tie":
+        final = max(current, key=lambda item: item[1].minutes)[1]
+        rows[middle_source].minutes = final.minutes
+        rows[middle_source].signed_minutes = final.signed_minutes
+    elif invalid == "source_alias":
+        current = [
+            (source, copy(row) if source == middle_source else row)
+            for source, row in current
+        ]
+    elif invalid == "route":
+        key = ("KMB", "91M", "inbound")
+
+    assert positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        current,
+        route_rows,
+        gate_index=gate_index,
+        checkpoint=checkpoint,
+    ) == []
+
+
+def test_atomic_fresh_root_alignment_rejects_equal_cross_class_competitor():
+    key = ("KMB", "91", "inbound")
+    base = datetime(2026, 9, 9, 18, 0, tzinfo=UTC)
+    gates = [
+        (0, AuthoritativeProbe(*key, 15, 4.0, EtaKind.REALTIME)),
+        (1, AuthoritativeProbe(*key, 15, 26.0, EtaKind.SCHEDULED)),
+    ]
+    specs = (
+        (21.1, EtaKind.SCHEDULED),
+        (22.0, EtaKind.REALTIME),
+        (42.2, EtaKind.SCHEDULED),
+    )
+    current = [
+        (
+            source,
+            Probe(
+                *key,
+                31,
+                minutes,
+                kind=kind,
+                cache_age_seconds=1.0,
+                signed_minutes=minutes,
+                refresh_generation=1,
+                arrival_at=base + timedelta(minutes=minutes),
+            ),
+        )
+        for source, (minutes, kind) in enumerate(specs)
+    ]
+
+    assert positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        current,
+        current,
+        gate_index=15,
+        checkpoint=31,
+        prior_gate_assignments={},
+    ) == []
+
+    plan = _plan_gate_associations(
+        [row for _source, row in current],
+        [row for _source, row in gates],
+        {key},
+    )
+    assert plan.gate_assignment == {0: 0}
+
+
+def test_atomic_fresh_root_alignment_rejects_backwards_prior_root_chronology():
+    key, gates, current, route_rows, gate_index, checkpoint = \
+        _live_frame_atomic_root_arguments()
+    stop_16_source, stop_16 = next(
+        (source, row)
+        for source, row in route_rows
+        if row.index == 16 and row.kind is EtaKind.REALTIME
+    )
+    stop_31_source = next(
+        source
+        for source, row in current
+        if row.arrival_at.isoformat() == "2026-09-09T18:08:04+08:00"
+    )
+    stop_16.minutes = 21.0
+    stop_16.signed_minutes = 21.0
+    stop_16.arrival_at = datetime.fromisoformat(
+        "2026-09-09T18:08:29.048856+08:00"
+    )
+
+    assert positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        current,
+        route_rows,
+        gate_index=gate_index,
+        checkpoint=checkpoint,
+        prior_gate_assignments={stop_16_source: 0},
+    ) == []
+
+    probes = [row for _source, row in route_rows]
+    authoritative = [row for _source, row in gates]
+    plan = _plan_gate_associations(probes, authoritative, {key})
+    assert plan.gate_assignment.get(stop_31_source) != 0
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_atomic_fresh_root_alignment_does_not_steal_owned_future_gate(reverse):
+    key, gates, current, route_rows, gate_index, checkpoint = \
+        _live_frame_atomic_root_arguments(frame=16, reverse=reverse)
+    future_source, future_gate = max(gates, key=lambda item: item[1].minutes)
+    future_gate.minutes = 26.0
+    future_gate.kind = EtaKind.REALTIME
+    gate_25_source = next(
+        source for source, gate in gates if gate.minutes == 25.0
+    )
+    tail_source = max(current, key=lambda item: item[1].minutes)[0]
+    probes = [row for _source, row in route_rows]
+    authoritative = [row for _source, row in gates]
+
+    plan = _plan_gate_associations(probes, authoritative, {key})
+    assert any(
+        gate == future_source and probes[source].index < checkpoint
+        for source, gate in plan.gate_assignment.items()
+    )
+    assert plan.gate_assignment.get(tail_source) != gate_25_source
+
+    prior = {
+        source: gate
+        for source, gate in plan.gate_assignment.items()
+        if probes[source].index < checkpoint
+    }
+    assert positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        current,
+        route_rows,
+        gate_index=gate_index,
+        checkpoint=checkpoint,
+        prior_gate_assignments=prior,
+    ) == []
+
+
+def test_atomic_fresh_root_alignment_ignores_wholly_unrelated_prior_assignment():
+    key, gates, current, route_rows, gate_index, checkpoint = \
+        _live_frame_atomic_root_arguments()
+    expected = positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        current,
+        route_rows,
+        gate_index=gate_index,
+        checkpoint=checkpoint,
+        prior_gate_assignments={},
+    )
+
+    assert expected
+    assert positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        current,
+        route_rows,
+        gate_index=gate_index,
+        checkpoint=checkpoint,
+        prior_gate_assignments={10_000: 20_000},
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "prior_factory",
+    [
+        lambda probe, _gate: {probe: 20_000},
+        lambda _probe, gate: {10_000: gate},
+        lambda _probe, gate: {True: gate},
+        lambda _probe, _gate: {10_000: False},
+        lambda probe, gate: {probe: gate},
+    ],
+)
+def test_atomic_fresh_root_alignment_rejects_invalid_prior_assignment_scope(
+    prior_factory,
+):
+    key, gates, current, route_rows, gate_index, checkpoint = \
+        _live_frame_atomic_root_arguments()
+    probe_source = current[0][0]
+    gate_source = gates[0][0]
+
+    assert positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        current,
+        route_rows,
+        gate_index=gate_index,
+        checkpoint=checkpoint,
+        prior_gate_assignments=prior_factory(probe_source, gate_source),
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "probe_kind",
+        "gate_kind",
+        "probe_bool_index",
+        "probe_float_index",
+        "gate_bool_index",
+        "gate_float_index",
+    ],
+)
+def test_atomic_fresh_root_alignment_rejects_malformed_rows_without_raising(invalid):
+    key, gates, current, route_rows, gate_index, checkpoint = \
+        _live_frame_atomic_root_arguments()
+    target_source, target = sorted(current, key=lambda item: item[1].minutes)[1]
+    if invalid == "probe_kind":
+        target.kind = []
+    elif invalid == "gate_kind":
+        gates[0][1].kind = {}
+    elif invalid == "probe_bool_index":
+        target.index = True
+    elif invalid == "probe_float_index":
+        target.index = float(checkpoint)
+    elif invalid == "gate_bool_index":
+        gates[0][1].index = True
+    else:
+        gates[0][1].index = float(gate_index)
+
+    assert positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        current,
+        route_rows,
+        gate_index=gate_index,
+        checkpoint=checkpoint,
+        prior_gate_assignments={},
+    ) == []
+
+    probes = [row for _source, row in route_rows]
+    authoritative = [row for _source, row in gates]
+    plan = _plan_gate_associations(probes, authoritative, {key})
+    assert plan.gate_assignment.get(target_source) != 0
+    assert isinstance(
+        estimate_bus_positions(
+            probes,
+            [_line(*key, stop_count=34)],
+            authoritative_etas=authoritative,
+            observed_checkpoint_indices={key: range(34)},
+        ),
+        list,
+    )
+
+
+def _leading_due_handoff_arguments(*, reverse=False):
+    key, gates, frontier, route_rows, gate_index, previous_checkpoint = \
+        _live_frame_atomic_root_arguments(frame=16, reverse=reverse)
+    probes = dict(route_rows)
+    current = [
+        (source, row)
+        for source, row in route_rows
+        if row.index == previous_checkpoint + 1
+    ]
+    fresh_pairs = positions_module._atomic_kmb_fresh_root_pairs(
+        key,
+        gates,
+        frontier,
+        route_rows,
+        gate_index=gate_index,
+        checkpoint=previous_checkpoint,
+    )
+    pairs = _align_gate_arrivals(
+        frontier,
+        current,
+        gate_index=previous_checkpoint,
+        checkpoint=previous_checkpoint + 1,
+    )
+    return key, frontier, current, {
+        "previous_rows": list(frontier),
+        "gate_index": gate_index,
+        "previous_checkpoint": previous_checkpoint,
+        "checkpoint": previous_checkpoint + 1,
+        "gate_assignments": {source: gate for source, gate in fresh_pairs},
+        "gate_rows": dict(gates),
+        "passed_rows": set(),
+        "pairs": pairs,
+        "carried": True,
+        "all_rows": probes,
+    }
+
+
+def test_atomic_frontier_carries_across_one_leading_due_vehicle():
+    key, frontier, current, args = _leading_due_handoff_arguments()
+    assert _atomic_kmb_frontier_certificate(key, frontier, current, **{
+        name: value for name, value in args.items() if name != "all_rows"
+    })
+
+
+@pytest.mark.parametrize("invalid", ["future", "scheduled", "two_leading", "root"])
+def test_atomic_frontier_leading_due_handoff_fails_closed(invalid):
+    key, frontier, current, args = _leading_due_handoff_arguments()
+    leading_source, leading = min(current, key=lambda item: item[1].minutes)
+    if invalid == "future":
+        leading.minutes = 0.1
+        leading.signed_minutes = 0.1
+    elif invalid == "scheduled":
+        leading.kind = EtaKind.SCHEDULED
+    elif invalid == "two_leading":
+        duplicate = copy(leading)
+        duplicate.arrival_at -= timedelta(seconds=1)
+        current.append((max(args["all_rows"]) + 1, duplicate))
+    elif invalid == "root":
+        args["gate_assignments"].pop(next(iter(args["gate_assignments"])))
+
+    assert not _atomic_kmb_frontier_certificate(key, frontier, current, **{
+        name: value for name, value in args.items() if name != "all_rows"
+    })
+
+
+def test_atomic_frontier_rejects_compatible_unrepresented_gate_suffix():
+    key, frontier, current, args = _leading_due_handoff_arguments()
+    future_gate = args["gate_rows"][max(args["gate_rows"])]
+    future_gate.kind = EtaKind.REALTIME
+    future_gate.minutes = 25.5
+    _source, final = max(current, key=lambda item: item[1].minutes)
+    final.minutes = 43.5
+    final.signed_minutes = 43.5
+
+    assert not _atomic_kmb_frontier_certificate(key, frontier, current, **{
+        name: value for name, value in args.items() if name != "all_rows"
+    })
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_atomic_frontier_keeps_excluding_future_gate_after_leading_handoff(reverse):
+    key, frontier, stop_32, args = _leading_due_handoff_arguments(reverse=reverse)
+    future_gate = args["gate_rows"][max(
+        args["gate_rows"], key=lambda source: args["gate_rows"][source].minutes,
+    )]
+    future_gate.kind = EtaKind.REALTIME
+    future_gate.minutes = 26.0
+    first_args = {
+        name: value for name, value in args.items() if name != "all_rows"
+    }
+    assert _atomic_kmb_frontier_certificate(
+        key, frontier, stop_32, **first_args,
+    )
+
+    route_rows = args["all_rows"]
+    stop_33 = [
+        (source, row) for source, row in route_rows.items() if row.index == 33
+    ]
+    _tail_source, tail = max(stop_33, key=lambda item: item[1].minutes)
+    shift = 46.0 - tail.minutes
+    tail.minutes = 46.0
+    tail.signed_minutes = 46.0
+    tail.arrival_at += timedelta(minutes=shift)
+    stop_32_gate_assignments = {
+        current_source: args["gate_assignments"][previous_source]
+        for current_source, previous_source in args["pairs"]
+    }
+    leading_source = min(stop_32, key=lambda item: item[1].minutes)[0]
+    pairs = _align_gate_arrivals(
+        stop_32,
+        stop_33,
+        gate_index=32,
+        checkpoint=33,
+    )
+
+    assert not _atomic_kmb_frontier_certificate(
+        key,
+        stop_32,
+        stop_33,
+        previous_rows=stop_32,
+        gate_index=15,
+        previous_checkpoint=32,
+        checkpoint=33,
+        gate_assignments=stop_32_gate_assignments,
+        gate_rows=args["gate_rows"],
+        passed_rows={leading_source},
+        pairs=pairs,
+        carried=True,
+    )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_gate_plan_keeps_excluding_future_gate_after_leading_handoff(reverse):
+    probes, gates, _expected = _kmb_91_sparse_gate_partition_fixture(
+        16, reverse=reverse,
+    )
+    key = ("KMB", "91", "inbound")
+    probes = [row for row in probes if row.index >= 31]
+    future_gate = max(gates, key=lambda row: row.minutes)
+    future_gate.kind = EtaKind.REALTIME
+
+    stop_32_tail = max(
+        (row for row in probes if row.index == 32), key=lambda row: row.minutes,
+    )
+    stop_32_shift = 58.0 - stop_32_tail.minutes
+    stop_32_tail.minutes = 58.0
+    stop_32_tail.signed_minutes = 58.0
+    stop_32_tail.arrival_at += timedelta(minutes=stop_32_shift)
+    stop_33_tail = max(
+        (row for row in probes if row.index == 33), key=lambda row: row.minutes,
+    )
+    stop_33_shift = 74.0 - stop_33_tail.minutes
+    stop_33_tail.minutes = 74.0
+    stop_33_tail.signed_minutes = 74.0
+    stop_33_tail.arrival_at += timedelta(minutes=stop_33_shift)
+
+    plan = _plan_gate_associations(probes, gates, {key})
+    gate_3_source = next(
+        source for source, gate in enumerate(gates) if gate.minutes == 3.0
+    )
+    gate_25_source = next(
+        source for source, gate in enumerate(gates) if gate.minutes == 25.0
+    )
+    stop_31 = sorted(
+        (pair for pair in enumerate(probes) if pair[1].index == 31),
+        key=lambda item: item[1].minutes,
+    )
+    stop_32 = sorted(
+        (pair for pair in enumerate(probes) if pair[1].index == 32),
+        key=lambda item: item[1].minutes,
+    )
+    stop_33 = sorted(
+        (pair for pair in enumerate(probes) if pair[1].index == 33),
+        key=lambda item: item[1].minutes,
+    )
+
+    assert plan.gate_assignment[stop_31[0][0]] == gate_3_source
+    assert plan.gate_assignment[stop_31[1][0]] == gate_25_source
+    assert plan.gate_assignment[stop_32[1][0]] == gate_3_source
+    assert plan.gate_assignment[stop_32[2][0]] == gate_25_source
+    assert plan.gate_assignment.get(stop_33[1][0]) != gate_3_source
+
+
+@pytest.mark.parametrize("frame", [25, 40])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_atomic_kmb_gate_frontier_preserves_three_full_snapshot_journeys(frame, reverse):
+    snapshot, gates, expected_rows, positions, brackets = _atomic_gate_frontier_fixture(
+        frame, reverse=reverse,
+    )
+    key = ("KMB", "91", "inbound")
+    probes = list(snapshot.rows)
+    route_line = _line(*key, stop_count=34)
+    plan = _plan_gate_associations(probes, gates, {key})
+    result = estimate_bus_positions(
+        probes, [route_line], authoritative_etas=gates,
+        observed_checkpoint_indices={key: {row.index for row in probes}},
+    )
+    assert len(result) == 3
+    assert [marker.position for marker in result] == pytest.approx(positions)
+    source_multiset = Counter(source for marker in result for source in marker.source_observations)
+    expected_sources = Counter({("probe", index): 1 for index, row in enumerate(probes)
+                                if row.minutes is not None})
+    expected_sources.update(("gate", index) for index in range(len(gates)))
+    assert source_multiset == expected_sources
+    assert sum(source_multiset.values()) == (37 if frame == 25 else 33)
+    for number, (owned_rows, marker, position, bracket) in enumerate(zip(
+        expected_rows, result, positions, brackets, strict=True,
+    )):
+        slots = {index for index, row in enumerate(probes) if any(row is owned for owned in owned_rows)}
+        expected = {("probe", index) for index in slots}
+        if number < 2:
+            root = max(range(2), key=lambda index: gates[index].minutes) if number == 0 else min(
+                range(2), key=lambda index: gates[index].minutes,
+            )
+            expected.add(("gate", root))
+            assert all(plan.gate_assignment[index] == root for index in slots)
+            assert not slots & plan.passed_probe_rows
+        else:
+            assert slots <= plan.passed_probe_rows
+            assert not slots & plan.gate_assignment.keys()
+        assert marker.source_observations == expected
+        assert marker.bracket == bracket
+        assert marker.lat == pytest.approx(22.333360)
+        assert marker.lon == pytest.approx(114.260 + position * 0.001)
+        assert marker.position < 30
+
+
+def _frontier_certificate_arguments():
+    snapshot, gates, _owned, _positions, _brackets = _atomic_gate_frontier_fixture(25)
+    probes = list(snapshot.rows)
+    key = ("KMB", "91", "inbound")
+    plan = _plan_gate_associations(probes, gates, {key})
+    frontier = [(index, row) for index, row in enumerate(probes) if row.index == 30]
+    current = [(index, row) for index, row in enumerate(probes) if row.index == 31]
+    pairs = _align_gate_arrivals(frontier, current, gate_index=30, checkpoint=31)
+    return key, frontier, current, dict(
+        previous_rows=list(frontier), gate_index=15,
+        previous_checkpoint=30, checkpoint=31,
+        gate_assignments=dict(plan.gate_assignment), gate_rows=dict(enumerate(gates)),
+        passed_rows=set(plan.passed_probe_rows), pairs=pairs,
+    )
+
+
+def _fixed_three_eta_horizon_slide_fixture(*, reverse=False, repeated_slide=False):
+    """Atomic KMB response where a passed bus displaces the third gate root."""
+    key = ("KMB", "91", "inbound")
+    base = datetime(2026, 9, 10, 3, 43, 43, tzinfo=UTC)
+    revision = 972
+    rows_by_stop = {
+        16: (
+            (17.946430, EtaKind.REALTIME),
+            (25.746430, EtaKind.SCHEDULED),
+            (46.363097, EtaKind.SCHEDULED),
+        ),
+        21: (
+            (-0.570237, EtaKind.REALTIME),
+            (24.746430, EtaKind.REALTIME),
+            (32.496430, EtaKind.SCHEDULED),
+        ),
+        22: (
+            (0.529763, EtaKind.REALTIME),
+            (25.863097, EtaKind.REALTIME),
+            (33.596430, EtaKind.SCHEDULED),
+        ),
+        24: (
+            (1.946430, EtaKind.REALTIME),
+            (27.196430, EtaKind.REALTIME),
+            (35.013097, EtaKind.SCHEDULED),
+        ),
+        29: (
+            (4.663097, EtaKind.REALTIME),
+            (29.863097, EtaKind.REALTIME),
+            (37.746430, EtaKind.SCHEDULED),
+        ),
+        30: (
+            (4.979763, EtaKind.REALTIME),
+            (30.179763, EtaKind.REALTIME),
+            (38.063097, EtaKind.SCHEDULED),
+        ),
+        31: (
+            (5.646430, EtaKind.REALTIME),
+            (30.813097, EtaKind.REALTIME),
+            (38.729763, EtaKind.SCHEDULED),
+        ),
+        33: (
+            (8.079763, EtaKind.REALTIME),
+            (33.213097, EtaKind.REALTIME),
+            (41.179763, EtaKind.SCHEDULED),
+        ),
+    }
+    if repeated_slide:
+        # A second passed bus enters the next-three window at checkpoint 30,
+        # displacing the remaining trailing root. The following checkpoints
+        # preserve all three ranks: two passed buses plus the final gate root.
+        for checkpoint, leading in ((30, -0.3), (31, 0.366), (33, 2.8)):
+            rows_by_stop[checkpoint] = (
+                (leading, EtaKind.REALTIME),
+                *rows_by_stop[checkpoint][:-1],
+            )
+    probes = [
+        Probe(
+            *key,
+            index,
+            max(0.0, signed),
+            kind=kind,
+            cache_age_seconds=19.0,
+            signed_minutes=signed,
+            refresh_generation=revision,
+            arrival_at=base + timedelta(minutes=signed),
+        )
+        for index, rows in rows_by_stop.items()
+        for signed, kind in rows
+    ]
+    gates = [
+        AuthoritativeProbe(*key, 15, minutes, kind=kind)
+        for minutes, kind in (
+            (16.0, EtaKind.REALTIME),
+            (24.0, EtaKind.SCHEDULED),
+            (45.0, EtaKind.SCHEDULED),
+        )
+    ]
+    if reverse:
+        probes.reverse()
+        gates.reverse()
+    return key, probes, gates, rows_by_stop
+
+
+def _fixed_three_eta_horizon_slide_certificate_arguments(*, reverse=False):
+    key, probes, gates, _rows_by_stop = _fixed_three_eta_horizon_slide_fixture(
+        reverse=reverse,
+    )
+    frontier = [
+        (index, row) for index, row in enumerate(probes) if row.index == 16
+    ]
+    current = [
+        (index, row) for index, row in enumerate(probes) if row.index == 21
+    ]
+    ordered_frontier = sorted(frontier, key=lambda item: item[1].minutes)
+    ordered_gates = sorted(enumerate(gates), key=lambda item: item[1].minutes)
+    gate_assignments = {
+        probe_source: gate_source
+        for (probe_source, _probe), (gate_source, _gate) in zip(
+            ordered_frontier,
+            ordered_gates,
+            strict=True,
+        )
+    }
+    return key, frontier, current, {
+        "previous_rows": list(frontier),
+        "gate_index": 15,
+        "previous_checkpoint": 16,
+        "checkpoint": 21,
+        "gate_assignments": gate_assignments,
+        "gate_rows": dict(enumerate(gates)),
+        "passed_rows": set(),
+        "pairs": _align_gate_arrivals(
+            frontier,
+            current,
+            gate_index=16,
+            checkpoint=21,
+        ),
+        "carried": False,
+    }
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_atomic_kmb_certificate_accepts_fixed_three_eta_horizon_slide(reverse):
+    key, frontier, current, arguments = \
+        _fixed_three_eta_horizon_slide_certificate_arguments(reverse=reverse)
+
+    assert _atomic_kmb_frontier_certificate(
+        key,
+        frontier,
+        current,
+        **arguments,
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["future_leader", "scheduled_leader", "mixed_revision", "dropped_root", "future_gate"],
+)
+def test_atomic_kmb_fixed_three_eta_horizon_slide_fails_closed(invalid):
+    key, frontier, current, arguments = \
+        _fixed_three_eta_horizon_slide_certificate_arguments()
+    leading_source, leading = min(current, key=lambda item: item[1].minutes)
+    if invalid == "future_leader":
+        leading.minutes = 0.1
+        leading.signed_minutes = 0.1
+    elif invalid == "scheduled_leader":
+        leading.kind = EtaKind.SCHEDULED
+    elif invalid == "mixed_revision":
+        leading.refresh_generation += 1
+    elif invalid == "dropped_root":
+        dropped_source, _row = max(frontier, key=lambda item: item[1].minutes)
+        arguments["gate_assignments"].pop(dropped_source)
+    else:
+        dropped_source, _row = max(frontier, key=lambda item: item[1].minutes)
+        dropped_gate = arguments["gate_assignments"][dropped_source]
+        arguments["gate_rows"][dropped_gate].minutes = 25.0
+
+    assert not _atomic_kmb_frontier_certificate(
+        key,
+        frontier,
+        current,
+        **arguments,
+    )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_atomic_kmb_fixed_three_eta_horizon_does_not_split_fast_journey(reverse):
+    key, probes, gates, rows_by_stop = _fixed_three_eta_horizon_slide_fixture(
+        reverse=reverse,
+    )
+    line = _line(*key, stop_count=34)
+    plan = _plan_gate_associations(probes, gates, {key})
+    estimates = estimate_bus_positions(
+        probes,
+        [line],
+        authoritative_etas=gates,
+        observed_checkpoint_indices={key: rows_by_stop},
+    )
+
+    gate_by_minutes = {gate.minutes: index for index, gate in enumerate(gates)}
+    gate_zero = gate_by_minutes[16.0]
+    gate_one = gate_by_minutes[24.0]
+    rows_at = {
+        checkpoint: sorted(
+            (
+                (index, row)
+                for index, row in enumerate(probes)
+                if row.index == checkpoint
+            ),
+            key=lambda item: item[1].minutes,
+        )
+        for checkpoint in rows_by_stop
+    }
+    assert rows_at[21][0][0] in plan.passed_probe_rows
+    for checkpoint in (21, 22, 24, 29, 30, 31, 33):
+        assert plan.gate_assignment[rows_at[checkpoint][1][0]] == gate_zero
+        assert plan.gate_assignment[rows_at[checkpoint][2][0]] == gate_one
+
+    assert len(estimates) == 3
+    gate_zero_marker = next(
+        marker
+        for marker in estimates
+        if ("gate", gate_zero) in marker.source_observations
+    )
+    gate_zero_evidence = {
+        (checkpoint, round(arrival, 6), revision)
+        for checkpoint, arrival, revision in gate_zero_marker.checkpoint_evidence
+    }
+    for checkpoint, rank in ((31, 1), (33, 1)):
+        expected = rows_at[checkpoint][rank][1]
+        assert (
+            checkpoint,
+            round(expected.arrival_at.timestamp(), 6),
+            expected.refresh_generation,
+        ) in gate_zero_evidence
+    assert not any(
+        {checkpoint for checkpoint, _arrival, _revision in marker.checkpoint_evidence}
+        <= {31, 33}
+        for marker in estimates
+    )
+    audit = audit_marker_positions(probes, gates, estimates, [line])
+    assert audit["ok"], audit["issues"]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("carried, expected", [(True, True), (False, False)])
+def test_atomic_kmb_one_root_frontier_requires_prior_certificate(
+    reverse,
+    carried,
+    expected,
+):
+    key, probes, gates, _rows_by_stop = _fixed_three_eta_horizon_slide_fixture(
+        reverse=reverse,
+        repeated_slide=True,
+    )
+    frontier = [
+        (index, row) for index, row in enumerate(probes) if row.index == 30
+    ]
+    current = [
+        (index, row) for index, row in enumerate(probes) if row.index == 31
+    ]
+    ordered_frontier = sorted(frontier, key=lambda item: item[1].minutes)
+    gate_zero = next(
+        index for index, gate in enumerate(gates) if gate.minutes == 16.0
+    )
+
+    certificate = _atomic_kmb_frontier_certificate(
+        key,
+        frontier,
+        current,
+        previous_rows=list(frontier),
+        gate_index=15,
+        previous_checkpoint=30,
+        checkpoint=31,
+        gate_assignments={ordered_frontier[-1][0]: gate_zero},
+        gate_rows=dict(enumerate(gates)),
+        passed_rows={source for source, _row in ordered_frontier[:-1]},
+        pairs=_align_gate_arrivals(
+            frontier,
+            current,
+            gate_index=30,
+            checkpoint=31,
+        ),
+        carried=carried,
+    )
+
+    assert certificate is expected
+
+
+@pytest.mark.parametrize("invalid_dropped_root", ["owned", "skipped", "missing"])
+def test_atomic_kmb_repeated_slide_still_validates_dropped_root(
+    invalid_dropped_root,
+):
+    key, probes, gates, _rows_by_stop = _fixed_three_eta_horizon_slide_fixture(
+        repeated_slide=True,
+    )
+    frontier = [
+        (index, row) for index, row in enumerate(probes) if row.index == 29
+    ]
+    current = [
+        (index, row) for index, row in enumerate(probes) if row.index == 30
+    ]
+    ordered_frontier = sorted(frontier, key=lambda item: item[1].minutes)
+    ordered_gates = sorted(enumerate(gates), key=lambda item: item[1].minutes)
+    passed_source = ordered_frontier[0][0]
+    retained_source = ordered_frontier[1][0]
+    dropped_source = ordered_frontier[2][0]
+    retained_root = ordered_gates[0][0]
+    invalid_root = {
+        "owned": retained_root,
+        "skipped": ordered_gates[2][0],
+        "missing": 999,
+    }[invalid_dropped_root]
+
+    assert not _atomic_kmb_frontier_certificate(
+        key,
+        frontier,
+        current,
+        previous_rows=list(frontier),
+        gate_index=15,
+        previous_checkpoint=29,
+        checkpoint=30,
+        gate_assignments={
+            retained_source: retained_root,
+            dropped_source: invalid_root,
+        },
+        gate_rows=dict(enumerate(gates)),
+        passed_rows={passed_source},
+        pairs=_align_gate_arrivals(
+            frontier,
+            current,
+            gate_index=29,
+            checkpoint=30,
+        ),
+        carried=True,
+    )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_atomic_kmb_repeated_fixed_three_eta_slides_keep_last_root(reverse):
+    key, probes, gates, rows_by_stop = _fixed_three_eta_horizon_slide_fixture(
+        reverse=reverse,
+        repeated_slide=True,
+    )
+    line = _line(*key, stop_count=34)
+    plan = _plan_gate_associations(probes, gates, {key})
+    estimates = estimate_bus_positions(
+        probes,
+        [line],
+        authoritative_etas=gates,
+        observed_checkpoint_indices={key: rows_by_stop},
+    )
+
+    gate_zero = next(
+        index for index, gate in enumerate(gates) if gate.minutes == 16.0
+    )
+    rows_at = {
+        checkpoint: sorted(
+            (
+                (index, row)
+                for index, row in enumerate(probes)
+                if row.index == checkpoint
+            ),
+            key=lambda item: item[1].minutes,
+        )
+        for checkpoint in rows_by_stop
+    }
+    for checkpoint in (30, 31, 33):
+        assert {source for source, _row in rows_at[checkpoint][:2]} \
+            <= plan.passed_probe_rows
+        assert plan.gate_assignment[rows_at[checkpoint][2][0]] == gate_zero
+
+    assert len(estimates) == 4
+    gate_zero_marker = next(
+        marker
+        for marker in estimates
+        if ("gate", gate_zero) in marker.source_observations
+    )
+    gate_zero_evidence = {
+        (checkpoint, round(arrival, 6), revision)
+        for checkpoint, arrival, revision in gate_zero_marker.checkpoint_evidence
+    }
+    for checkpoint in (31, 33):
+        expected = rows_at[checkpoint][2][1]
+        assert (
+            checkpoint,
+            round(expected.arrival_at.timestamp(), 6),
+            expected.refresh_generation,
+        ) in gate_zero_evidence
+    assert not any(
+        {checkpoint for checkpoint, _arrival, _revision in marker.checkpoint_evidence}
+        <= {31, 33}
+        for marker in estimates
+    )
+    audit = audit_marker_positions(probes, gates, estimates, [line])
+    assert audit["ok"], audit["issues"]
+
+
+def _two_rank_gate_handoff_arguments(*, leading_gate_minutes=0.2, extra=False):
+    """Frame-9-shaped live/scheduled gate handoff with exact two-row census."""
+    key = ("KMB", "91", "inbound")
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    gates = [Probe(*key, 15, leading_gate_minutes, kind=EtaKind.REALTIME),
+             Probe(*key, 15, 28.0, kind=EtaKind.SCHEDULED)]
+    values = ((16, (0.9705484833, 29.2205484833)),
+              (24, (10.0205484833, 38.3705484833)),
+              (25, (10.6038818167, 38.9538818167)),
+              (29, (12.88721515, 41.2538818167)),
+              (30, (13.2205484833, 41.5538818167)),
+              (33, (16.28721515, 44.6038818167)))
+    all_rows = []
+    for index, minutes_by_rank in values:
+      for rank, minutes in enumerate(minutes_by_rank):
+        kind = EtaKind.REALTIME if rank == 0 else EtaKind.SCHEDULED
+        previous = Probe(
+            *key, index, minutes, kind=kind, signed_minutes=minutes,
+            cache_age_seconds=9.2, refresh_generation=9,
+            arrival_at=base + timedelta(minutes=minutes),
+        )
+        all_rows.append(previous)
+    frontier = [(4, all_rows[6]), (5, all_rows[7])]
+    current = [(8, all_rows[8]), (9, all_rows[9])]
+    if extra:
+        row = copy(current[1][1])
+        row.minutes = row.signed_minutes = 40.0
+        row.arrival_at = base + timedelta(minutes=40)
+        current.append((12, row))
+    return key, frontier, current, dict(
+        previous_rows=list(frontier), gate_index=15,
+        previous_checkpoint=29, checkpoint=30,
+        gate_assignments={4: 0, 5: 1}, gate_rows=dict(enumerate(gates)),
+        passed_rows=set(),
+        pairs=[(8, 4), (9, 5)],
+        all_rows=all_rows,
+    )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_atomic_frontier_admits_exact_two_rank_due_gate_handoff(reverse):
+    key, frontier, current, args = _two_rank_gate_handoff_arguments()
+    args.pop("all_rows")
+    if reverse:
+        frontier.reverse()
+        current.reverse()
+        args["previous_rows"] = list(frontier)
+    assert _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_two_rank_gate_handoff_renders_two_markers_with_each_source_once(reverse):
+    key, frontier, current, _args = _two_rank_gate_handoff_arguments()
+    probes = list(_two_rank_gate_handoff_arguments()[3]["all_rows"])
+    gates = [Probe(*key, 15, 0.0, kind=EtaKind.REALTIME),
+             Probe(*key, 15, 28.0, kind=EtaKind.SCHEDULED)]
+    if reverse:
+        probes.reverse()
+        gates.reverse()
+    result = estimate_bus_positions(
+        probes, [_line(*key, stop_count=34)], authoritative_etas=gates,
+        observed_checkpoint_indices={key: {16, 24, 25, 29, 30, 33}},
+    )
+    assert len(result) == 2
+    tokens_by_kind = {
+        EtaKind.REALTIME: {('probe', index) for index, row in enumerate(probes)
+                           if row.kind is EtaKind.REALTIME},
+        EtaKind.SCHEDULED: {('probe', index) for index, row in enumerate(probes)
+                            if row.kind is EtaKind.SCHEDULED},
+    }
+    live_marker = next(marker for marker in result
+                       if next(iter(tokens_by_kind[EtaKind.REALTIME]))
+                       in marker.source_observations)
+    scheduled_marker = next(marker for marker in result if marker is not live_marker)
+    assert {token for token in live_marker.source_observations if token[0] == 'probe'} == tokens_by_kind[EtaKind.REALTIME]
+    assert {token for token in scheduled_marker.source_observations if token[0] == 'probe'} == tokens_by_kind[EtaKind.SCHEDULED]
+    assert next(token for token in live_marker.source_observations if token[0] == 'gate') == next(
+        ('gate', index) for index, gate in enumerate(gates) if gate.kind is EtaKind.REALTIME
+    )
+    assert next(token for token in scheduled_marker.source_observations if token[0] == 'gate') == next(
+        ('gate', index) for index, gate in enumerate(gates) if gate.kind is EtaKind.SCHEDULED
+    )
+    # Stop 30 is the one-minute first-deficit admission, and stop 33 is the
+    # subsequent carried checkpoint; both remain owned by their original rank.
+    stop30_live = ('probe', next(i for i, row in enumerate(probes)
+                                 if row.index == 30 and row.kind is EtaKind.REALTIME))
+    stop33_live = ('probe', next(i for i, row in enumerate(probes)
+                                 if row.index == 33 and row.kind is EtaKind.REALTIME))
+    stop30_scheduled = ('probe', next(i for i, row in enumerate(probes)
+                                      if row.index == 30 and row.kind is EtaKind.SCHEDULED))
+    stop33_scheduled = ('probe', next(i for i, row in enumerate(probes)
+                                      if row.index == 33 and row.kind is EtaKind.SCHEDULED))
+    assert {stop30_live, stop33_live} <= live_marker.source_observations
+    assert {stop30_scheduled, stop33_scheduled} <= scheduled_marker.source_observations
+    assert {live_marker.position, scheduled_marker.position} == {1.0, 15.0}
+    source_multiset = Counter(
+        source for marker in result for source in marker.source_observations
+    )
+    expected_sources = Counter({
+        ("probe", index): 1 for index in range(len(probes))
+    })
+    expected_sources.update(("gate", index) for index in range(len(gates)))
+    assert source_multiset == expected_sources
+
+
+def test_atomic_frontier_two_rank_handoff_requires_due_leading_gate_and_exact_shape():
+    key, frontier, current, args = _two_rank_gate_handoff_arguments(
+        leading_gate_minutes=0.51,
+    )
+    args.pop("all_rows")
+    assert not _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+
+
+def test_atomic_gate_partition_preserves_a_genuine_fourth_passed_ladder():
+    probes, gates, _expected = _kmb_91_sparse_gate_partition_fixture(12)
+    extra = [
+        Probe(
+            "KMB",
+            "91",
+            "inbound",
+            index,
+            minutes,
+            kind=EtaKind.REALTIME,
+            cache_age_seconds=9.843999999997322,
+            signed_minutes=minutes,
+            refresh_generation=129,
+            arrival_at=datetime.fromisoformat(arrival),
+        )
+        for index, minutes, arrival in (
+            (31, 8.0, "2026-09-09T17:55:31+08:00"),
+            (32, 8.7, "2026-09-09T17:56:13+08:00"),
+            (33, 10.3, "2026-09-09T17:57:49+08:00"),
+        )
+    ]
+    probes.extend(extra)
+
+    estimates = estimate_bus_positions(
+        probes,
+        [_line("KMB", "91", "inbound", stop_count=34)],
+        authoritative_etas=gates,
+        observed_checkpoint_indices={("KMB", "91", "inbound"): range(34)},
+    )
+
+    assert len(estimates) == 4
+    sources = [
+        source
+        for estimate in estimates
+        for source in estimate.source_observations
+        if source[0] == "probe"
+    ]
+    assert Counter(sources) == Counter(
+        ("probe", index) for index in range(len(probes))
+    )
+
+    key, frontier, current, args = _two_rank_gate_handoff_arguments(extra=True)
+    args.pop("all_rows")
+    assert not _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+
+    key, frontier, current, args = _two_rank_gate_handoff_arguments()
+    args.pop("all_rows")
+    args["gate_rows"][2] = copy(args["gate_rows"][1])
+    assert not _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+
+    key, frontier, current, args = _two_rank_gate_handoff_arguments()
+    args.pop("all_rows")
+    args["gate_assignments"].pop(5)
+    assert not _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+
+
+@pytest.mark.parametrize("invalid", [
+    "stale", "revision", "boolean_minutes", "boolean_age", "boolean_signed",
+    "nonfinite_minutes", "missing_arrival", "tie", "count", "duplicate_source",
+    "incomplete_population", "missing_root", "missing_passed", "root_rank",
+    "too_early", "true_passed",
+    "scheduled_transition", "unknown_kind", "unavailable", "gmb", "other_kmb",
+    "wrong_direction", "zero",
+])
+def test_atomic_frontier_certificate_fails_closed(invalid):
+    key, frontier, current, args = _frontier_certificate_arguments()
+    assert _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+    row = current[0][1]  # a gate-backed current row
+    if invalid == "stale":
+        row.cache_age_seconds = 60
+    elif invalid == "revision":
+        row.refresh_generation += 1
+    elif invalid == "boolean_minutes":
+        row.minutes = True
+    elif invalid == "boolean_age":
+        row.cache_age_seconds = False
+    elif invalid == "boolean_signed":
+        row.signed_minutes = True
+    elif invalid == "nonfinite_minutes":
+        row.minutes = float("nan")
+    elif invalid == "missing_arrival":
+        row.arrival_at = None
+    elif invalid == "tie":
+        row.minutes = row.signed_minutes = current[1][1].minutes
+    elif invalid == "count":
+        current.pop()
+    elif invalid == "duplicate_source":
+        current[0] = (frontier[0][0], row)
+    elif invalid == "incomplete_population":
+        args["previous_rows"].append((999, copy(frontier[0][1])))
+    elif invalid == "missing_root":
+        args["gate_assignments"].pop(frontier[0][0])
+    elif invalid == "missing_passed":
+        args["passed_rows"].clear()
+    elif invalid == "root_rank":
+        roots = args["gate_assignments"]
+        roots[frontier[0][0]], roots[frontier[1][0]] = roots[frontier[1][0]], roots[frontier[0][0]]
+    elif invalid in {"too_early", "true_passed", "zero"}:
+        root = args["gate_rows"][args["gate_assignments"][frontier[0][0]]]
+        delta = 14.749 if invalid == "too_early" else -0.1
+        row.minutes = row.signed_minutes = root.minutes + delta if invalid != "zero" else 0
+    elif invalid == "scheduled_transition":
+        next(
+            present for source, present in current
+            if source in args["gate_assignments"] and present.kind is EtaKind.REALTIME
+        ).kind = EtaKind.SCHEDULED
+    elif invalid == "unknown_kind":
+        row.kind = "unknown"
+    elif invalid == "unavailable":
+        row.kind = EtaKind.UNAVAILABLE
+    elif invalid == "gmb":
+        key = ("GMB", "91", "inbound")
+    elif invalid == "other_kmb":
+        key = ("KMB", "91P", "inbound")
+    elif invalid == "wrong_direction":
+        row.bound = "outbound"
+    assert not _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_atomic_frontier_preserves_live_class_or_same_scheduled_journey(scheduled):
+    key, frontier, current, args = _frontier_certificate_arguments()
+    for previous, present in zip(frontier, current, strict=True):
+        if previous[0] in args["gate_assignments"]:
+            root = args["gate_rows"][args["gate_assignments"][previous[0]]]
+            previous[1].kind = EtaKind.SCHEDULED if scheduled else EtaKind.MOVING_SLOWLY
+            present[1].kind = EtaKind.SCHEDULED if scheduled else EtaKind.DELAYED
+            root.kind = EtaKind.SCHEDULED if scheduled else EtaKind.REALTIME
+    assert _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+
+
+def test_atomic_frontier_does_not_promote_live_probe_suffix_from_scheduled_gate():
+    key, frontier, current, args = _frontier_certificate_arguments()
+    source = next(
+        source for source, row in frontier
+        if source in args["gate_assignments"] and row.kind is EtaKind.REALTIME
+    )
+    root = args["gate_rows"][args["gate_assignments"][source]]
+    root.kind = EtaKind.SCHEDULED
+    assert not _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+
+
+@pytest.mark.parametrize("owner", ["passed", "gate_root"])
+@pytest.mark.parametrize("clock", ["arrival", "signed_eta"])
+def test_atomic_frontier_rejects_backwards_matched_edge(owner, clock):
+    key, frontier, current, args = _frontier_certificate_arguments()
+    previous_by_source = dict(frontier)
+    current_by_source = dict(current)
+    owners = args["passed_rows" if owner == "passed" else "gate_assignments"]
+    current_source, previous_source = next(
+        pair for pair in args["pairs"] if pair[1] in owners
+    )
+    previous = previous_by_source[previous_source]
+    present = current_by_source[current_source]
+    if clock == "arrival":
+        present.arrival_at = previous.arrival_at - timedelta(seconds=1)
+    else:
+        present.signed_minutes = previous.signed_minutes - 0.1
+        present.minutes = max(0, present.signed_minutes)
+    assert not _atomic_kmb_frontier_certificate(key, frontier, current, **args)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_atomic_frontier_never_certifies_a_filtered_previous_population(
+    monkeypatch, reverse,
+):
+    snapshot, gates, _owned, _positions, _brackets = _atomic_gate_frontier_fixture(
+        25, reverse=reverse,
+    )
+    probes = list(snapshot.rows)
+    template = next(
+        row for row in probes
+        if row.index == 30 and row.kind is EtaKind.SCHEDULED
+    )
+    omitted = copy(template)
+    omitted.signed_minutes = omitted.minutes = 35.0
+    omitted.arrival_at += timedelta(minutes=35.0 - template.signed_minutes)
+    probes.append(omitted)
+    if reverse:
+        probes.reverse()
+    checks = []
+    original = positions_module._atomic_kmb_frontier_certificate
+
+    def record(*args, **kwargs):
+        result = original(*args, **kwargs)
+        checks.append((kwargs["previous_checkpoint"], kwargs["checkpoint"], result))
+        return result
+
+    monkeypatch.setattr(positions_module, "_atomic_kmb_frontier_certificate", record)
+    _plan_gate_associations(probes, gates, {("KMB", "91", "inbound")})
+
+    assert (30, 31, False) in checks
+    assert not any(result for previous, _current, result in checks if previous >= 30)
+
+
+@pytest.mark.parametrize("empty_kind", [EtaKind.REALTIME, EtaKind.UNAVAILABLE])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_atomic_frontier_cannot_carry_across_explicit_empty_checkpoint(
+    monkeypatch, reverse, empty_kind,
+):
+    snapshot, gates, _owned, _positions, _brackets = _atomic_gate_frontier_fixture(
+        25, reverse=reverse,
+    )
+    key = ("KMB", "91", "inbound")
+    probes = [row for row in snapshot.rows if row.index != 32]
+    probes.append(
+        Probe(
+            *key, 32, None, kind=empty_kind, cache_age_seconds=9.2,
+            refresh_generation=25,
+        )
+    )
+    checks = []
+    original = positions_module._atomic_kmb_frontier_certificate
+
+    def record(*args, **kwargs):
+        result = original(*args, **kwargs)
+        checks.append((kwargs["previous_checkpoint"], kwargs["checkpoint"], result))
+        return result
+
+    monkeypatch.setattr(positions_module, "_atomic_kmb_frontier_certificate", record)
+    _plan_gate_associations(probes, gates, {key})
+
+    assert (30, 31, True) in checks
+    assert not any(current >= 32 and result for _previous, current, result in checks)
+
+
+def test_atomic_frontier_cannot_carry_across_rowless_observed_empty_checkpoint(
+    monkeypatch,
+):
+    snapshot, gates, _owned, _positions, _brackets = _atomic_gate_frontier_fixture(25)
+    key = ("KMB", "91", "inbound")
+    probes = [row for row in snapshot.rows if row.index != 32]
+    checks = []
+    original = positions_module._atomic_kmb_frontier_certificate
+
+    def record(*args, **kwargs):
+        result = original(*args, **kwargs)
+        checks.append((kwargs["previous_checkpoint"], kwargs["checkpoint"], result))
+        return result
+
+    monkeypatch.setattr(positions_module, "_atomic_kmb_frontier_certificate", record)
+    observed = {key: {row.index for row in snapshot.rows}}
+    _plan_gate_associations(
+        probes, gates, {key}, observed_checkpoint_indices=observed,
+    )
+
+    assert (30, 31, True) in checks
+    assert not any(current >= 32 and result for _previous, current, result in checks)
+
+
+def test_observed_checkpoint_collection_is_normalized_for_estimator_and_auditor():
+    line = _line("KMB", "91", "inbound", stop_count=34)
+    assert estimate_bus_positions(
+        [], [line], observed_checkpoint_indices=range(34),
+    ) == []
+    audit = audit_marker_positions(
+        [], [], [], [line], observed_checkpoint_indices=range(34),
+    )
+    assert audit["ok"]
+
+
+@pytest.mark.parametrize(
+    ("operator", "route", "bound"),
+    [
+        ("KMB", "91", "inbound"),
+        ("KMB", "91P", "inbound"),
+        ("GMB", "11B", "seq-1"),
+    ],
+)
+@pytest.mark.parametrize("empty_form", ["sentinel", "metadata"])
+def test_empty_only_upstream_checkpoint_preserves_ordinary_frontier(
+    operator, route, bound, empty_form,
+):
+    key = (operator, route, bound)
+    gates = [
+        Probe(*key, 15, 10),
+        Probe(*key, 15, 30),
+    ]
+    probes = [
+        Probe(*key, 13, 9),
+        Probe(*key, 13, 29),
+        Probe(*key, 16, 10.3),
+        Probe(*key, 16, 14),
+        Probe(*key, 16, 30.3),
+    ]
+    baseline = _plan_gate_associations(probes, gates, {key})
+    observed = None
+    if empty_form == "sentinel":
+        probes.append(Probe(*key, 14, None, kind=EtaKind.UNAVAILABLE))
+    else:
+        observed = {key: {13, 14, 16}}
+
+    guarded = _plan_gate_associations(
+        probes, gates, {key}, observed_checkpoint_indices=observed,
+    )
+
+    assert guarded == baseline
+
+
+@pytest.mark.parametrize(
+    ("operator", "route", "bound"),
+    [
+        ("KMB", "91", "inbound"),
+        ("KMB", "91P", "inbound"),
+        ("GMB", "11B", "seq-1"),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_empty_sentinel_never_discards_active_checkpoint_siblings(
+    operator, route, bound, reverse,
+):
+    snapshot, template_gates, _owned, _positions, _brackets = (
+        _atomic_gate_frontier_fixture(40, reverse=reverse)
+    )
+    key = (operator, route, bound)
+    probes = []
+    gates = []
+    for source, destination in ((snapshot.rows, probes), (template_gates, gates)):
+        for original in source:
+            row = copy(original)
+            row.operator, row.route, row.bound = key
+            destination.append(row)
+    baseline = _plan_gate_associations(probes, gates, {key})
+    sentinel = copy(next(row for row in probes if row.index == 32))
+    sentinel.minutes = sentinel.signed_minutes = None
+    sentinel.arrival_at = None
+    sentinel.kind = EtaKind.UNAVAILABLE
+    probes.append(sentinel)
+
+    guarded = _plan_gate_associations(probes, gates, {key})
+    active = {
+        index for index, row in enumerate(probes)
+        if row.index == 32 and row.minutes is not None
+    }
+    classified = set(guarded.gate_assignment) | set(guarded.passed_probe_rows)
+
+    assert active <= classified
+    assert len(probes) - 1 not in classified
+    if key not in {("KMB", "91", "inbound"), ("KMB", "91M", "inbound")}:
+        assert guarded == baseline
+
+
+@pytest.mark.parametrize(
+    "break_kind",
+    ["revision", "continuity", "order", "arrival_chronology", "signed_chronology"],
+)
+def test_atomic_frontier_chain_cannot_resume_after_a_later_checkpoint_break(monkeypatch, break_kind):
+    snapshot, gates, _owned, _positions, _brackets = _atomic_gate_frontier_fixture(25)
+    probes = list(snapshot.rows)
+    current = sorted((row for row in probes if row.index == 32), key=lambda row: row.minutes)
+    if break_kind == "revision":
+        for row in current:
+            row.refresh_generation += 1
+    elif break_kind in {"continuity", "order"}:
+        row = current[0]
+        # 24.4 retains the passed rank but exceeds local travel tolerance;
+        # crossing the middle root additionally violates the rank invariant.
+        minutes = 24.4 if break_kind == "continuity" else current[1].minutes + 1
+        row.arrival_at += timedelta(minutes=minutes - row.minutes)
+        row.minutes = row.signed_minutes = minutes
+    else:
+        previous = min(
+            (row for row in probes if row.index == 31), key=lambda row: row.minutes,
+        )
+        row = current[0]
+        if break_kind == "arrival_chronology":
+            row.arrival_at = previous.arrival_at - timedelta(seconds=1)
+        else:
+            row.signed_minutes = previous.signed_minutes - 0.1
+            row.minutes = max(0, row.signed_minutes)
+    checks = []
+    original = positions_module._atomic_kmb_frontier_certificate
+
+    def record(*args, **kwargs):
+        result = original(*args, **kwargs)
+        checks.append((kwargs["checkpoint"], kwargs["carried"], result))
+        return result
+
+    monkeypatch.setattr(positions_module, "_atomic_kmb_frontier_certificate", record)
+    _plan_gate_associations(probes, gates, {("KMB", "91", "inbound")})
+    assert (31, False, True) in checks
+    assert (32, True, False) in checks
+    assert not any(checkpoint > 32 for checkpoint, _carried, _result in checks)
+
+
+@pytest.mark.parametrize("operator,route", [("GMB", "11B"), ("KMB", "91P")])
+def test_atomic_frontier_leaves_other_routes_and_11b_directions_isolated(monkeypatch, operator, route):
+    snapshot, template_gates, _owned, _positions, _brackets = _atomic_gate_frontier_fixture(25)
+    probes = []
+    gates = []
+    keys = set()
+    for direction in ("seq-1", "seq-2"):
+        keys.add((operator, route, direction))
+        for source, destination in ((snapshot.rows, probes), (template_gates, gates)):
+            for original in source:
+                row = copy(original)
+                row.operator, row.route, row.bound = operator, route, direction
+                destination.append(row)
+    enabled = _plan_gate_associations(probes, gates, keys)
+    monkeypatch.setattr(positions_module, "_atomic_kmb_frontier_certificate",
+                        lambda *_args, **_kwargs: False)
+    ordinary = _plan_gate_associations(probes, gates, keys)
+    assert enabled == ordinary
+    assert enabled.gate_assignment
+    assert all(probes[source].bound == gates[root].bound
+               for source, root in enabled.gate_assignment.items())
+
+
 def test_timetable_ladder_collapses_to_one_vehicle():
     """One real bus announced at many stops with timetable-interpolated ETAs
     leaves a ladder of implied positions rising ~1 stop per stop. It must
@@ -81,6 +1800,415 @@ def test_timetable_ladder_collapses_to_one_vehicle():
     assert isinstance(estimate, BusEstimate)
     # Anchored at the maximum implied position (2.0).
     assert abs(estimate.lon - line.stops[2].lon) < 1e-6
+
+
+def test_verified_gate_probe_reunites_exact_live_11s_sparse_ladder():
+    """A missing gate-feed frame must not split one gate-probed journey."""
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(
+            *key,
+            0,
+            None,
+            cache_age_seconds=7.4,
+            refresh_generation=2504,
+        ),
+        Probe(
+            *key,
+            7,
+            10.33589975,
+            cache_age_seconds=7.688,
+            signed_minutes=10.33589975,
+            refresh_generation=2500,
+            arrival_at=datetime.fromisoformat("2026-09-09T03:32:07.886+08:00"),
+        ),
+        Probe(
+            *key,
+            9,
+            14.7188443,
+            cache_age_seconds=8.063,
+            signed_minutes=14.7188443,
+            refresh_generation=2498,
+            arrival_at=datetime.fromisoformat("2026-09-09T03:36:30.402+08:00"),
+        ),
+        Probe(
+            *key,
+            18,
+            24.322681583333335,
+            cache_age_seconds=7.86,
+            signed_minutes=24.322681583333335,
+            refresh_generation=2499,
+            arrival_at=datetime.fromisoformat("2026-09-09T03:46:06.887+08:00"),
+        ),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {0, 7, 9, 18}},
+        verified_gate_indices={key: 7},
+    )
+
+    assert len(estimates) == 1
+    # The fallback proves identity only. Existing all-positive physical
+    # placement remains the first-present boundary, one stop upstream.
+    assert estimates[0].position == 6.0
+    assert estimates[0].bracket == (0.0, 7.0)
+    assert estimates[0].boundary_revision == (2504, 2500)
+    assert estimates[0].source_observations == {
+        ("probe", 1),
+        ("probe", 2),
+        ("probe", 3),
+    }
+
+    line.stops[7] = Stop("20013011", "HKUST South", 22.333360, 114.267)
+    audit = audit_marker_positions(rows, (), estimates, [line])
+    assert audit["ok"]
+    assert audit["issues"] == []
+
+
+def test_verified_gate_probe_preserves_two_ordered_occurrences():
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(*key, 0, None, cache_age_seconds=4, refresh_generation=1),
+        Probe(*key, 7, 4, cache_age_seconds=4, refresh_generation=2),
+        Probe(*key, 7, 10, cache_age_seconds=4, refresh_generation=2),
+        Probe(*key, 9, 8, cache_age_seconds=4, refresh_generation=3),
+        Probe(*key, 9, 14, cache_age_seconds=4, refresh_generation=3),
+        Probe(*key, 18, 26, cache_age_seconds=4, refresh_generation=4),
+        Probe(*key, 18, 32, cache_age_seconds=4, refresh_generation=4),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {0, 7, 9, 18}},
+        verified_gate_indices={key: 7},
+    )
+
+    assert len(estimates) == 2
+    assert sorted(
+        observation
+        for estimate in estimates
+        for observation in estimate.source_observations
+        if observation in {("probe", 1), ("probe", 2)}
+    ) == [("probe", 1), ("probe", 2)]
+    assert all(len(estimate.source_observations) == 3 for estimate in estimates)
+
+
+def test_verified_gate_probe_leaves_unmatched_passed_vehicle_separate():
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(*key, 0, None, cache_age_seconds=4, refresh_generation=1),
+        Probe(*key, 7, 10, cache_age_seconds=4, refresh_generation=2),
+        Probe(*key, 18, 2, cache_age_seconds=4, refresh_generation=3),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {0, 7, 18}},
+        verified_gate_indices={key: 7},
+    )
+
+    assert sorted(estimate.position for estimate in estimates) == [6.0, 17.0]
+    assert {estimate.source_observations for estimate in estimates} == {
+        frozenset({("probe", 1)}),
+        frozenset({("probe", 2)}),
+    }
+
+
+def test_live_terminal_singleton_prioritizes_eta_implied_interior_stops():
+    """The exact 11S frame-5 shape should need one priority generation."""
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(
+            *key, 0, 0.0, kind=EtaKind.SCHEDULED,
+            cache_age_seconds=7.1, signed_minutes=-0.149,
+            refresh_generation=53,
+            arrival_at=datetime.fromisoformat("2026-09-09T04:11:23.709+08:00"),
+        ),
+        Probe(
+            *key, 9, 15.001336, kind=EtaKind.SCHEDULED,
+            cache_age_seconds=45.2, refresh_generation=22,
+            arrival_at=datetime.fromisoformat("2026-09-09T04:25:54.791+08:00"),
+        ),
+        Probe(
+            *key, 18, 5.874677816666666, kind=EtaKind.REALTIME,
+            cache_age_seconds=9.0, refresh_generation=45,
+            arrival_at=datetime.fromisoformat("2026-09-09T04:17:23.463+08:00"),
+        ),
+        Probe(
+            *key, 18, 24.78519448333333, kind=EtaKind.SCHEDULED,
+            cache_age_seconds=9.0, refresh_generation=45,
+            arrival_at=datetime.fromisoformat("2026-09-09T04:36:17.094+08:00"),
+        ),
+    ]
+    gate_rows = [
+        AuthoritativeProbe(*key, 7, 11.0, kind=EtaKind.SCHEDULED),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        authoritative_etas=gate_rows,
+        observed_checkpoint_indices={key: {0, 9, 18}},
+    )
+
+    assert len(estimates) == 2
+    live = next(
+        estimate for estimate in estimates
+        if estimate.source_observations == {("probe", 2)}
+    )
+    # Search hints do not turn the heuristic projection into motion evidence.
+    assert live.position == 17.0
+    assert live.bracket == (9.0, 18.0)
+    assert live.priority_indices == frozenset({18})
+    assert live.exploratory_indices == frozenset({15, 16})
+
+
+def test_live_singleton_priority_uses_refreshed_frame_9_eta():
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(*key, 14, None, cache_age_seconds=7.1, refresh_generation=87),
+        Probe(
+            *key, 18, 4.9704192166666665,
+            cache_age_seconds=7.4, refresh_generation=86,
+            arrival_at=datetime.fromisoformat("2026-09-09T04:17:10.889+08:00"),
+        ),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {14, 18}},
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].position == 17.0
+    assert estimates[0].bracket == (14.0, 18.0)
+    assert estimates[0].priority_indices == frozenset({18})
+    assert estimates[0].exploratory_indices == frozenset({15, 16})
+
+
+@pytest.mark.parametrize(
+    ("kind", "age", "revision", "minutes"),
+    [
+        (EtaKind.SCHEDULED, 1.0, 1, 5.0),
+        (EtaKind.UNAVAILABLE, 1.0, 1, 5.0),
+        (EtaKind.REALTIME, 60.0, 1, 5.0),
+        (EtaKind.REALTIME, float("nan"), 1, 5.0),
+        (EtaKind.REALTIME, True, 1, 5.0),
+        (EtaKind.REALTIME, 1.0, 0, 5.0),
+        (EtaKind.REALTIME, 1.0, 1, float("nan")),
+        (EtaKind.REALTIME, 1.0, 1, True),
+    ],
+)
+def test_eta_guided_priority_fails_closed_for_noncurrent_rows(
+    kind, age, revision, minutes
+):
+    row = Probe(
+        "GMB", "11S", "seq-1", 18, minutes, kind=kind,
+        cache_age_seconds=age, refresh_generation=revision,
+    )
+    assert _eta_guided_priority_indices(row, (9.0, 18.0), 19) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("minutes", "bracket", "expected"),
+    [
+        (6.0, (9.0, 18.0), frozenset({15})),
+        (5.8, (15.0, 18.0), frozenset({16})),
+        (20.0, (9.0, 18.0), frozenset()),
+        (2.0, (17.0, 18.0), frozenset()),
+    ],
+)
+def test_eta_guided_priority_is_clamped_to_strict_bracket_interior(
+    minutes, bracket, expected
+):
+    row = Probe(
+        "GMB", "11S", "seq-1", 18, minutes,
+        cache_age_seconds=1, refresh_generation=1,
+    )
+    assert _eta_guided_priority_indices(row, bracket, 19) == expected
+
+
+def test_eta_guided_priority_deduplicates_equal_terminal_occurrences():
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(*key, 9, None, cache_age_seconds=1, refresh_generation=1),
+        Probe(*key, 18, 5.0, cache_age_seconds=1, refresh_generation=2),
+        Probe(*key, 18, 5.0, cache_age_seconds=1, refresh_generation=2),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {9, 18}},
+    )
+
+    assert len(estimates) == 2
+    assert {estimate.source_observations for estimate in estimates} == {
+        frozenset({("probe", 1)}),
+        frozenset({("probe", 2)}),
+    }
+    assert all(
+        estimate.priority_indices == frozenset({18})
+        and estimate.exploratory_indices == frozenset({15, 16})
+        for estimate in estimates
+    )
+
+
+def test_multirow_realtime_ladder_uses_its_unique_fresh_upper_as_search_hint():
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(*key, 9, None, cache_age_seconds=1, refresh_generation=1),
+        Probe(*key, 17, 3.0, cache_age_seconds=1, refresh_generation=2),
+        Probe(*key, 18, 5.0, cache_age_seconds=1, refresh_generation=3),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {9, 17, 18}},
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].priority_indices == frozenset({17, 18})
+    assert estimates[0].exploratory_indices == frozenset({15, 16})
+
+
+@pytest.mark.parametrize("gate_age", [60.0, None, float("nan")])
+def test_stale_or_invalid_gate_probe_cannot_reunite_sparse_fragments(gate_age):
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(*key, 0, None, cache_age_seconds=4, refresh_generation=1),
+        Probe(*key, 7, 10, cache_age_seconds=gate_age, refresh_generation=2),
+        Probe(*key, 9, 14, cache_age_seconds=4, refresh_generation=3),
+        Probe(*key, 18, 24, cache_age_seconds=4, refresh_generation=4),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {0, 7, 9, 18}},
+        verified_gate_indices={key: 7},
+    )
+
+    assert len(estimates) == 2
+
+
+def test_negative_gate_probe_cannot_make_filtered_rows_position_evidence():
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(*key, 0, None, cache_age_seconds=4, refresh_generation=1),
+        Probe(*key, 7, 20, cache_age_seconds=4, refresh_generation=2),
+        Probe(*key, 9, 24, cache_age_seconds=4, refresh_generation=3),
+        Probe(*key, 18, 28, cache_age_seconds=4, refresh_generation=4),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {0, 7, 9, 18}},
+        verified_gate_indices={key: 7},
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].position == 17.0
+    assert estimates[0].bracket == (9.0, 18.0)
+    assert estimates[0].source_observations == {("probe", 3)}
+
+
+def test_verified_gate_probe_track_obeys_future_origin_suppression():
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(*key, 0, 5, cache_age_seconds=4, refresh_generation=1),
+        Probe(*key, 7, 12, cache_age_seconds=4, refresh_generation=2),
+        Probe(*key, 9, 16, cache_age_seconds=4, refresh_generation=3),
+    ]
+
+    assert estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {0, 7, 9}},
+        verified_gate_indices={key: 7},
+    ) == []
+
+
+def test_verified_gate_probe_keeps_final_zero_first_future_placement():
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    rows = [
+        Probe(*key, 0, None, cache_age_seconds=4, refresh_generation=1),
+        Probe(
+            *key,
+            7,
+            0,
+            cache_age_seconds=4,
+            signed_minutes=-1.0,
+            refresh_generation=2,
+        ),
+        Probe(
+            *key,
+            8,
+            0,
+            cache_age_seconds=4,
+            signed_minutes=-0.25,
+            refresh_generation=3,
+        ),
+        Probe(
+            *key,
+            9,
+            1,
+            cache_age_seconds=4,
+            signed_minutes=1.0,
+            refresh_generation=4,
+        ),
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={key: {0, 7, 8, 9}},
+        verified_gate_indices={key: 7},
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].bracket == (8.0, 9.0)
+    assert estimates[0].position == pytest.approx(8.2)
+    assert estimates[0].bracket_eta_offsets == (-0.25, 1.0)
+
+
+def test_authoritative_gate_rows_disable_probe_gate_fallback():
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    probes = [
+        Probe(*key, 7, 10, cache_age_seconds=4, refresh_generation=2),
+        Probe(*key, 18, 24, cache_age_seconds=4, refresh_generation=3),
+    ]
+    gates = [AuthoritativeProbe(*key, 7, 10)]
+
+    estimates = estimate_bus_positions(
+        probes,
+        [line],
+        authoritative_etas=gates,
+        verified_gate_indices={key: 7},
+    )
+
+    assert len(estimates) == 1
+    assert ("gate", 0) in estimates[0].source_observations
+    assert ("probe", 0) not in estimates[0].source_observations
 
 
 def test_long_upstream_hop_rejects_impossible_gate_match():
@@ -1222,6 +3350,136 @@ def test_small_negative_downstream_skew_keeps_passed_gate_journey_on_one_marker(
     )
 
 
+def test_gate_downstream_clock_skew_keeps_live_terminal_ladder_attached():
+    """A fractional downstream countdown must survive the integral gate edge."""
+    line = _line("KMB", "91M", "outbound", stop_count=29)
+    probes = [
+        Probe("KMB", "91M", "outbound", index, minutes)
+        for index, minutes in (
+            (13, 19.084),
+            (14, 20.384),
+            (20, 27.501),
+            (21, 29.951),
+            (28, 31.801),
+        )
+    ]
+    estimates = estimate_bus_positions(
+        probes,
+        [line],
+        authoritative_etas=[
+            AuthoritativeProbe("KMB", "91M", "outbound", 12, 15)
+        ],
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].source_observations == frozenset(
+        {("gate", 0), *(('probe', index) for index in range(5))}
+    )
+
+
+def test_frame27_91m_mixed_population_preserves_three_vehicle_identity_ladders():
+    line = _line("KMB", "91M", "outbound", stop_count=29)
+    values = [
+        (3, 0.0),
+        (4, 0.4341865833),
+        (5, 2.3675199167),
+        (13, 0.7175199167),
+        (13, 19.0841865833),
+        (14, 2.0175199167),
+        (14, 20.3841865833),
+        (20, 9.1341865833),
+        (20, 27.50085325),
+        (21, 0.0),
+        (21, 11.5841865833),
+        (21, 29.95085325),
+        (28, 9.9675199167),
+        (28, 19.8175199167),
+        (28, 31.80085325),
+    ]
+    estimates = estimate_bus_positions(
+        [Probe("KMB", "91M", "outbound", index, minutes) for index, minutes in values],
+        [line],
+        authoritative_etas=[
+            AuthoritativeProbe("KMB", "91M", "outbound", 12, 15)
+        ],
+    )
+
+    assert len(estimates) == 3
+    probe_tokens = {
+        ("probe", index)
+        for index in range(len(values))
+    }
+    owned_tokens = [
+        token
+        for estimate in estimates
+        for token in estimate.source_observations
+        if token[0] == "probe"
+    ]
+    assert set(owned_tokens) == probe_tokens
+    assert len(owned_tokens) == len(set(owned_tokens)) == len(values)
+    gate_backed = next(
+        estimate
+        for estimate in estimates
+        if ("gate", 0) in estimate.source_observations
+    )
+    assert ("probe", 14) in gate_backed.source_observations
+    terminal_estimates = [
+        estimate
+        for estimate in estimates
+        if ("probe", 12) in estimate.source_observations
+        or ("probe", 13) in estimate.source_observations
+    ]
+    assert len(terminal_estimates) == 2
+    assert all(estimate is not gate_backed for estimate in terminal_estimates)
+    assert terminal_estimates[0].source_observations.isdisjoint(
+        terminal_estimates[1].source_observations
+    )
+
+
+def test_equal_raw_terminal_occurrence_remains_a_second_vehicle():
+    """Repeated terminal evidence remains a distinct second vehicle."""
+    line = _line("KMB", "91M", "outbound", stop_count=29)
+    probes = [
+        Probe("KMB", "91M", "outbound", 20, 27.501),
+        Probe("KMB", "91M", "outbound", 28, 31.801),
+        Probe("KMB", "91M", "outbound", 28, 31.801),
+    ]
+    estimates = estimate_bus_positions(
+        probes,
+        [line],
+        authoritative_etas=[
+            AuthoritativeProbe("KMB", "91M", "outbound", 12, 15)
+        ],
+    )
+
+    assert len(estimates) == 2
+    assert any(
+        estimate.source_observations
+        == frozenset({("gate", 0), ("probe", 0), ("probe", 1)})
+        for estimate in estimates
+    )
+    assert any(
+        estimate.source_observations == frozenset({("probe", 2)})
+        for estimate in estimates
+    )
+
+
+def test_fresh_downstream_gate_matching_keeps_existing_drift_boundary():
+    gate_rows = [
+        (0, AuthoritativeProbe("KMB", "91M", "outbound", 12, 15)),
+        (1, AuthoritativeProbe("KMB", "91M", "outbound", 12, 35)),
+    ]
+    probe_rows = [
+        (0, Probe("KMB", "91M", "outbound", 28, 31)),
+        (1, Probe("KMB", "91M", "outbound", 28, 51)),
+        (2, Probe("KMB", "91M", "outbound", 28, 71)),
+    ]
+
+    assert _align_gate_arrivals(
+        gate_rows, probe_rows, gate_index=12, checkpoint=28
+    ) == [(1, 0), (2, 1)]
+
+
 def test_upstream_stop_accepts_fast_but_ordered_gate_journey():
     gate_rows = [
         (0, AuthoritativeProbe("GMB", "12", "seq-2", 16, 10)),
@@ -1286,6 +3544,155 @@ def test_same_stop_close_departures_are_not_healed_together():
         [line],
     )
     assert len(estimates) == 2
+
+
+def test_atomic_kmb_sparse_fast_ladder_does_not_split_terminal_marker():
+    """One route-response ETA chain remains one bus across a wide stop gap."""
+    line = _line("KMB", "91", "outbound", stop_count=31)
+    rows = [
+        Probe(
+            "KMB", "91", "outbound", index, minutes,
+            cache_age_seconds=9.391,
+            signed_minutes=signed_minutes,
+            refresh_generation=305,
+            arrival_at=datetime.fromisoformat(arrival_at),
+        )
+        for index, minutes, signed_minutes, arrival_at in (
+            (17, 0.0, -1.90, "2026-09-08T23:46:30+08:00"),
+            (18, 0.0, -0.55, "2026-09-08T23:47:51+08:00"),
+            (30, 16.412, 16.412, "2026-09-09T00:04:39+08:00"),
+        )
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={
+            ("KMB", "91", "outbound"): range(31),
+        },
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].source_observations == frozenset(
+        {("probe", 0), ("probe", 1), ("probe", 2)}
+    )
+    # Preserve the established final-zero/first-future boundary. The distant
+    # terminal proves identity but does not place a second bus at stop 29.
+    assert estimates[0].bracket == (18.0, 30.0)
+    assert 18.0 < estimates[0].position < 19.0
+    assert estimates[0].priority_indices == frozenset({17, 18, 30})
+
+
+def test_atomic_kmb_91m_sparse_terminal_ladder_remains_one_marker():
+    """91M has a verified full line and uses the same atomic KMB response."""
+    line = _line("KMB", "91M", "inbound", stop_count=28)
+    rows = [
+        Probe(
+            "KMB", "91M", "inbound", index, minutes,
+            cache_age_seconds=28.843,
+            signed_minutes=signed_minutes,
+            refresh_generation=976,
+            arrival_at=datetime.fromisoformat(arrival_at),
+        )
+        for index, minutes, signed_minutes, arrival_at in (
+            (17, 0.0, -0.858, "2026-09-09T00:38:07+08:00"),
+            (18, 0.609, 0.609, "2026-09-09T00:39:35+08:00"),
+            (27, 11.942, 11.942, "2026-09-09T00:50:55+08:00"),
+        )
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={
+            ("KMB", "91M", "inbound"): range(28),
+        },
+    )
+
+    assert len(estimates) == 1
+    assert estimates[0].source_observations == frozenset(
+        {("probe", 0), ("probe", 1), ("probe", 2)}
+    )
+    assert estimates[0].bracket == (17.0, 18.0)
+    assert 17.0 < estimates[0].position < 18.0
+
+
+def test_atomic_kmb_temporal_heal_requires_one_route_response_revision():
+    """Staggered disjoint rows are ambiguous and must remain separate."""
+    line = _line("KMB", "91", "outbound", stop_count=31)
+    rows = [
+        Probe(
+            "KMB", "91", "outbound", index, minutes,
+            cache_age_seconds=9.391,
+            signed_minutes=signed_minutes,
+            refresh_generation=revision,
+            arrival_at=datetime.fromisoformat(arrival_at),
+        )
+        for index, minutes, signed_minutes, revision, arrival_at in (
+            (17, 0.0, -1.90, 304, "2026-09-08T23:46:30+08:00"),
+            (18, 0.0, -0.55, 304, "2026-09-08T23:47:51+08:00"),
+            (30, 16.412, 16.412, 305, "2026-09-09T00:04:39+08:00"),
+        )
+    ]
+
+    estimates = estimate_bus_positions(rows, [line])
+
+    assert len(estimates) == 2
+
+
+def test_atomic_kmb_temporal_heal_rejects_geometry_prefix_end():
+    """A rendered prefix endpoint is not an authoritative route terminus."""
+    line = _line("KMB", "91P", "outbound", stop_count=11)
+    rows = [
+        Probe(
+            "KMB", "91P", "outbound", index, minutes,
+            cache_age_seconds=5.0,
+            signed_minutes=signed_minutes,
+            refresh_generation=305,
+            arrival_at=datetime.fromisoformat(arrival_at),
+        )
+        for index, minutes, signed_minutes, arrival_at in (
+            (4, 0.0, -1.0, "2026-09-09T00:00:00+08:00"),
+            (5, 0.0, -0.2, "2026-09-09T00:00:48+08:00"),
+            (10, 4.0, 4.0, "2026-09-09T00:04:00+08:00"),
+        )
+    ]
+
+    estimates = estimate_bus_positions(rows, [line])
+
+    assert len(estimates) == 2
+
+
+def test_atomic_kmb_temporal_heal_preserves_equal_terminal_multiplicity():
+    """Two equal terminal occurrences are still evidence for two vehicles."""
+    line = _line("KMB", "91", "outbound", stop_count=31)
+    rows = [
+        Probe(
+            "KMB", "91", "outbound", index, minutes,
+            cache_age_seconds=9.391,
+            signed_minutes=signed_minutes,
+            refresh_generation=305,
+            arrival_at=datetime.fromisoformat(arrival_at),
+        )
+        for index, minutes, signed_minutes, arrival_at in (
+            (17, 0.0, -1.90, "2026-09-08T23:46:30+08:00"),
+            (18, 0.0, -0.55, "2026-09-08T23:47:51+08:00"),
+            (30, 16.412, 16.412, "2026-09-09T00:04:39+08:00"),
+            (30, 16.412, 16.412, "2026-09-09T00:04:39+08:00"),
+        )
+    ]
+
+    estimates = estimate_bus_positions(rows, [line])
+
+    # Ambiguous equal occurrences are never consumed merely by input order.
+    assert len(estimates) == 3
+    terminal_tokens = [
+        token
+        for estimate in estimates
+        for token in estimate.source_observations
+        if token in {("probe", 2), ("probe", 3)}
+    ]
+    assert sorted(terminal_tokens) == [("probe", 2), ("probe", 3)]
 
 
 def test_anchor_cluster_prefers_earliest_realtime_in_positional_order():
@@ -1538,6 +3945,105 @@ def test_partial_observation_without_upstream_absence_has_no_bracket():
     assert len(estimates) == 1
     assert estimates[0].bracket is None
     assert estimates[0].boundary_age_seconds is None
+
+
+def test_rebuild_positive_union_uses_upstream_empty_checkpoint():
+    line = _line(stop_count=10)
+    rows = [
+        Probe("KMB", "X", "outbound", 0, None, refresh_generation=11),
+        Probe("KMB", "X", "outbound", 4, 0.2, refresh_generation=11),
+        Probe("KMB", "X", "outbound", 6, None, refresh_generation=11),
+        Probe("KMB", "X", "outbound", 8, 0.7, refresh_generation=11),
+        Probe("KMB", "X", "outbound", 9, 0.8, refresh_generation=11),
+    ]
+    base = BusEstimate(
+        "X destination", 22.3, 114.2, Operator.KMB, 0.0,
+        route="X", bound="outbound", operator_code="KMB",
+        source_observations=frozenset({("probe", 1)}),
+    )
+    fragments = [
+        BusEstimate(
+            "X destination", 22.3, 114.2, Operator.KMB, 0.0,
+            route="X", bound="outbound", operator_code="KMB",
+            source_observations=frozenset({("probe", index)}),
+        )
+        for index in (3, 4)
+    ]
+    rebuilt = rebuild_estimate_from_probe_fragments(
+        base, fragments, rows, [line]
+    )
+    assert rebuilt.bracket == (0.0, 4.0)
+    assert rebuilt.position == pytest.approx(3.9)
+    assert rebuilt.boundary_revision == (11, 11)
+
+
+def test_rebuild_positive_union_accepts_unrelated_upstream_eta_checkpoint():
+    line = _line(stop_count=8)
+    rows = [
+        Probe("KMB", "X", "outbound", 2, 5.0, refresh_generation=12),
+        Probe("KMB", "X", "outbound", 4, 0.2, refresh_generation=12),
+    ]
+    base = BusEstimate(
+        "X destination", 22.3, 114.2, Operator.KMB, 0.0,
+        route="X", bound="outbound", operator_code="KMB",
+        source_observations=frozenset({("probe", 1)}),
+    )
+    rebuilt = rebuild_estimate_from_probe_fragments(base, (), rows, [line])
+    assert rebuilt.bracket == (2.0, 4.0)
+    assert rebuilt.position == pytest.approx(3.9)
+    assert rebuilt.boundary_revision == (12, 12)
+
+
+def test_rebuild_due_only_union_is_a_point_boundary():
+    line = _line(stop_count=8)
+    rows = [
+        Probe("KMB", "X", "outbound", 3, 0.0, refresh_generation=7),
+        Probe("KMB", "X", "outbound", 4, 0.0, refresh_generation=7),
+    ]
+    base = BusEstimate(
+        "X destination", 22.3, 114.2, Operator.KMB, 0.0,
+        route="X", bound="outbound", operator_code="KMB",
+        source_observations=frozenset({("probe", 0), ("probe", 1)}),
+    )
+    rebuilt = rebuild_estimate_from_probe_fragments(base, (), rows, [line])
+    assert rebuilt.bracket == (4.0, 4.0)
+    assert rebuilt.position == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize("kind", [EtaKind.REALTIME, EtaKind.MOVING_SLOWLY, EtaKind.DELAYED])
+def test_owned_subset_accepts_confirmed_live_kinds(kind):
+    rows = [
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0, refresh_generation=12),
+        Probe("KMB", "X", "outbound", 3, 0, kind=kind, cache_age_seconds=0,
+              signed_minutes=-0.25, refresh_generation=12,
+              arrival_at=datetime.fromisoformat("2026-01-01T00:00:00+00:00")),
+        Probe("KMB", "X", "outbound", 4, 0.75, kind=kind, cache_age_seconds=0,
+              signed_minutes=0.75, refresh_generation=12,
+              arrival_at=datetime.fromisoformat("2026-01-01T00:01:00+00:00")),
+    ]
+    template = BusEstimate("X destination", 0, 0, Operator.KMB, 0,
+                           route="X", bound="outbound", operator_code="KMB")
+    rebuilt = rebuild_estimate_from_probe_sources(template, (1, 2), rows, [_line()])
+    assert rebuilt is not None
+    assert rebuilt.position == pytest.approx(3.25)
+    assert rebuilt.bracket == (3, 4)
+    assert rebuilt.lon == pytest.approx(114.26325)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("minutes", True), ("cache_age_seconds", False), ("signed_minutes", True),
+    ("kind", EtaKind.SCHEDULED), ("kind", EtaKind.UNAVAILABLE), ("kind", "unknown"),
+])
+def test_owned_subset_rejects_boolean_numbers_and_non_live_kinds(field, value):
+    rows = [
+        Probe("KMB", "X", "outbound", 2, None, cache_age_seconds=0, refresh_generation=12),
+        Probe("KMB", "X", "outbound", 3, 1, cache_age_seconds=0, refresh_generation=12,
+              arrival_at=datetime.fromisoformat("2026-01-01T00:01:00+00:00")),
+    ]
+    setattr(rows[1], field, value)
+    template = BusEstimate("X destination", 0, 0, Operator.KMB, 0,
+                           route="X", bound="outbound", operator_code="KMB")
+    assert rebuild_estimate_from_probe_sources(template, (1,), rows, [_line()]) is None
 
 
 def test_probe_selection_uses_bounded_evenly_spaced_anchors():

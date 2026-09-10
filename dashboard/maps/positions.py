@@ -2791,9 +2791,11 @@ def estimate_bus_positions(
                             ) * fraction
                     else:
                         # With no due row, the first stop which sees this ETA
-                        # remains the physical upper boundary.
+                        # remains the physical upper boundary. Project across
+                        # the full proven bracket when checkpoints are sparse.
                         position = boundary_index - min(
-                            1.0, max(0.0, eta_minutes / MINUTES_PER_STOP)
+                            boundary_index - lower_index,
+                            max(0.0, eta_minutes / MINUTES_PER_STOP),
                         )
                         # A unique fresh realtime row at the physical upper
                         # boundary is a safe search hint even when coherent
@@ -3079,8 +3081,10 @@ def rebuild_estimate_from_probe_fragments(
         position = float(lower_index)
     elif not zero_indices:
         # With no due row, the first present stop is the physical upper
-        # boundary.  Keep the same one-stop ETA offset used by the estimator.
-        position = upper_index - min(1.0, max(0.0, upper_eta / MINUTES_PER_STOP))
+        # boundary. Use the same full-bracket ETA projection as the estimator.
+        position = upper_index - min(
+            upper_index - lower_index, max(0.0, upper_eta / MINUTES_PER_STOP),
+        )
     else:
         fraction = min(1.0, max(0.0, -lower_eta / (upper_eta - lower_eta)))
         position = lower_index + (upper_index - lower_index) * fraction

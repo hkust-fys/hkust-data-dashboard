@@ -1916,9 +1916,9 @@ def test_verified_gate_probe_reunites_exact_live_11s_sparse_ladder():
     )
 
     assert len(estimates) == 1
-    # The fallback proves identity only. Existing all-positive physical
-    # placement remains the first-present boundary, one stop upstream.
-    assert estimates[0].position == 6.0
+    # The fallback proves identity only. Physical placement projects the
+    # first-present ETA across its certified (0, 7) bracket.
+    assert estimates[0].position == pytest.approx(1.832050125)
     assert estimates[0].bracket == (0.0, 7.0)
     assert estimates[0].boundary_revision == (2504, 2500)
     assert estimates[0].source_observations == {
@@ -2036,6 +2036,59 @@ def test_live_terminal_singleton_prioritizes_eta_implied_interior_stops():
     assert live.exploratory_indices == frozenset({15, 16})
 
 
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_sparse_empty_future_bracket_projects_across_its_full_span(rebuild):
+    line = _line("GMB", "11S", "seq-1", stop_count=19)
+    key = ("GMB", "11S", "seq-1")
+    arrival = datetime(2026, 9, 11, tzinfo=UTC) + timedelta(minutes=8.2603563)
+    rows = [
+        Probe(*key, 9, None, cache_age_seconds=0, refresh_generation=10),
+        Probe(*key, 18, 8.2603563, kind=EtaKind.REALTIME,
+              cache_age_seconds=0, refresh_generation=11, arrival_at=arrival),
+    ]
+    estimates = estimate_bus_positions(
+        rows, [line], observed_checkpoint_indices={key: {9, 18}},
+    )
+    assert len(estimates) == 1
+    estimate = estimates[0]
+    if rebuild:
+        estimate = rebuild_estimate_from_probe_fragments(estimate, [], rows, [line])
+        assert estimate is not estimates[0]
+    assert estimate.position == pytest.approx(13.86982185)
+    assert estimate.bracket == (9.0, 18.0)
+    assert estimate.boundary_revision == (10, 11)
+    assert estimate.boundary_age_seconds == 0
+    assert estimate.position_authoritative is not False
+    assert estimate.source_indices == frozenset({18})
+    assert estimate.source_observations == frozenset({("probe", 1)})
+    assert estimate.checkpoint_evidence == ((18, arrival.timestamp(), 11),)
+    assert estimate.priority_indices == frozenset({18})
+    assert estimate.exploratory_indices == (
+        frozenset() if rebuild else frozenset({13, 14})
+    )
+
+    # A newly observed upper rung consistent with the same two-minutes-per-stop
+    # projection narrows the bracket without correcting the position backward.
+    narrowed_rows = [
+        Probe(*key, 9, None, cache_age_seconds=0, refresh_generation=12),
+        Probe(*key, 14, 0.2603563, kind=EtaKind.REALTIME,
+              cache_age_seconds=0, refresh_generation=13,
+              arrival_at=arrival - timedelta(minutes=8)),
+        rows[1],
+    ]
+    narrowed = estimate_bus_positions(
+        narrowed_rows, [line], observed_checkpoint_indices={key: {9, 14, 18}},
+    )
+    assert len(narrowed) == 1
+    assert narrowed[0].bracket == (9.0, 14.0)
+    assert narrowed[0].position == pytest.approx(estimate.position)
+    assert narrowed[0].position_authoritative is not False
+    assert narrowed[0].boundary_revision == (12, 13)
+    assert narrowed[0].source_indices == frozenset({14, 18})
+    assert narrowed[0].priority_indices == frozenset({14, 18})
+    assert narrowed[0].exploratory_indices == frozenset({13})
+
+
 def test_live_singleton_priority_uses_refreshed_frame_9_eta():
     line = _line("GMB", "11S", "seq-1", stop_count=19)
     key = ("GMB", "11S", "seq-1")
@@ -2055,7 +2108,7 @@ def test_live_singleton_priority_uses_refreshed_frame_9_eta():
     )
 
     assert len(estimates) == 1
-    assert estimates[0].position == 17.0
+    assert estimates[0].position == pytest.approx(15.514790391666667)
     assert estimates[0].bracket == (14.0, 18.0)
     assert estimates[0].priority_indices == frozenset({18})
     assert estimates[0].exploratory_indices == frozenset({15, 16})

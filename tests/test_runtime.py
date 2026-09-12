@@ -4,15 +4,18 @@ operation after a failed provider."""
 
 
 import asyncio
+from collections import deque
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import discord
 import pytest
 
 from bot import (
     DASHBOARD_MESSAGE_MARKER,
     DashboardUpdater,
+    _bounded_discord,
     _find_dashboard_message,
     _payload_fingerprint,
     _resolve_dashboard_message,
@@ -84,6 +87,116 @@ class _FakeChannel:
 
     async def fetch_message(self, message_id):
         return next(message for message in self.messages if message.id == message_id)
+
+
+class _FakeHTTPResponse:
+    def __init__(self, status, payload, *, entered=None, bucket_headers=False):
+        self.status = status
+        self.reason = "test"
+        self.headers = {
+            "content-type": "application/json",
+            "Via": "1.1 test",
+        }
+        if bucket_headers:
+            self.headers.update(
+                {
+                    "X-Ratelimit-Bucket": "shared-test-bucket",
+                    "X-Ratelimit-Remaining": "0",
+                    "X-Ratelimit-Reset-After": "1.0",
+                }
+            )
+        self._payload = payload
+        self._entered = entered
+
+    async def __aenter__(self):
+        if self._entered is not None:
+            await self._entered.wait()
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def text(self, encoding="utf-8"):
+        import json
+
+        return json.dumps(self._payload)
+
+
+class _FakeHTTPSession:
+    def __init__(self, responses, *, repeat_last=False):
+        self.responses = deque(responses)
+        self.repeat_last = repeat_last
+        self._last = None
+        self.calls = 0
+
+    def request(self, *_args, **_kwargs):
+        self.calls += 1
+        if self.responses:
+            self._last = self.responses.popleft()
+        elif not self.repeat_last or self._last is None:
+            raise AssertionError("unexpected fake HTTP request")
+        if len(self._last) == 2:
+            status, payload = self._last
+            entered = None
+        else:
+            status, payload, entered = self._last
+        return _FakeHTTPResponse(status, payload, entered=entered)
+
+
+class _WindowedHTTPSession:
+    def __init__(self):
+        self.calls = 0
+        self._window_until = 0.0
+
+    def request(self, *_args, **_kwargs):
+        import time
+
+        self.calls += 1
+        if time.monotonic() < self._window_until:
+            return _FakeHTTPResponse(
+                429,
+                {"retry_after": self._window_until - time.monotonic(), "global": False},
+            )
+        self._window_until = time.monotonic() + 1.0
+        return _FakeHTTPResponse(200, {"ok": True}, bucket_headers=True)
+
+
+class _HTTPBackedMessage(_FakeMessage):
+    def __init__(self, http, channel_id=1):
+        super().__init__(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=321)
+        self._http = http
+        self._channel_id = channel_id
+
+    async def edit(self, **kwargs):
+        from discord.http import Route
+
+        await self._http.request(
+            Route("GET", "/channels/{channel_id}/messages", channel_id=self._channel_id)
+        )
+        await super().edit(**kwargs)
+
+
+class _HTTPBackedChannel:
+    def __init__(self, http, message):
+        self._http = http
+        self._message = message
+        self.sent = []
+        self.guild = type("Guild", (), {"me": _FakeAuthor(bot=True, id=42)})()
+
+    async def fetch_message(self, _message_id):
+        from discord.http import Route
+
+        await self._http.request(
+            Route("GET", "/channels/{channel_id}/messages", channel_id=1)
+        )
+        return self._message
+
+    async def history(self, limit=50, **_kwargs):
+        await self.fetch_message(self._message.id)
+        yield self._message
+
+    async def send(self, **_kwargs):
+        raise AssertionError("startup reconciliation must not send")
 
 
 class _FakeThread:
@@ -1623,6 +1736,229 @@ async def test_discord_global_gate_self_recovers_if_retry_is_cancelled(
 
     assert http.max_ratelimit_timeout == 0.01
     assert http._global_over.is_set()
+
+
+@pytest.mark.asyncio
+async def test_discord_bucket_admission_allows_ordinary_reset_but_rejects_long_wait():
+    """The installed discord.py applies our ceiling before HTTP I/O."""
+    from discord.http import Ratelimit
+
+    import bot as bot_module
+
+    loop = asyncio.get_running_loop()
+    allowed = Ratelimit(bot_module.DISCORD_MAX_RATELIMIT_RETRY_SECONDS)
+    allowed.reset_after = 1.00
+    allowed.expires = loop.time() + allowed.reset_after
+    started = loop.time()
+    async with allowed:
+        pass
+    assert loop.time() - started >= 0.85
+
+    rejected = Ratelimit(bot_module.DISCORD_MAX_RATELIMIT_RETRY_SECONDS)
+    rejected.reset_after = 1.50
+    rejected.expires = loop.time() + rejected.reset_after
+    with pytest.raises(discord.errors.RateLimited):
+        async with rejected:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_discord_http_allows_one_second_429_retry_and_rejects_long_retry():
+    from discord.http import HTTPClient, Route
+
+    import bot as bot_module
+
+    loop = asyncio.get_running_loop()
+    http = HTTPClient(loop)
+    http._global_over = asyncio.Event()  # noqa: SLF001
+    http._global_over.set()  # noqa: SLF001
+    bot_module._configure_discord_http_deadlines(http)  # noqa: SLF001
+    route = Route("GET", "/channels/{channel_id}/messages", channel_id=1)
+
+    session = _FakeHTTPSession([
+        (429, {"retry_after": 1.0, "global": False}),
+        (200, {"ok": True}),
+    ])
+    http._HTTPClient__session = session  # noqa: SLF001
+    assert await asyncio.wait_for(http.request(route), timeout=3.0) == {"ok": True}
+    assert session.calls == 2
+
+    rejected_session = _FakeHTTPSession([
+        (429, {"retry_after": 1.5, "global": True}),
+    ])
+    http._HTTPClient__session = rejected_session  # noqa: SLF001
+    with pytest.raises(discord.errors.RateLimited):
+        await http.request(route)
+    assert rejected_session.calls == 1
+    assert http._global_over.is_set()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_discord_http_global_retry_cancellation_reopens_gate():
+    from discord.http import HTTPClient, Route
+
+    import bot as bot_module
+
+    http = HTTPClient(asyncio.get_running_loop())
+    http._global_over = asyncio.Event()  # noqa: SLF001
+    http._global_over.set()  # noqa: SLF001
+    bot_module._configure_discord_http_deadlines(http)  # noqa: SLF001
+    http._HTTPClient__session = _FakeHTTPSession(
+        [(429, {"retry_after": 0.04, "global": True})],
+        repeat_last=True,
+    )  # noqa: SLF001
+    route = Route("GET", "/channels/{channel_id}/messages", channel_id=1)
+    clear_calls = 0
+    gate = http._global_over  # noqa: SLF001
+    original_clear = gate.clear
+
+    def record_clear():
+        nonlocal clear_calls
+        clear_calls += 1
+        original_clear()
+        if clear_calls >= 2:
+            second_clear.set()
+
+    gate.clear = record_clear
+    second_clear = asyncio.Event()
+
+    request = asyncio.create_task(http.request(route))
+    await asyncio.wait_for(second_clear.wait(), timeout=2.0)
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert http._HTTPClient__session.calls >= 2  # noqa: SLF001
+    await asyncio.wait_for(http._global_over.wait(), timeout=2.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_discord_bucket_queued_acquisition_cancellation_is_reusable():
+    from discord.http import Ratelimit
+
+    bucket = Ratelimit(1.25)
+    release_holder = asyncio.Event()
+
+    async def hold_bucket():
+        async with bucket:
+            await release_holder.wait()
+
+    holder = asyncio.create_task(hold_bucket())
+    for _ in range(100):
+        if bucket.outgoing:
+            break
+        await asyncio.sleep(0)
+    assert bucket.outgoing == 1
+    waiter = asyncio.create_task(bucket.acquire())
+    for _ in range(100):
+        if bucket._pending_requests:  # noqa: SLF001
+            break
+        await asyncio.sleep(0)
+    assert bucket._pending_requests  # noqa: SLF001
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    release_holder.set()
+    await asyncio.wait_for(holder, timeout=1.0)
+    async with bucket:
+        pass
+    assert bucket.outgoing == 0
+
+
+@pytest.mark.asyncio
+async def test_discord_http_request_cancellation_during_response_entry_is_reusable(
+    monkeypatch,
+):
+    from discord.http import HTTPClient, Route
+
+    import bot as bot_module
+
+    monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.05)
+    http = HTTPClient(asyncio.get_running_loop())
+    http._global_over = asyncio.Event()  # noqa: SLF001
+    http._global_over.set()  # noqa: SLF001
+    bot_module._configure_discord_http_deadlines(http)  # noqa: SLF001
+    entered = asyncio.Event()
+    http._HTTPClient__session = _FakeHTTPSession(  # noqa: SLF001
+        [(200, {"ok": True}, entered)]
+    )
+    route = Route("GET", "/channels/{channel_id}/messages", channel_id=1)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await _bounded_discord(http.request(route))
+
+    http._HTTPClient__session = _FakeHTTPSession(  # noqa: SLF001
+        [(200, {"ok": True})]
+    )
+    assert await asyncio.wait_for(http.request(route), timeout=1.0) == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_discord_cancellation_during_bucket_exit_is_reusable():
+    """Cancellation during bucket release does not strand that bucket."""
+    from discord.http import Ratelimit
+
+    bucket = Ratelimit(1.25)
+    bucket.reset_after = 0.2
+    bucket.expires = asyncio.get_running_loop().time() + bucket.reset_after
+
+    async def consume_bucket():
+        async with bucket:
+            pass
+
+    operation = asyncio.create_task(consume_bucket())
+    for _ in range(1000):
+        if bucket._sleeping.locked():  # noqa: SLF001
+            break
+        await asyncio.sleep(0)
+    assert bucket._sleeping.locked()  # noqa: SLF001
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    await asyncio.sleep(0.25)
+    async with bucket:
+        pass
+    assert bucket.outgoing == 0
+
+
+@pytest.mark.asyncio
+async def test_persisted_dashboard_startup_fetch_history_then_edits_once(tmp_path):
+    """One shared Discord bucket permits persisted fetch, history, then edit."""
+    from discord.http import HTTPClient
+
+    import bot as bot_module
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    http = HTTPClient(asyncio.get_running_loop())
+    http._global_over = asyncio.Event()  # noqa: SLF001
+    http._global_over.set()  # noqa: SLF001
+    bot_module._configure_discord_http_deadlines(http)  # noqa: SLF001
+    http._HTTPClient__session = _WindowedHTTPSession()  # noqa: SLF001
+    message = _HTTPBackedMessage(http)
+    channel = _HTTPBackedChannel(http, message)
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "dashboard_message_id": message.id,
+        },
+    )
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    updater._persisted_dashboard_message_id = message.id  # noqa: SLF001
+    updater._message = None  # noqa: SLF001
+    updater._ensure_thread = lambda: asyncio.sleep(0)
+    updater._post_alert_events = lambda _results: asyncio.sleep(0)
+    updater._snapshot_payload = lambda: payload
+
+    await asyncio.wait_for(updater._tick(channel), timeout=7.0)  # noqa: SLF001
+
+    assert updater._message is message  # noqa: SLF001
+    assert message.edits == 1
+    assert not channel.sent
+    assert updater._dashboard_messages_reconciled  # noqa: SLF001
 
 
 @pytest.mark.asyncio

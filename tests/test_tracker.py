@@ -30,6 +30,7 @@ from dashboard.maps.tracker import (
 from dashboard.models import EtaKind, Operator
 from dashboard.providers.route_geometry import RouteLine, Stop
 from dashboard.providers.transit import ProbeEta, ProbeEtaSnapshot, ProbeRouteGeneration
+from tests.test_positions import _frame60_kmb91m_estimator_fixture
 
 BASE_TIME = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -1389,6 +1390,54 @@ def _geometry_line(*, stops=11, route="R", bound="out", operator="KMB"):
         [(stop.lat, stop.lon) for stop in route_stops],
         [index * 100.0 for index in range(stops)],
     )
+
+
+@pytest.mark.asyncio
+async def test_estimator_terminal_singleton_lifecycle_is_interior_and_retires():
+    """A complete census must birth and later retire the repaired singleton."""
+    key, line, rows, gates, collected = _frame60_kmb91m_estimator_fixture()
+    estimates = estimate_bus_positions(
+        rows, [line], authoritative_etas=gates,
+        observed_checkpoint_indices={key: {0, 12, 14, 16, 19, 22, 23, 28}},
+        verified_gate_indices={key: 12},
+    )
+    assert len(estimates) == 3
+    terminal = next(item for item in estimates if ("probe", 9) in item.source_observations)
+    assert terminal.position == pytest.approx(22.637, abs=1e-9)
+    assert terminal.position != 28.0
+    assert terminal.position_authoritative is not True
+    assert (28, rows[9].arrival_at.timestamp(), 648) in terminal.checkpoint_evidence
+    tracker = MarkerTracker()
+    observed = frozenset((0, 12, 14, 16, 19, 22, 23, 28))
+    revisions = tuple((index, 648) for index in observed)
+    snapshot = ProbeEtaSnapshot((ProbeRouteGeneration(
+        key, tuple(rows), 685, collected,
+        observed_checkpoint_indices=observed,
+        checkpoint_revisions=revisions,
+    ),), collected)
+    born = await tracker.update(
+        snapshot, [terminal], [line]
+    )
+    assert len(born) == 1
+    track_id = born[0].track_id
+    assert born[0].position == pytest.approx(22.637, abs=1e-9)
+    retained = await tracker.update(
+        ProbeEtaSnapshot((ProbeRouteGeneration(
+            key, tuple(rows), 685, collected + timedelta(seconds=10),
+            observed_checkpoint_indices=observed,
+            checkpoint_revisions=revisions,
+        ),), collected + timedelta(seconds=10)), [terminal], [line]
+    )
+    assert len(retained) == 1
+    assert retained[0].track_id == track_id
+    retired = await tracker.update(
+        ProbeEtaSnapshot((ProbeRouteGeneration(
+            key, (), 728, collected + timedelta(seconds=20),
+            observed_checkpoint_indices=observed,
+            checkpoint_revisions=tuple((index, 728) for index in observed),
+        ),), collected + timedelta(seconds=20)), [], [line]
+    )
+    assert retired == []
 
 
 def _crossed_first_boundary_frames():

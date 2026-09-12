@@ -1,5 +1,6 @@
 """Estimated bus position tests: ladder-collapsed vehicle reconstruction."""
 
+import math
 from collections import Counter
 from copy import copy
 from datetime import UTC, datetime, timedelta
@@ -2735,6 +2736,185 @@ def test_common_stop_headway_correction_is_input_order_independent():
         [line],
     )
     assert sorted(e.position for e in forward) == sorted(e.position for e in reverse)
+
+
+def _kmb91m_singleton_boundary_case():
+    key = ("KMB", "91M", "outbound")
+    singleton = frozenset({("probe", 0)})
+    trailing = frozenset({("probe", 1), ("probe", 2)})
+    middle = frozenset({("probe", 3), ("probe", 4)})
+    records = [
+        (key, 22.637016375, False, singleton),
+        (key, 8.978683041666667, False, trailing),
+        (key, 18.137016375, False, middle),
+    ]
+    evidence = {
+        ("probe", 0): (28, 22.637016375),
+        ("probe", 1): (28, 6.295349708333333),
+        ("probe", 2): (28, 6.295349708333333),
+        ("probe", 3): (28, 15.453683041666668),
+        ("probe", 4): (28, 15.453683041666668),
+    }
+    return key, records, evidence, singleton, trailing, middle
+
+
+def _frame60_kmb91m_estimator_fixture():
+    """Exact distilled frame-60 rows; all three separator components are live."""
+    key = ("KMB", "91M", "outbound")
+    line = _line(*key, stop_count=29)
+    collected_at = datetime(2026, 1, 1, 13, 0, tzinfo=UTC)
+    scheduled = EtaKind.SCHEDULED
+    triples = {
+        0: ((4.109300583333333, scheduled), (19.109300583333333, scheduled), (34.10930058333334, scheduled)),
+        12: ((8.77596725, EtaKind.REALTIME), (22.709300583333334, scheduled), (37.70930058333333, scheduled)),
+        14: ((13.959300583333334, EtaKind.REALTIME), (27.859300583333333, scheduled), (42.85930058333334, scheduled)),
+        28: ((10.72596725, EtaKind.REALTIME), (25.092633916666667, EtaKind.REALTIME), (43.409300583333334, EtaKind.REALTIME)),
+        16: ((0.0, EtaKind.REALTIME), (16.92596725, EtaKind.REALTIME), (30.809300583333332, scheduled)),
+        19: ((1.9093005833333334, EtaKind.REALTIME), (20.392633916666668, EtaKind.REALTIME), (34.259300583333335, scheduled)),
+        22: ((7.72596725, EtaKind.REALTIME), (26.042633916666666, EtaKind.REALTIME), (39.99263391666667, scheduled)),
+        23: ((10.37596725, EtaKind.REALTIME), (28.69263391666667, EtaKind.REALTIME), (42.64263391666667, scheduled)),
+    }
+    rows = []
+    for index in (0, 12, 14, 28, 16, 19, 22, 23):
+        for minutes, kind in triples[index]:
+            signed = -1.67403275 if index == 16 and minutes == 0.0 else minutes
+            rows.append(Probe(*key, index, minutes, kind=kind,
+                              signed_minutes=signed,
+                              arrival_at=collected_at - timedelta(seconds=9.547)
+                              + timedelta(minutes=signed),
+                              cache_age_seconds=9.547, refresh_generation=648))
+    gates = [
+        AuthoritativeProbe(*key, 12, 9, kind=EtaKind.REALTIME,
+                           cache_age_seconds=9.547, refresh_generation=648),
+        AuthoritativeProbe(*key, 12, 23, kind=scheduled,
+                           cache_age_seconds=9.547, refresh_generation=648),
+        AuthoritativeProbe(*key, 12, 38, kind=scheduled,
+                           cache_age_seconds=9.547, refresh_generation=648),
+    ]
+    return key, line, rows, gates, collected_at
+
+
+def test_singleton_anchor_keeps_interior_eta_when_headway_span_is_infeasible():
+    key, records, evidence, singleton, trailing, middle = _kmb91m_singleton_boundary_case()
+    corrected = _separate_common_stop_departures(
+        records, evidence, {key: 28.0}, {key: 12.001}
+    )
+    assert corrected[singleton] == 22.637016375
+    assert corrected[middle] == 18.137016375
+    assert corrected[trailing] == 12.001
+
+
+def test_singleton_boundary_guard_is_input_order_independent():
+    key, records, evidence, singleton, _trailing, _middle = _kmb91m_singleton_boundary_case()
+    forward = _separate_common_stop_departures(
+        records, evidence, {key: 28.0}, {key: 12.001}
+    )
+    reverse = _separate_common_stop_departures(
+        list(reversed(records)), evidence, {key: 28.0}, {key: 12.001}
+    )
+    assert forward == reverse
+    assert forward[singleton] == 22.637016375
+
+
+def test_singleton_boundary_guard_does_not_accept_reversed_baselines():
+    key, records, evidence, singleton, trailing, middle = _kmb91m_singleton_boundary_case()
+    reversed_baselines = [
+        records[0],
+        (key, 18.0, False, trailing),
+        (key, 12.0, False, middle),
+    ]
+    corrected = _separate_common_stop_departures(
+        reversed_baselines, evidence, {key: 28.0}, {key: 12.001}
+    )
+    assert corrected[singleton] != 22.637016375
+    assert corrected[middle] > corrected[trailing]
+    assert corrected[singleton] <= 28.0
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "delta_ulps", "expected_projection"),
+    [("lower", 0, True), ("lower", -1, True), ("lower", -32, False),
+     ("upper", 0, True), ("upper", 1, True), ("upper", 16, False)],
+)
+def test_singleton_boundary_tolerance_selects_projection_or_bounded_baselines(
+    endpoint, delta_ulps, expected_projection,
+):
+    key = ("KMB", "91M", "outbound")
+    singleton = frozenset({("probe", 0)})
+    ahead = frozenset({("probe", 1), ("probe", 3)})
+    behind = frozenset({("probe", 2), ("probe", 4)})
+    if endpoint == "lower":
+        singleton_position = 5.0
+        baselines = [(ahead, 12.0), (singleton, singleton_position), (behind, 1.0)]
+    else:
+        singleton_position = 15.0
+        baselines = [(ahead, 17.0), (singleton, singleton_position), (behind, 1.0)]
+    singleton_position += delta_ulps * math.ulp(singleton_position)
+    records = [(key, position, False, sources) for sources, position in baselines]
+    evidence = {
+        ("probe", 0): (28, 5.0),
+        ("probe", 1): (28, 10.0),
+        ("probe", 2): (28, 0.0),
+        ("probe", 3): (28, 10.0),
+        ("probe", 4): (28, 0.0),
+    }
+    records = [
+        (route, singleton_position if sources == singleton else position, auth, sources)
+        for route, position, auth, sources in records
+    ]
+    corrected = _separate_common_stop_departures(
+        records, evidence, {key: 20.0}, {key: 0.0}
+    )
+    if endpoint == "lower":
+        assert corrected[ahead] == pytest.approx(10.0 if expected_projection else 12.0)
+        assert corrected[behind] == pytest.approx(0.0 if expected_projection else 1.0)
+    else:
+        assert corrected[ahead] == pytest.approx(20.0 if expected_projection else 17.0)
+        assert corrected[behind] == pytest.approx(10.0 if expected_projection else 1.0)
+
+
+def test_full_span_zero_origin_nextafter_stays_on_projection_path():
+    key = ("KMB", "91M", "outbound")
+    ahead = frozenset({("probe", 1), ("probe", 3)})
+    singleton = frozenset({("probe", 0)})
+    behind = frozenset({("probe", 2), ("probe", 4)})
+    singleton_baseline = math.nextafter(22.0, math.inf)
+    corrected = _separate_common_stop_departures(
+        [
+            (key, 30.0, False, ahead),
+            (key, singleton_baseline, False, singleton),
+            (key, 1.0, False, behind),
+        ],
+        {
+            ("probe", 0): (28, 22.0),
+            ("probe", 1): (28, 30.0),
+            ("probe", 2): (28, 0.0),
+            ("probe", 3): (28, 30.0),
+            ("probe", 4): (28, 0.0),
+        },
+        {key: 30.0},
+        {key: 0.0},
+    )
+    assert corrected[ahead] == pytest.approx(30.0)
+    assert corrected[singleton] == pytest.approx(singleton_baseline)
+    assert corrected[behind] == pytest.approx(0.0)
+
+
+def test_frame60_trace_keeps_kmb91m_terminal_singleton_at_eta_position():
+    key, line, rows, gates, _collected_at = _frame60_kmb91m_estimator_fixture()
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        authoritative_etas=gates,
+        observed_checkpoint_indices={key: {0, 12, 14, 16, 19, 22, 23, 28}},
+        verified_gate_indices={key: 12},
+    )
+    assert len(estimates) == 3
+    terminal = next(estimate for estimate in estimates if ("probe", 9) in estimate.source_observations)
+    assert terminal.position == pytest.approx(22.637, abs=1e-9)
+    assert terminal.position != 28.0
+    assert terminal.position_authoritative is not True
+    assert terminal.source_observations == frozenset({("probe", 9)})
 
 
 def test_close_common_stop_departures_are_not_forced_apart():

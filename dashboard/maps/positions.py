@@ -2045,6 +2045,7 @@ def _separate_common_stop_departures(
         singleton_anchors = [
             sources for sources in component if len(sources) == 1
         ]
+        anchor = None
         if singleton_anchors and max(
             baseline[sources] for sources in singleton_anchors
         ) < maximum - 1.0:
@@ -2052,7 +2053,43 @@ def _separate_common_stop_departures(
             origin = baseline[anchor] - scaled_distance[anchor]
         else:
             origin = median(residuals)
-        origin = min(max(minimum, origin), maximum - span)
+        lower_origin = minimum
+        upper_origin = maximum - span
+        # An independent singleton is a source-backed coordinate, rather than
+        # merely a rung to be translated with the rest of the component.  If
+        # its preferred origin is genuinely outside the feasible interval,
+        # preserve the independently bounded baselines when they still retain
+        # every proved direction.  This avoids moving a live singleton all the
+        # way to the terminus solely because a collapsed ladder is too wide.
+        ulp_operands = (
+            origin, lower_origin, upper_origin,
+            baseline[anchor] if anchor is not None else 0.0,
+            scaled_distance[anchor] if anchor is not None else 0.0,
+            maximum, span,
+        )
+        ulp_scale = max(
+            1.0,
+            *(abs(value) for value in ulp_operands if math.isfinite(value)),
+        )
+        boundary_tolerance = 4.0 * math.ulp(ulp_scale)
+        origin_outside = (
+            origin < lower_origin - boundary_tolerance
+            or origin > upper_origin + boundary_tolerance
+        )
+        if anchor is not None and origin_outside:
+            bounded_baseline = {
+                sources: min(max(lower_origin, baseline[sources]), maximum)
+                for sources in component
+            }
+            if all(
+                bounded_baseline[ahead] > bounded_baseline[behind]
+                for ahead in directed
+                for behind in directed[ahead]
+                if ahead in bounded_baseline and behind in bounded_baseline
+            ):
+                adjusted.update(bounded_baseline)
+                continue
+        origin = min(max(lower_origin, origin), upper_origin)
         for sources in component:
             position = origin + scaled_distance[sources]
             # The algebra is bounded to [0, maximum], but the leading vehicle

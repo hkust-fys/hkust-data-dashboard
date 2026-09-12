@@ -11,12 +11,13 @@ import asyncio
 import io
 import logging
 from datetime import datetime
+from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from PIL import Image, UnidentifiedImageError
 
-from dashboard.http import CachedFetch, HttpClient, as_datetime
+from dashboard.http import CachedFetch, FetchError, HttpClient, as_datetime
 from dashboard.models import WeatherSnapshot, WeatherWarning
 
 log = logging.getLogger(__name__)
@@ -38,11 +39,12 @@ OBS_TTL_SECONDS = 600.0  # 10 minutes
 WARN_TTL_SECONDS = 60.0  # 1 minute
 WARN_INFO_TTL_SECONDS = 300.0
 
-# wxwarntoday supplies both the authoritative display metadata and the icon
-# path. Keep the host fixed while allowing only the source-provided path.
-HKO_ORIGIN = "https://www.hko.gov.hk/"
+# wxwarntoday supplies authoritative display metadata; the warning details
+# page supplies the static PNG catalog used for icons.
 WARNTODAY_URL = "https://www.hko.gov.hk/wxinfo/dailywx/wxwarntoday.json"
 WARNTODAY_TTL_SECONDS = 5 * 60.0
+WARNING_DETAILS_URL = "https://www.hko.gov.hk/en/wservice/warning/details.htm"
+WARNING_DETAILS_TTL_SECONDS = 24 * 60 * 60.0
 _warning_icon_cache: dict[str, bytes] = {}
 _WARNING_ICON_MAX_BYTES = 256 * 1024
 
@@ -110,27 +112,102 @@ def _pre_no8_from_warning_info(warning_info: dict[str, Any] | None) -> WeatherWa
     return None
 
 
-def _warning_metadata_from_warntoday(raw: dict[str, Any]) -> dict[str, tuple[str, str]]:
+def _normalize_warning_label(value: Any) -> str:
+    return "".join(char for char in str(value or "").casefold() if char.isalnum())
+
+
+def _is_static_warning_png_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "www.hko.gov.hk"
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path.startswith("/en/textonly/img/warn/images/")
+        and parsed.path.casefold().endswith(".png")
+    )
+
+
+class _WarningCatalogParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entries: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() != "img":
+            return
+        values = dict(attrs)
+        alt, src = values.get("alt"), values.get("src")
+        if not alt or not src:
+            return
+        url = urljoin(WARNING_DETAILS_URL, src)
+        if _is_static_warning_png_url(url):
+            self.entries.append((_normalize_warning_label(alt), url))
+
+
+def _warning_catalog_from_html(html: str) -> dict[str, str]:
+    """Return unambiguous normalized alt labels to official static PNG URLs."""
+    parser = _WarningCatalogParser()
+    parser.feed(html)
+    grouped: dict[str, set[str]] = {}
+    for label, url in parser.entries:
+        if label:
+            grouped.setdefault(label, set()).add(url)
+    catalog = {
+        label: next(iter(urls))
+        for label, urls in grouped.items()
+        if len(urls) == 1
+    }
+    return catalog
+
+
+def _require_warning_catalog(html: str) -> None:
+    if not _warning_catalog_from_html(html):
+        raise FetchError("HKO warning details contained no usable static PNG catalog")
+
+
+def _warning_static_icon(
+    entry: dict[str, Any],
+    catalog: dict[str, str] | None,
+) -> str:
+    if not catalog:
+        return ""
+    names = (
+        entry.get("WarningName"),
+        entry.get("warningName"),
+        _source_warning_name(
+            entry.get("Type") or entry.get("type"),
+            entry.get("WarningName") or entry.get("warningName"),
+            "",
+        ),
+    )
+    for name in names:
+        icon = catalog.get(_normalize_warning_label(name))
+        if icon and _is_static_warning_png_url(icon):
+            return icon
+    return ""
+
+
+def _warning_metadata_from_warntoday(
+    raw: dict[str, Any],
+    catalog: dict[str, str] | None = None,
+) -> dict[str, tuple[str, str]]:
     """Build canonical-code -> (official name, official icon URL)."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("WARNING_DATABASE"), list):
+        return {}
     metadata: dict[str, tuple[str, str]] = {}
     for entry in raw.get("WARNING_DATABASE") or []:
         if not isinstance(entry, dict):
             continue
         code = entry.get("WarningCode")
-        source_name = str(entry.get("WarningName") or entry.get("warningName") or "").strip()
+        source_name = str(
+            entry.get("WarningName") or entry.get("warningName") or ""
+        ).strip()
         warning_type = str(entry.get("Type") or entry.get("type") or "").strip()
-        icon = str(entry.get("Icon") or entry.get("icon") or "").strip()
         if not code:
             continue
         name = _source_warning_name(warning_type, source_name, str(code))
-        # Accept only an origin-relative path.  A protocol-relative value such
-        # as ``//example.invalid/icon.gif`` would otherwise escape HKO through
-        # ``urljoin``.
-        icon_url = (
-            urljoin(HKO_ORIGIN, icon)
-            if icon.startswith("/") and not icon.startswith("//")
-            else ""
-        )
+        icon_url = _warning_static_icon(entry, catalog)
         metadata[str(code)] = (name, icon_url)
     return metadata
 
@@ -157,8 +234,32 @@ def _icon_urls_from_warntoday(raw: dict[str, Any]) -> dict[str, str]:
 
 def _warning_icon_url(code: str, icon_map: dict[str, str] | None = None) -> str:
     if icon_map:
-        return icon_map.get(code, "")
+        icon = icon_map.get(code)
+        if icon is not None and _is_static_warning_png_url(icon):
+            return icon
+        # HKO's live warnsum code can identify a family while wxwarntoday
+        # appends a subtype (for example WMSGNL_MONSOON).  Use that fallback
+        # only when the metadata key is unambiguous; a guessed icon is worse
+        # than no icon when several variants are published.
+        candidates = [value for key, value in icon_map.items() if key.startswith(f"{code}_")]
+        if len(candidates) == 1 and _is_static_warning_png_url(candidates[0]):
+            return candidates[0]
     return ""
+
+
+def _warning_metadata_entry(
+    code: str, warning_metadata: dict[str, tuple[str, str]] | None
+) -> tuple[str, str]:
+    """Resolve exact HKO metadata, or one unambiguous code-subtype entry."""
+    if not warning_metadata:
+        return "", ""
+    exact = warning_metadata.get(code)
+    if exact is not None:
+        return exact
+    candidates = [
+        value for key, value in warning_metadata.items() if key.startswith(f"{code}_")
+    ]
+    return candidates[0] if len(candidates) == 1 else ("", "")
 
 
 def _warning_info_map(warning_info: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -278,7 +379,7 @@ def parse_warnings(
         if not isinstance(payload, dict) or not payload:
             continue
         code = str(payload.get("code") or family)
-        metadata_name, source_icon = (warning_metadata or {}).get(code, ("", ""))
+        metadata_name, source_icon = _warning_metadata_entry(code, warning_metadata)
         live_name = _source_warning_name(
             payload.get("type") or payload.get("Type"),
             payload.get("name") or payload.get("Name"),
@@ -329,8 +430,9 @@ async def _fetch_warning_icons(
 ) -> None:
     """Attach cached official icon bytes for the renderer's composite image."""
     async def load(warning: WeatherWarning) -> None:
-        parsed = urlparse(warning.icon_url)
-        if parsed.scheme != "https" or parsed.hostname != "www.hko.gov.hk":
+        if (
+            not _is_static_warning_png_url(warning.icon_url)
+        ):
             return
         cached = _warning_icon_cache.get(warning.icon_url)
         if cached is not None:
@@ -356,35 +458,18 @@ async def _fetch_warning_icons(
 
 
 def _normalize_warning_icon(data: bytes) -> bytes | None:
-    """Return one deterministic, static PNG frame from an HKO icon.
+    """Validate and return one deterministic static PNG from the HKO catalog.
 
-    HKO publishes blinking GIFs whose blank frame must not become the
-    dashboard's thumbnail.  Score every frame by the amount of visible
-    foreground (alpha coverage and contrast against its corner background),
-    retaining the earliest frame on ties for deterministic output.
+    The catalog is static PNG-only; reject animated or other source formats.
     """
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
     with Image.open(io.BytesIO(data)) as source:
-        best: tuple[int, int, Image.Image] | None = None
-        frame_count = getattr(source, "n_frames", 1)
-        for index in range(frame_count):
-            source.seek(index)
-            frame = source.convert("RGBA")
-            pixels = frame.load()
-            background = pixels[0, 0]
-            foreground = 0
-            for pixel in frame.getdata():
-                if pixel[3] and (pixel[:3] != background[:3] or pixel[3] != background[3]):
-                    foreground += 1
-            # Alpha coverage breaks ties for flat-colour icons; foreground
-            # contrast is the primary signal for blink/blank frames.
-            score = foreground * 2 + sum(1 for pixel in frame.getdata() if pixel[3])
-            candidate = (score, -index, frame.copy())
-            if best is None or candidate[:2] > best[:2]:
-                best = candidate
-        if best is None:
+        if getattr(source, "n_frames", 1) != 1:
             return None
+        frame = source.convert("RGBA")
         output = io.BytesIO()
-        best[2].save(output, format="PNG", optimize=True)
+        frame.save(output, format="PNG", optimize=True)
     normalized = output.getvalue()
     return normalized if normalized and len(normalized) <= _WARNING_ICON_MAX_BYTES else None
 
@@ -395,6 +480,7 @@ async def fetch_weather_conditions(
     warn_spec: CachedFetch | None = None,
     warn_info_spec: CachedFetch | None = None,
     warntoday_spec: CachedFetch | None = None,
+    details_spec: CachedFetch | None = None,
 ) -> tuple[WeatherSnapshot | None, list[WeatherWarning], datetime | None]:
     """Fetch observations and warnings concurrently (via the shared cache).
 
@@ -408,6 +494,9 @@ async def fetch_weather_conditions(
     )
     warntoday_spec = warntoday_spec or CachedFetch(
         WARNTODAY_URL, WARNTODAY_TTL_SECONDS, cache_key="warntoday"
+    )
+    details_spec = details_spec or CachedFetch(
+        WARNING_DETAILS_URL, WARNING_DETAILS_TTL_SECONDS, cache_key="warning-details"
     )
 
     snapshot: WeatherSnapshot | None = None
@@ -439,11 +528,23 @@ async def fetch_weather_conditions(
             log.warning("HKO warningInfo fetch failed: %s", exc)
 
     warning_metadata: dict[str, tuple[str, str]] = {}
-    try:
-        _, warntoday_raw, _ = await client.fetch_json_cached(warntoday_spec)
-        warning_metadata = _warning_metadata_from_warntoday(warntoday_raw or {})
-    except Exception as exc:  # noqa: BLE001
-        log.warning("HKO wxwarntoday fetch failed (icons fall back to text): %s", exc)
+    metadata_result, catalog_result = await asyncio.gather(
+        client.fetch_json_cached(warntoday_spec),
+        client.fetch_html_cached(details_spec, validator=_require_warning_catalog),
+        return_exceptions=True,
+    )
+    warntoday_raw: dict[str, Any] = {}
+    if isinstance(metadata_result, Exception):
+        log.warning("HKO wxwarntoday fetch failed (icons fall back to text): %s", metadata_result)
+    else:
+        _, warntoday_raw, _ = metadata_result
+    catalog: dict[str, str] = {}
+    if isinstance(catalog_result, Exception):
+        log.warning("HKO warning details fetch failed (icons unavailable): %s", catalog_result)
+    else:
+        _, details_html, _ = catalog_result
+        catalog = _warning_catalog_from_html(details_html)
+    warning_metadata = _warning_metadata_from_warntoday(warntoday_raw, catalog)
 
     if warn_raw:
         warnings = parse_warnings(warn_raw, info_raw, warning_metadata=warning_metadata)

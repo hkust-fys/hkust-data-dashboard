@@ -171,7 +171,14 @@ class HttpClient:
                 await asyncio.sleep(delay)
             self._origin_next_request[origin] = loop.time() + interval
 
-    async def _request_bytes(self, url: str, headers: dict[str, str] | None) -> bytes:
+    async def _request_bytes(
+        self,
+        url: str,
+        headers: dict[str, str] | None,
+        *,
+        allow_html: bool = False,
+        max_bytes: int = MAX_BYTES_IMAGE,
+    ) -> bytes:
         """GET with bounded size; raises FetchError on bad status/content-type."""
         last_started_error: Exception | None = None
         for attempt in range(1, self.retry_attempts + 1):
@@ -187,13 +194,15 @@ class HttpClient:
                             f"HTTP {resp.status} for {url}", status_code=resp.status
                         )
                     ct = resp.headers.get("Content-Type", "")
-                    if not ct or ct.lower().startswith("text/html"):
+                    content_type = ct.lower()
+                    is_html = content_type.startswith(("text/html", "application/xhtml+xml"))
+                    if not ct or (allow_html and not is_html) or (is_html and not allow_html):
                         # Some providers send HTML error pages on failure; treat as error.
                         raise FetchError(f"Unexpected content type {ct!r} for {url}")
                     # read() decompresses gzip and returns the full body;
                     # a bounded read() would truncate it.
                     data = await resp.read()
-                    if len(data) > MAX_BYTES_IMAGE:
+                    if len(data) > max_bytes:
                         raise FetchError(f"Response too large for {url}")
                     return data
             except RequestNotStarted:
@@ -229,7 +238,7 @@ class HttpClient:
         headers: dict[str, str] | None = None,
         max_bytes: int = MAX_BYTES_IMAGE,
     ) -> bytes:
-        data = await self._request_bytes(url, headers)
+        data = await self._request_bytes(url, headers, max_bytes=max_bytes)
         if len(data) > max_bytes:
             raise FetchError(f"Response too large for {url}")
         return data
@@ -241,6 +250,16 @@ class HttpClient:
         max_bytes: int = MAX_BYTES_TEXT,
     ) -> str:
         data = await self.fetch_bytes(url, headers, max_bytes)
+        return data.decode("utf-8", errors="replace")
+
+    async def fetch_html(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        max_bytes: int = MAX_BYTES_TEXT,
+    ) -> str:
+        """Fetch bounded HTML explicitly; ordinary API fetches still reject it."""
+        data = await self._request_bytes(url, headers, allow_html=True, max_bytes=max_bytes)
         return data.decode("utf-8", errors="replace")
 
     async def fetch_json(
@@ -367,6 +386,33 @@ class HttpClient:
             lambda url: self.fetch_text(url, headers, max_bytes),
             **url_kwargs,
         )
+
+    async def fetch_html_cached(
+        self,
+        spec: CachedFetch,
+        headers: dict[str, str] | None = None,
+        max_bytes: int = MAX_BYTES_TEXT,
+        validator: Callable[[str], None] | None = None,
+        **url_kwargs: Any,
+    ) -> tuple[bool, str, float]:
+        """Cached bounded HTML with stale-on-error fallback."""
+        return await self._fetch_cached(
+            spec,
+            lambda url: self._fetch_validated_html(url, headers, max_bytes, validator),
+            **url_kwargs,
+        )
+
+    async def _fetch_validated_html(
+        self,
+        url: str,
+        headers: dict[str, str] | None,
+        max_bytes: int,
+        validator: Callable[[str], None] | None,
+    ) -> str:
+        value = await self.fetch_html(url, headers, max_bytes)
+        if validator is not None:
+            validator(value)
+        return value
 
     async def fetch_xml_text_cached(
         self,

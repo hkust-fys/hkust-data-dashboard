@@ -111,6 +111,61 @@ async def test_fetch_text_cached_uses_ttl_and_stale_on_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fetch_html_explicitly_allows_html_but_api_text_rejects_it():
+    class Response:
+        status = 200
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def read(self):
+            return b"<html><img alt='STRONG MONSOON SIGNAL'></html>"
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    client = HttpClient(Session(), retry_attempts=1, origin_request_interval_seconds=0)
+    assert "STRONG MONSOON" in await client.fetch_html("https://example.test/details")
+    with pytest.raises(FetchError, match="Unexpected content type"):
+        await client.fetch_text("https://example.test/details")
+    Response.headers = {"Content-Type": "application/xhtml+xml"}
+    assert "STRONG MONSOON" in await client.fetch_html("https://example.test/details")
+    with pytest.raises(FetchError, match="Unexpected content type"):
+        await client.fetch_text("https://example.test/details")
+
+
+@pytest.mark.asyncio
+async def test_fetch_html_cached_validator_keeps_last_good_catalog(monkeypatch):
+    client = HttpClient(object(), retry_attempts=1)
+    values = ["<img>", "invalid", "invalid"]
+
+    async def fetch_html(_url, _headers=None, _max_bytes=None):
+        return values.pop(0)
+
+    def require_catalog(value):
+        if value != "<img>":
+            raise FetchError("invalid catalog")
+
+    monkeypatch.setattr(client, "fetch_html", fetch_html)
+    spec = CachedFetch("https://example.test/details", ttl=60, cache_key="details")
+    stale, value, _ = await client.fetch_html_cached(spec, validator=require_catalog)
+    assert not stale and value == "<img>"
+    client.cache._store["details"].fetched_at = 0  # noqa: SLF001
+    stale, value, _ = await client.fetch_html_cached(spec, validator=require_catalog)
+    assert stale and value == "<img>"
+
+    fresh_client = HttpClient(object(), retry_attempts=1)
+    monkeypatch.setattr(fresh_client, "fetch_html", fetch_html)
+    with pytest.raises(FetchError, match="invalid catalog"):
+        await fresh_client.fetch_html_cached(spec, validator=require_catalog)
+
+
+@pytest.mark.asyncio
 async def test_fetch_raises_when_no_cached_value(monkeypatch):
     client = HttpClient(object(), retry_attempts=1)
 

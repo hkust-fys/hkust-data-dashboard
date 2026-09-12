@@ -11,6 +11,7 @@ from dashboard.models import WeatherWarning
 from dashboard.providers.weather import (
     _fetch_warning_icons,
     _normalize_warning_icon,
+    _warning_catalog_from_html,
     _warning_icon_cache,
     _warning_metadata_from_warntoday,
     parse_observations,
@@ -123,16 +124,56 @@ def test_parse_warning_issued_time_does_not_use_later_update_time():
 
 
 def test_live_wrain_uses_payload_code_and_official_metadata():
-    metadata = _warning_metadata_from_warntoday(s.hko_warntoday_wrain())
+    catalog = _warning_catalog_from_html(
+        '<img alt="AMBER RAINSTORM WARNING SIGNAL" src="/en/textonly/img/warn/images/rainamber.png">'
+    )
+    metadata = _warning_metadata_from_warntoday(s.hko_warntoday_wrain(), catalog)
     warnings = parse_warnings(
         s.hko_warnsum_wrain_live(), s.hko_warning_info_list(), warning_metadata=metadata
     )
     assert len(warnings) == 1
     assert warnings[0].code == "WRAINA"
     assert warnings[0].name == "Amber Rainstorm Warning Signal"
-    assert warnings[0].icon_url == "https://www.hko.gov.hk/images_e/raina.gif"
+    assert warnings[0].icon_url == "https://www.hko.gov.hk/en/textonly/img/warn/images/rainamber.png"
     assert "WRAIN" not in warnings[0].name
     assert warnings[0].summary == ""
+
+
+def test_live_strong_monsoon_code_resolves_unique_subtype_metadata_icon():
+    catalog = _warning_catalog_from_html(
+        '<img alt="STRONG MONSOON SIGNAL" src="../../../en/textonly/img/warn/images/sms.png">'
+    )
+    metadata = _warning_metadata_from_warntoday(s.hko_warntoday_monsoon(), catalog)
+    warnings = parse_warnings(
+        s.hko_warnsum_monsoon_live(), warning_metadata=metadata
+    )
+    assert warnings[0].code == "WMSGNL"
+    assert warnings[0].icon_url == "https://www.hko.gov.hk/en/textonly/img/warn/images/sms.png"
+
+
+def test_warning_metadata_prefix_fallback_rejects_ambiguous_variants():
+    warnings = parse_warnings(
+        {"WMSGNL": {"code": "WMSGNL"}},
+        warning_metadata={
+            "WMSGNL_MONSOON": ("Monsoon", "https://www.hko.gov.hk/images_e/msn.gif"),
+            "WMSGNL_OTHER": ("Other", "https://www.hko.gov.hk/images_e/other.gif"),
+        },
+    )
+    assert warnings[0].icon_url == ""
+
+
+def test_warning_catalog_rejects_unsafe_and_ambiguous_images():
+    catalog = _warning_catalog_from_html(
+        '<img alt="safe" src="/en/textonly/img/warn/images/safe.png">'
+        '<img alt="bad" src="https://evil.example/bad.png">'
+        '<img alt="jpg" src="/en/textonly/img/warn/images/jpg.gif">'
+        '<img alt="dup" src="/en/textonly/img/warn/images/a.png">'
+        '<img alt="DUP" src="/en/textonly/img/warn/images/b.png">'
+    )
+    assert catalog["safe"] == "https://www.hko.gov.hk/en/textonly/img/warn/images/safe.png"
+    assert "bad" not in catalog
+    assert "jpg" not in catalog
+    assert "dup" not in catalog
 
 
 def test_warning_info_only_entry_does_not_become_active():
@@ -168,13 +209,18 @@ def test_warntoday_rejects_protocol_relative_icon_url():
     assert metadata["WTS"][1] == ""
 
 
+def test_warntoday_metadata_malformed_payload_fails_softly():
+    assert _warning_metadata_from_warntoday(None) == {}  # type: ignore[arg-type]
+    assert _warning_metadata_from_warntoday({"WARNING_DATABASE": {}}) == {}
+
+
 @pytest.mark.asyncio
 async def test_warning_icon_bytes_are_fetched_once_and_cached():
     class Client:
         calls = 0
 
         async def fetch_bytes(self, url, max_bytes):
-            assert url == "https://www.hko.gov.hk/images_e/raina.gif"
+            assert url == "https://www.hko.gov.hk/en/textonly/img/warn/images/rainamber.png"
             assert max_bytes == 256 * 1024
             self.calls += 1
             output = io.BytesIO()
@@ -185,11 +231,11 @@ async def test_warning_icon_bytes_are_fetched_once_and_cached():
     client = Client()
     first = WeatherWarning(
         "WRAINA", "Amber Rainstorm Warning Signal",
-        icon_url="https://www.hko.gov.hk/images_e/raina.gif",
+        icon_url="https://www.hko.gov.hk/en/textonly/img/warn/images/rainamber.png",
     )
     second = WeatherWarning(
         "WRAINA", "Amber Rainstorm Warning Signal",
-        icon_url="https://www.hko.gov.hk/images_e/raina.gif",
+        icon_url="https://www.hko.gov.hk/en/textonly/img/warn/images/rainamber.png",
     )
 
     await _fetch_warning_icons(client, [first])
@@ -200,10 +246,10 @@ async def test_warning_icon_bytes_are_fetched_once_and_cached():
     assert client.calls == 1
 
 
-def test_normalize_warning_gif_selects_visible_frame_and_writes_static_png():
-    frames = [Image.new("RGBA", (8, 8), (255, 255, 255, 0)), Image.new("RGBA", (8, 8), (255, 0, 0, 255))]
+def test_normalize_warning_png_writes_static_png():
+    frames = [Image.new("RGBA", (8, 8), (255, 0, 0, 255))]
     output = io.BytesIO()
-    frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0, disposal=2)
+    frames[0].save(output, format="PNG")
 
     normalized = _normalize_warning_icon(output.getvalue())
 
@@ -216,22 +262,28 @@ def test_normalize_warning_gif_selects_visible_frame_and_writes_static_png():
 
 
 @pytest.mark.asyncio
-async def test_warning_gif_is_cached_as_static_png():
+async def test_warning_gif_is_rejected_without_fetching():
     frames = [Image.new("RGBA", (8, 8), (255, 255, 255, 0)), Image.new("RGBA", (8, 8), (0, 0, 255, 255))]
     output = io.BytesIO()
     frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0, disposal=2)
     payload = output.getvalue()
+    assert _normalize_warning_icon(payload) is None
+    assert _normalize_warning_icon(b"not-a-png") is None
 
     class Client:
+        calls = 0
+
         async def fetch_bytes(self, _url, max_bytes):
             assert max_bytes == 256 * 1024
+            self.calls += 1
             return payload
 
     _warning_icon_cache.clear()
+    client = Client()
     warning = WeatherWarning("WTS", "Thunderstorm Warning", icon_url="https://www.hko.gov.hk/images_e/ts.gif")
-    await _fetch_warning_icons(Client(), [warning])
-    assert warning.icon_data.startswith(b"\x89PNG")
-    assert b"GIF" not in warning.icon_data[:16]
+    await _fetch_warning_icons(client, [warning])
+    assert warning.icon_data == b""
+    assert client.calls == 0
 
 
 @pytest.mark.asyncio
@@ -252,11 +304,11 @@ async def test_invalid_warning_icon_is_not_cached_and_retries():
     client = Client()
     first = WeatherWarning(
         "WRAINA", "Amber Rainstorm Warning Signal",
-        icon_url="https://www.hko.gov.hk/images_e/raina.gif",
+        icon_url="https://www.hko.gov.hk/en/textonly/img/warn/images/rainamber.png",
     )
     second = WeatherWarning(
         "WRAINA", "Amber Rainstorm Warning Signal",
-        icon_url="https://www.hko.gov.hk/images_e/raina.gif",
+        icon_url="https://www.hko.gov.hk/en/textonly/img/warn/images/rainamber.png",
     )
 
     await _fetch_warning_icons(client, [first])
@@ -273,7 +325,7 @@ async def test_warning_icon_fetch_rejects_non_hko_but_accepts_minor_warning():
         calls = 0
 
         async def fetch_bytes(self, url, max_bytes):
-            assert url == "https://www.hko.gov.hk/images_e/ts.gif"
+            assert url == "https://www.hko.gov.hk/en/textonly/img/warn/images/ts.png"
             assert max_bytes == 256 * 1024
             self.calls += 1
             output = io.BytesIO()
@@ -283,7 +335,7 @@ async def test_warning_icon_fetch_rejects_non_hko_but_accepts_minor_warning():
     warnings = [
         WeatherWarning("WRAINA", "Rain", icon_url="https://evil.example/rain.gif"),
         WeatherWarning(
-            "WTS", "Thunderstorm", icon_url="https://www.hko.gov.hk/images_e/ts.gif"
+            "WTS", "Thunderstorm", icon_url="https://www.hko.gov.hk/en/textonly/img/warn/images/ts.png"
         ),
     ]
 

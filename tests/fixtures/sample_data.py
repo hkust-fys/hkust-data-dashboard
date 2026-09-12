@@ -234,6 +234,25 @@ def hko_warntoday_wrain() -> dict:
     }
 
 
+def hko_warnsum_monsoon_live() -> dict:
+    """Live-shaped monsoon warning: warnsum code lacks metadata suffix."""
+    return {"WMSGNL": {
+        "code": "WMSGNL", "name": "Strong Monsoon Signal", "type": "",
+        "issueTime": utc().isoformat(), "updateTime": utc().isoformat(),
+    }}
+
+
+def hko_warntoday_monsoon() -> dict:
+    return {
+        "WARNING_DATABASE": [{
+            "WarningCode": "WMSGNL_MONSOON",
+            "WarningName": "Strong Monsoon Signal",
+            "Type": "",
+            "Icon": "/images_e/msn.gif",
+        }]
+    }
+
+
 def weather_snapshot() -> WeatherSnapshot:
     return WeatherSnapshot(
         temperature_c=28.5, rainfall_mm=0.0, humidity_pct=71, source_time=utc()

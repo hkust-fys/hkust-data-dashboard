@@ -2129,11 +2129,13 @@ class DashboardUpdater:
             if not self._dashboard_send_retry_ready:
                 # A failed scan, unresolved cleanup, or expired nonce window
                 # cannot authorize another possibly creating request.
-                return
-            self._message = await self._retry_uncertain_dashboard_send(
-                channel,
-                payload,
-            )
+                if self._message is None:
+                    return
+            else:
+                self._message = await self._retry_uncertain_dashboard_send(
+                    channel,
+                    payload,
+                )
         elif self._rollover_uncertain_since is not None:
             # Legacy timestamp-only state still requires one successful scan.
             return
@@ -2252,6 +2254,12 @@ class DashboardUpdater:
                 self._last_good_payload = payload
         except Exception as exc:  # noqa: BLE001
             log.warning("edit failed (keeping last good): %s", exc)
+
+        # An unresolved send may reuse a known canonical for ordinary edits,
+        # but cannot run status/alert side effects until reconciliation proves
+        # which wire attempt owns the dashboard.
+        if self._dashboard_send_nonce is not None and not self._dashboard_messages_reconciled:
+            return
 
         # status thread + alerts (create the thread after the message exists)
         if self._dashboard_messages_reconciled:

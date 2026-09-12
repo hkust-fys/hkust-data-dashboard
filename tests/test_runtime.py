@@ -1962,6 +1962,155 @@ async def test_persisted_dashboard_startup_fetch_history_then_edits_once(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_expired_nonce_known_canonical_allows_edit_only_and_deduplicates(
+    tmp_path,
+):
+    import bot as bot_module
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    message = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=321
+    )
+    channel = _FakeChannel([message])
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "dashboard_message_id": message.id,
+            "dashboard_send_nonce": 123,
+            "dashboard_send_predecessor_id": 111,
+            "rollover_uncertain_since": 1.0,
+        },
+    )
+    first = DashboardPayload(files=[ImageAsset("map.png", b"first")])
+    second = DashboardPayload(files=[ImageAsset("map.png", b"second")])
+    payloads = iter((first, second, second))
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    updater._snapshot_payload = lambda: next(payloads)
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("unresolved nonce must remain edit-only")
+
+    updater._ensure_thread = forbidden
+    updater._post_alert_events = forbidden
+    updater._process_alert_snapshot = forbidden
+
+    await updater._tick(channel)  # noqa: SLF001
+    await updater._tick(channel)  # noqa: SLF001
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert message.edits == 2
+    assert not channel.sent
+    assert updater._dashboard_send_nonce == 123  # noqa: SLF001
+    assert updater._dashboard_send_predecessor_id == 111  # noqa: SLF001
+    assert updater._rollover_uncertain_since == 1.0  # noqa: SLF001
+    assert not updater._dashboard_messages_reconciled  # noqa: SLF001
+    assert not updater._pending_dashboard_delete_ids  # noqa: SLF001
+    persisted = bot_module._load_dashboard_runtime_state(settings)  # noqa: SLF001
+    assert persisted["dashboard_message_id"] == message.id
+    assert persisted["dashboard_send_nonce"] == 123
+    assert persisted["dashboard_send_predecessor_id"] == 111
+
+
+@pytest.mark.asyncio
+async def test_expired_nonce_failed_history_edits_known_fallback_only(tmp_path):
+    import bot as bot_module
+
+    class FailedHistoryChannel(_FakeChannel):
+        async def history(self, **_kwargs):
+            raise RuntimeError("history temporarily unavailable")
+            yield  # pragma: no cover
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    message = _FakeMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=321
+    )
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "dashboard_message_id": message.id,
+            "dashboard_send_nonce": 123,
+            "dashboard_send_predecessor_id": 111,
+            "rollover_uncertain_since": 1.0,
+        },
+    )
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._message = message  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    updater._snapshot_payload = lambda: DashboardPayload(
+        files=[ImageAsset("map.png", b"fallback")]
+    )
+    updater._ensure_thread = lambda: (_ for _ in ()).throw(
+        AssertionError("thread must remain suppressed")
+    )
+    updater._process_alert_snapshot = lambda: (_ for _ in ()).throw(
+        AssertionError("alerts must remain suppressed")
+    )
+    channel = FailedHistoryChannel([message])
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert updater._message is message  # noqa: SLF001
+    assert message.edits == 1
+    assert not channel.sent
+    assert updater._dashboard_send_nonce == 123  # noqa: SLF001
+    assert not updater._dashboard_messages_reconciled  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("edit failed"),
+        type("Missing", (Exception,), {"status": 404})(),
+        type("Unknown", (Exception,), {"code": 30046})(),
+    ],
+)
+async def test_expired_nonce_edit_failure_cannot_rollover_or_send(tmp_path, failure):
+    import bot as bot_module
+
+    class FailingMessage(_FakeMessage):
+        async def edit(self, **_kwargs):
+            raise failure
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    message = FailingMessage(
+        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=321
+    )
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "dashboard_message_id": message.id,
+            "dashboard_send_nonce": 123,
+            "dashboard_send_predecessor_id": 111,
+            "rollover_uncertain_since": 1.0,
+        },
+    )
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._message = message  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    updater._last_payload_fingerprint = "old-fingerprint"  # noqa: SLF001
+    updater._snapshot_payload = lambda: DashboardPayload(
+        files=[ImageAsset("map.png", b"new")]
+    )
+    channel = _FakeChannel([message])
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert not channel.sent
+    assert updater._last_payload_fingerprint == "old-fingerprint"  # noqa: SLF001
+    assert updater._dashboard_send_nonce == 123  # noqa: SLF001
+    assert updater._rollover_uncertain_since == 1.0  # noqa: SLF001
+    assert not updater._dashboard_messages_reconciled  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_first_rollover_captures_existing_status_thread(monkeypatch, tmp_path):
     import bot as bot_module
 

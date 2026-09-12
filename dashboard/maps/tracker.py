@@ -6,7 +6,7 @@ import asyncio
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from math import inf, isfinite
+from math import inf, isfinite, nextafter
 
 from dashboard.maps.positions import (
     LIVE_PROBE_ETA_KINDS,
@@ -62,6 +62,9 @@ class _Track:
     # this identity's route order. A later timetable-only cohort cannot erase
     # that historical position authority.
     position_authoritative: bool = False
+    # Current-source metadata may refresh without committing a motion boundary.
+    # Keep its per-stop high-water marks even when a later bundle omits a stop.
+    metadata_revision_floors: dict[int, int] = field(default_factory=dict)
 
 
 def _key(item):
@@ -616,6 +619,15 @@ class MarkerTracker:
                 # rows. Refresh matched tracks, but never alter cardinality
                 # until a newer complete generation arrives.
                 ownership_cache = {}
+                reservations, blocked_old, blocked_new = _same_generation_identity_plan(
+                    old, rows, now,
+                )
+                reserved_old = dict(reservations)
+                reserved_candidates = {id(rows[index]): owner for owner, index in reservations}
+                blocked_candidates = {id(rows[index]) for index in blocked_new}
+                old_indices = {track.track_id: index for index, track in enumerate(old)}
+                if blocked_old or blocked_new:
+                    self._lifecycle_refresh_routes.add(key)
 
                 def checkpoint_ownership(candidate, route_tracks=trusted_owners,
                                          cache=ownership_cache):
@@ -626,7 +638,18 @@ class MarkerTracker:
                         )
                     return cache[cache_key]
 
-                def refresh_compatible(track, candidate, route_tracks=matching_old):
+                def refresh_compatible(track, candidate, route_tracks=matching_old,
+                                       identity_context=(old, old_indices, reserved_old,
+                                                         reserved_candidates, blocked_old,
+                                                         blocked_candidates)):
+                    (real_old, old_indices, reserved_old, reserved_candidates,
+                     blocked_old, blocked_candidates) = identity_context
+                    old_index = old_indices[track.track_id]
+                    if old_index in reserved_old or id(candidate) in reserved_candidates:
+                        return (reserved_candidates.get(id(candidate)) == old_index
+                                and _candidate_actionable(candidate, real_old[old_index]))
+                    if old_index in blocked_old or id(candidate) in blocked_candidates:
+                        return False
                     return _same_generation_actionable(
                         route_tracks, track, candidate,
                         ownership=checkpoint_ownership(candidate),
@@ -653,8 +676,8 @@ class MarkerTracker:
                     else None
                 )
 
-                fresh_rows = [
-                    candidate for index, candidate in enumerate(rows)
+                fresh_indices = [
+                    index for index, candidate in enumerate(rows)
                     if index != certified_surplus_index
                     if _fresh_bracket_position(candidate) is not None
                     and any(
@@ -662,33 +685,7 @@ class MarkerTracker:
                         for track in matching_old
                     )
                 ]
-                # A cold all-positive projection has no motion boundary, but
-                # an injective continuation of an established identity may
-                # still refresh its polling metadata.  Keep these separate
-                # from motion candidates so they cannot move or birth tracks.
-                cold_metadata_candidates = []
-                for _candidate_index, candidate in enumerate(rows):
-                    if (getattr(candidate, "bracket", None) is not None
-                            or getattr(candidate, "position_authoritative", None) is not False):
-                        continue
-                    matches = []
-                    candidate_checkpoints = set(_checkpoint_rows(candidate))
-                    for old_index, track in enumerate(old):
-                        old_checkpoints = set(_checkpoint_rows(track.estimate))
-                        cohort = set(_cohort_rows(track))
-                        if (candidate_checkpoints == old_checkpoints
-                                and candidate_checkpoints
-                                or any(_evidence_continues(old_row, new_row)
-                                       for old_row in cohort
-                                       for new_row in candidate_checkpoints)):
-                            matches.append(old_index)
-                    if len(matches) == 1:
-                        cold_metadata_candidates.append((matches[0], candidate))
-                # Require a globally injective identity assignment; two cold
-                # candidates must never spend one survivor's continuity proof.
-                cold_counts = Counter(index for index, _candidate in cold_metadata_candidates)
-                cold_metadata = [item for item in cold_metadata_candidates
-                                 if cold_counts[item[0]] == 1]
+                fresh_rows = [rows[index] for index in fresh_indices]
                 fixed_pairs, recovery_pairs, movement_pairs = _recovery_plan(
                     matching_old,
                     fresh_rows,
@@ -709,12 +706,20 @@ class MarkerTracker:
                         (old_index, new_index) in movement_pairs,
                     )) is not None
                 }
-                accepted_updates, birth_allowed = _select_valid_partial_transaction(
+                # Identity reservations consume both endpoints even when a
+                # boundary is stale, cold, too distant, or blocked by order.
+                # Publish their current metadata in the same capacity check
+                # as motion, so a held owner cannot duplicate a moving one.
+                pairs = [(old_index, fresh_indices[new_index])
+                         for old_index, new_index in pairs]
+                pairs = sorted(set(pairs) | reservations)
+                accepted_updates, birth_allowed, accepted_motion = _select_valid_partial_transaction(
                     old,
                     rows,
-                    fresh_rows,
+                    rows,
                     pairs,
                     proposed_positions,
+                    metadata_indices=set(reserved_old),
                     birth_candidate=(
                         rows[partial_birth_index]
                         if partial_birth_index is not None else None
@@ -726,7 +731,11 @@ class MarkerTracker:
                     if old_index not in accepted_updates:
                         continue
                     track = old[old_index]
-                    candidate = fresh_rows[new_index]
+                    candidate = rows[new_index]
+                    if old_index not in accepted_motion:
+                        _refresh_held_metadata(track, candidate)
+                        continue
+                    _record_metadata_revisions(track, candidate)
                     track.position = proposed_positions[old_index]
                     track.estimate = replace(candidate, track_id=track.track_id,
                                              operator_code=key[0])
@@ -738,18 +747,6 @@ class MarkerTracker:
                     track.display_bracket = getattr(candidate, "bracket", None)
                     _commit_boundary_evidence(track, candidate)
                     _clear_forward_search(track)
-                for old_index, candidate in cold_metadata:
-                    track = old[old_index]
-                    if old_index in accepted_updates:
-                        continue
-                    track.estimate = replace(
-                        track.estimate,
-                        source_indices=getattr(candidate, "source_indices", track.estimate.source_indices),
-                        source_observations=getattr(candidate, "source_observations", track.estimate.source_observations),
-                        priority_indices=getattr(candidate, "priority_indices", track.estimate.priority_indices),
-                        exploratory_indices=getattr(candidate, "exploratory_indices", track.estimate.exploratory_indices),
-                        position_authoritative=False,
-                    )
                 if partial_birth_index is not None:
                     candidate = rows[partial_birth_index]
                     track_id = self._next_id
@@ -2098,6 +2095,356 @@ def _matching_track(track):
     ), committed_boundary_evidence=())
 
 
+def _checkpoint_arrival_range_mask(arrivals, center, tolerance):
+    """Index the original subtraction predicate without rounded-cutoff drift."""
+    # Widen the tolerance before addition: near cancellation, one ULP of the
+    # resulting cutoff can be much smaller than subtraction's rounding error.
+    # The outward-rounded bounds form a superset; validate its endpoints using
+    # the original predicate. Binary correction preserves repeated-row bounds.
+    expanded = nextafter(tolerance, inf)
+    lower = bisect_left(arrivals, nextafter(center - expanded, -inf))
+    upper = bisect_right(arrivals, nextafter(center + expanded, inf))
+    if lower < upper and abs(arrivals[lower] - center) > tolerance:
+        left, right = lower, upper
+        while left < right:
+            middle = (left + right) // 2
+            value = arrivals[middle]
+            if value >= center or abs(value - center) <= tolerance:
+                right = middle
+            else:
+                left = middle + 1
+        lower = left
+    if lower < upper and abs(arrivals[upper - 1] - center) > tolerance:
+        left, right = lower, upper
+        while left < right:
+            middle = (left + right) // 2
+            value = arrivals[middle]
+            if value <= center or abs(value - center) <= tolerance:
+                left = middle + 1
+            else:
+                right = middle
+        upper = left
+    return (1 << upper) - (1 << lower)
+
+
+def _indexed_checkpoint_links(owned, current, range_cache=None):
+    """Compare ledgers by physical stop, retaining occurrence multiplicity."""
+    if range_cache is None:
+        range_cache = {}
+    exact, temporal, eligible, newer_stops = set(), set(), set(), set()
+    for stop in owned.keys() & current.keys():
+        before, after = owned[stop], current[stop]
+        # Normal route ledgers have one occurrence per physical checkpoint.
+        # Avoid allocating a per-stop matching table for this common case.
+        if len(before) == len(after) == 1:
+            old_arrival, old_revision, _ = before[0]
+            new_arrival, new_revision, row_number = after[0]
+            drift = abs(new_arrival - old_arrival)
+            is_exact = drift <= 0.5
+            newer = new_revision > old_revision and drift <= RECOVERY_ARRIVAL_TOLERANCE_SECONDS
+            if is_exact:
+                exact.add(row_number)
+            if newer:
+                newer_stops.add(stop)
+            if is_exact or newer:
+                temporal.add(row_number)
+                eligible.add(row_number)
+            continue
+        old_number = new_number = 0
+        while old_number < len(before) and new_number < len(after):
+            old_arrival = before[old_number][0]
+            new_arrival, _revision, row_number = after[new_number]
+            if abs(old_arrival - new_arrival) <= 0.5:
+                exact.add(row_number)
+                old_number += 1
+                new_number += 1
+            elif old_arrival < new_arrival:
+                old_number += 1
+            else:
+                new_number += 1
+        # Share the current response's arrival/revision indexes across all old
+        # ledgers. Each old occurrence needs two contiguous arrival ranges and
+        # a revision-mask intersection, never a scan of every current occurrence.
+        if stop not in range_cache:
+            arrivals = tuple(row[0] for row in after)
+            by_revision = {}
+            for number, (_arrival, revision, _row) in enumerate(after):
+                by_revision[revision] = by_revision.get(revision, 0) | (1 << number)
+            revisions = sorted(by_revision)
+            suffix_masks = [0] * (len(revisions) + 1)
+            for number in range(len(revisions) - 1, -1, -1):
+                suffix_masks[number] = suffix_masks[number + 1] | by_revision[revisions[number]]
+            range_cache[stop] = arrivals, revisions, suffix_masks, {}
+        arrivals, revisions, suffix_masks, newer_masks = range_cache[stop]
+        if (after[-1][0] - before[0][0] <= RECOVERY_ARRIVAL_TOLERANCE_SECONDS
+                and before[-1][0] - after[0][0] <= RECOVERY_ARRIVAL_TOLERANCE_SECONDS
+                and revisions[0] > max(row[1] for row in before)):
+            # Every old/current occurrence continues every other occurrence.
+            # With multiplicity on either side no row has a unique old owner.
+            temporal.update(row[2] for row in after)
+            newer_stops.add(stop)
+            continue
+        temporal_mask = unique_mask = repeated_unique_mask = 0
+        for old_arrival, old_revision, _ in before:
+            newer_mask = newer_masks.get(old_revision)
+            if newer_mask is None:
+                newer_mask = suffix_masks[bisect_right(revisions, old_revision)]
+                newer_masks[old_revision] = newer_mask
+            exact_mask = _checkpoint_arrival_range_mask(arrivals, old_arrival, 0.5)
+            wide_mask = _checkpoint_arrival_range_mask(
+                arrivals, old_arrival, RECOVERY_ARRIVAL_TOLERANCE_SECONDS,
+            )
+            newer = wide_mask & newer_mask
+            if newer:
+                newer_stops.add(stop)
+            matches = exact_mask | newer
+            temporal_mask |= matches
+            if matches.bit_count() == 1:
+                repeated_unique_mask |= unique_mask & matches
+                unique_mask |= matches
+        eligible_mask = unique_mask & ~repeated_unique_mask
+        for number, (_arrival, _revision, row_number) in enumerate(after):
+            bit = 1 << number
+            if temporal_mask & bit:
+                temporal.add(row_number)
+            if eligible_mask & bit:
+                eligible.add(row_number)
+    return exact, temporal, eligible, len(newer_stops) >= 2, bool(exact)
+
+
+def _forced_identity_pairs(edges, invalid):
+    """Return edges common to every maximum injective census assignment."""
+    edges = {index: tuple(sorted(neighbours - invalid)) for index, neighbours in edges.items()}
+
+    def augment(owners, old_index, visited, forbidden=None):
+        for new_index in edges[old_index]:
+            if (old_index, new_index) == forbidden or new_index in visited:
+                continue
+            visited.add(new_index)
+            if new_index not in owners or augment(owners, owners[new_index], visited, forbidden):
+                owners[new_index] = old_index
+                return True
+        return False
+
+    matching = {}
+    for old_index in edges:
+        augment(matching, old_index, set())
+
+    def forced(pair):
+        # Removing one edge from a maximum matching leaves a deficit of one.
+        # It is forced exactly when no alternating path can repair that deficit,
+        # including paths starting at a previously unmatched old identity.
+        owners = dict(matching)
+        del owners[pair[1]]
+        matched_old = set(owners.values())
+        return not any(
+            augment(owners, index, set(), pair)
+            for index in edges if index not in matched_old
+        )
+
+    return {
+        (old_index, new_index) for new_index, old_index in matching.items()
+        if new_index not in invalid and forced((old_index, new_index))
+    }
+
+
+def _same_generation_identity_plan(old, new, now):
+    """Reserve forced census identities before considering motion eligibility.
+
+    Strictly newer observations at two distinct physical checkpoints certify
+    temporal edges. Neither position nor mutable source slots break temporal
+    ambiguity. Exact one-checkpoint matching retains its existing contracts.
+    """
+    raw_current = [getattr(candidate, "checkpoint_evidence", ()) for candidate in new]
+    raw_owned = [
+        (track.cohort_evidence if track.cohort_trusted else ())
+        if track.cohort_observed_at > 0
+        else getattr(track.estimate, "checkpoint_evidence", ())
+        for track in old
+    ]
+    if any(not isinstance(rows, tuple) or len(rows) > MAX_CHECKPOINT_EVIDENCE
+           for rows in (*raw_current, *raw_owned)):
+        return set(), set(range(len(old))), set(range(len(new)))
+    current = [_strict_checkpoint_rows(candidate) for candidate in new]
+    owned = [
+        _strict_checkpoint_rows(replace(
+            track.estimate, checkpoint_evidence=rows,
+        ))
+        for track, rows in zip(old, raw_owned, strict=True)
+    ]
+    # A malformed ledger can hide a competitor. It cannot establish uniqueness
+    # by silently dropping its invalid rows.
+    if any(rows is None for rows in (*current, *owned)):
+        return set(), set(range(len(old))), set(range(len(new)))
+    def indexed(rows):
+        stops = {}
+        for number, (stop, arrival, revision) in enumerate(rows):
+            stops.setdefault(stop, []).append((arrival, revision, number))
+        return {stop: sorted(values, key=lambda value: (value[0], value[2]))
+                for stop, values in stops.items()}
+
+    # Equal-time populations often repeat an entire ledger. Share comparison
+    # work, but keep all physical owners in the masks and in the final census.
+    owner_groups = {}
+    for index, rows in enumerate(owned):
+        owner_groups[rows] = owner_groups.get(rows, 0) | (1 << index)
+    indexed_owned = {rows: indexed(rows) for rows in owner_groups}
+    profiles = {}
+    remaining = Counter(current)
+    revision_floors = _route_metadata_revision_floors(old)
+    # Revisions belong to physical stop responses, not individual vehicles.
+    # A stale candidate retains identity edges only to fence its component;
+    # it cannot supply matching capacity or fall through to ordinary motion.
+    invalid = {index for index, candidate in enumerate(new)
+               if not _metadata_nonregressing(candidate, revision_floors)}
+    mixed_edges = set()
+    exact_edges = {index: set() for index, rows in enumerate(owned) if rows}
+    temporal_edges = {index: set() for index, rows in enumerate(owned) if rows}
+    for new_index, candidate in enumerate(new):
+        rows = current[new_index]
+        if rows not in profiles:
+            current_stops = indexed(rows)
+            range_cache = {}
+            links = {ledger: _indexed_checkpoint_links(stops, current_stops, range_cache)
+                     for ledger, stops in indexed_owned.items()}
+            exact_owners = [0] * len(rows)
+            raw_owners = [0] * len(rows)
+            eligible_owners = [0] * len(rows)
+            for ledger, (exact, temporal, eligible, _strong, _proof) in links.items():
+                mask = owner_groups[ledger]
+                for row in exact:
+                    exact_owners[row] |= mask
+                for row in temporal:
+                    raw_owners[row] |= mask
+                for row in eligible:
+                    eligible_owners[row] |= mask
+            exclusive_stops = {}
+            strong_owners = set()
+            for number, (exact, raw, eligible) in enumerate(zip(
+                exact_owners, raw_owners, eligible_owners, strict=True,
+            )):
+                if exact:
+                    if exact.bit_count() == 1:
+                        strong_owners.add(exact)
+                elif raw.bit_count() == 1 and eligible:
+                    exclusive_stops.setdefault(raw, set()).add(rows[number][0])
+            strong_owners.update(mask for mask, stops in exclusive_stops.items() if len(stops) >= 2)
+            mixed = sum(strong_owners) if len(strong_owners) > 1 else 0
+            prior = {number for number, mask in enumerate(exact_owners) if mask}
+            covering = sum(owner_groups[ledger] for ledger, link in links.items()
+                           if prior and link[0] == prior)
+            any_exact = 0
+            for mask in exact_owners:
+                any_exact |= mask
+            profiles[rows] = links, covering, any_exact, mixed, bool(prior and not covering)
+        links, covering, any_exact, mixed, uncovered = profiles[rows]
+        if mixed or uncovered or _incoherent_checkpoint_chronology(candidate):
+            invalid.add(new_index)
+            mixed_edges.update(
+                (index, new_index) for index in range(len(old))
+                if (mixed | any_exact) & (1 << index)
+            )
+        for old_index, track in enumerate(old):
+            if not owned[old_index] or covering and not covering & (1 << old_index):
+                continue
+            _exact, _temporal, _eligible, strong, exact_proof = links[owned[old_index]]
+            if exact_proof:
+                exact_edges[old_index].add(new_index)
+            recent = (track.cohort_observed_at <= 0
+                      or 0 <= now - track.cohort_observed_at <= COHORT_EVIDENCE_TTL_SECONDS)
+            if recent and strong:
+                temporal_edges[old_index].add(new_index)
+        remaining[rows] -= 1
+        if not remaining[rows]:
+            del profiles[rows]
+    # Compose exact ownership first: a newer response for a nearby old bus
+    # cannot steal the immutable checkpoint population of its exact owner.
+    # Invalid candidates cannot provide the extra matching capacity which
+    # makes a neighbouring valid edge appear forced. Fence their whole component
+    # in the unfiltered census, while preserving unrelated components.
+    census_edges = {index: exact_edges[index] | temporal_edges[index] for index in exact_edges}
+    for old_index, new_index in mixed_edges:
+        census_edges.setdefault(old_index, set()).add(new_index)
+    reverse = {}
+    for old_index, neighbours in census_edges.items():
+        for new_index in neighbours:
+            reverse.setdefault(new_index, set()).add(old_index)
+    invalid_old = set()
+    pending = list(invalid)
+    while pending:
+        for old_index in reverse.get(pending.pop(), ()):
+            if old_index in invalid_old:
+                continue
+            invalid_old.add(old_index)
+            unseen = census_edges[old_index] - invalid
+            invalid.update(unseen)
+            pending.extend(unseen)
+    reservations = _forced_identity_pairs(exact_edges, invalid)
+    reserved_old = {index for index, _ in reservations}
+    reserved_new = {index for _, index in reservations}
+    edges = {index: neighbours - reserved_new for index, neighbours in temporal_edges.items()
+             if index not in reserved_old}
+    exact_candidates = {index for neighbours in exact_edges.values() for index in neighbours}
+    for old_index, neighbours in edges.items():
+        if exact_edges.get(old_index):
+            neighbours.intersection_update(exact_edges[old_index])
+        neighbours.difference_update(exact_candidates - exact_edges.get(old_index, set()))
+    for old_index, new_index in mixed_edges:
+        if old_index not in reserved_old and new_index not in reserved_new:
+            edges.setdefault(old_index, set()).add(new_index)
+
+    reservations.update(_forced_identity_pairs(edges, invalid))
+    blocked_old = {index for index, neighbours in edges.items() if neighbours} | invalid_old
+    blocked_new = {index for neighbours in edges.values() for index in neighbours} | invalid
+    # A one-stop drift is not a reservation or an ambiguity certificate. It
+    # retains historical short-distance fallback only outside these fences.
+    blocked_old.difference_update(index for index, _ in reservations)
+    blocked_new.difference_update(index for _, index in reservations)
+    return reservations, blocked_old, blocked_new
+
+
+def _metadata_revision_floors(track):
+    floors = dict(track.metadata_revision_floors)
+    for stop, _arrival, revision in (*_checkpoint_rows(track.estimate), *_cohort_rows(track)):
+        floors[stop] = max(floors.get(stop, 0), revision)
+    return floors
+
+
+def _route_metadata_revision_floors(tracks):
+    floors = {}
+    for track in tracks:
+        for stop, revision in _metadata_revision_floors(track).items():
+            floors[stop] = max(floors.get(stop, 0), revision)
+    return floors
+
+
+def _metadata_nonregressing(candidate, floors):
+    return all(revision >= floors.get(stop, 0)
+               for stop, _arrival, revision in _checkpoint_rows(candidate))
+
+
+def _record_metadata_revisions(track, candidate):
+    floors = _metadata_revision_floors(track)
+    for stop, _arrival, revision in _checkpoint_rows(candidate):
+        floors[stop] = max(floors.get(stop, 0), revision)
+    track.metadata_revision_floors = floors
+
+
+def _refresh_held_metadata(track, candidate):
+    """Replace one current identity bundle without renewing motion evidence."""
+    metadata = {
+        name: getattr(candidate, name)
+        for name in (
+            "source_indices", "source_observations", "checkpoint_evidence",
+            "priority_indices", "exploratory_indices", "eta_arrival_at", "eta_minutes",
+        )
+    }
+    if getattr(candidate, "position_authoritative", None) is False:
+        metadata["position_authoritative"] = False
+    _record_metadata_revisions(track, candidate)
+    track.estimate = replace(track.estimate, **metadata)
+
+
 def _evidence_continues(prior, current):
     """Whether one current occurrence can be the same physical ETA row."""
     old_stop, old_arrival, old_revision = prior
@@ -2123,6 +2470,11 @@ def _replace_track_cohort(track, candidates, now):
     )
     track.cohort_observed_at = now
     track.cohort_trusted = True
+    track.metadata_revision_floors = {}
+    for stop, _arrival, revision in track.cohort_evidence:
+        track.metadata_revision_floors[stop] = max(
+            track.metadata_revision_floors.get(stop, 0), revision,
+        )
 
 
 def _reconcile_complete_probe_ownership(old, new, now, probe_inputs, route_lines):
@@ -4346,10 +4698,20 @@ def _retain_current_checkpoint_capacity(
 
 def _select_valid_partial_transaction(
     old, current_population, update_candidates, pairs, proposed_positions,
-    *, birth_candidate=None,
+    *, birth_candidate=None, metadata_indices=None,
 ):
     """Select a monotone, ordered partial update and optional certified birth."""
-    accepted = _select_ordered_updates(old, proposed_positions)
+    metadata = set(metadata_indices or ())
+    revision_floors = _route_metadata_revision_floors(old)
+    regressing = {
+        old_index for old_index, new_index in pairs
+        if not _metadata_nonregressing(update_candidates[new_index], revision_floors)
+    }
+    metadata.difference_update(regressing)
+    proposed_positions = {index: position for index, position in proposed_positions.items()
+                          if index not in regressing}
+    motion = _select_ordered_updates(old, proposed_positions)
+    accepted = motion | metadata
     while True:
         capacity_accepted = _retain_current_checkpoint_capacity(
             old, current_population, update_candidates, pairs, accepted,
@@ -4361,20 +4723,28 @@ def _select_valid_partial_transaction(
                 if index in capacity_accepted
             },
         )
-        narrowed = accepted & capacity_accepted & ordered_accepted
+        narrowed = accepted & capacity_accepted & (ordered_accepted | metadata)
         if narrowed == accepted:
+            motion = ordered_accepted & accepted
             break
         accepted = narrowed
 
+    def result(birth_allowed):
+        if metadata_indices is None:
+            return accepted, birth_allowed
+        return accepted, birth_allowed, motion
+
     if birth_candidate is None:
-        return accepted, True
+        return result(True)
+    if not _metadata_nonregressing(birth_candidate, revision_floors):
+        return result(False)
     capacity = Counter(
         row
         for candidate in current_population
         for row in _checkpoint_rows(candidate)
     )
     if not capacity:
-        return accepted, True
+        return result(True)
     candidate_by_old = {
         old_index: update_candidates[new_index]
         for old_index, new_index in pairs
@@ -4389,10 +4759,10 @@ def _select_valid_partial_transaction(
     birth_counts = Counter(
         row for row in _checkpoint_rows(birth_candidate) if row in capacity
     )
-    return accepted, all(
+    return result(all(
         displayed[row] + count <= capacity[row]
         for row, count in birth_counts.items()
-    )
+    ))
 
 
 def _boundary_observed_at(candidate, now):

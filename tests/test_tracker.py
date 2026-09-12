@@ -1,7 +1,9 @@
 from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from time import perf_counter
+from math import inf, nextafter
+from random import Random
+from time import perf_counter, process_time
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +32,588 @@ from dashboard.providers.route_geometry import RouteLine, Stop
 from dashboard.providers.transit import ProbeEta, ProbeEtaSnapshot, ProbeRouteGeneration
 
 BASE_TIME = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def _route11_identity_case():
+    """Public ETA evidence distilled from the last clean cohort and frames 84/85."""
+    epoch = BASE_TIME.timestamp() - 41.1721
+
+    def evidence(values):
+        return tuple((stop, epoch + arrival, revision) for stop, arrival, revision in values)
+
+    def candidate(position, values, slots, bracket, revision=None, age=None):
+        return replace(
+            _candidate(position, route="11", operator=Operator.GMB, bound="seq-1",
+                       bracket=bracket, boundary_revision=revision, boundary_age=age),
+            checkpoint_evidence=evidence(values),
+            source_indices=frozenset(stop for stop, _, _ in values),
+            source_observations=frozenset(("probe", slot) for slot in slots),
+        )
+
+    cohort = [
+        candidate(5.0, ((7, 285.550, 771), (8, 350.320, 805), (17, 896.660, 806)),
+                  (66, 69, 178), (0.0, 6.0)),
+        candidate(6.0, ((7, 62.067, 771), (8, 121.739, 805), (17, 792.473, 806)),
+                  (65, 68, 177), (0.0, 6.0)),
+        candidate(7.961849366666667, ((8, 18.257, 805), (17, 397.550, 806)),
+                  (64, 67), (7.0, 8.0), (842, 805), 46.219),
+    ]
+    frame84 = [
+        replace(candidate(0.0, ((0, 100.0, 881), (3, 368.190, 850), (4, 390.155, 848)),
+                          (58, 163, 166), (0.0, 0.0), (881, 881), 0), unreliable=True),
+        candidate(5.0, ((7, 254.986, 842), (8, 309.757, 882), (17, 912.678, 883)),
+                  (66, 69, 170), (3.0, 6.0)),
+        candidate(6.0, ((7, 89.854, 842), (8, 147.855, 882), (17, 849.473, 883)),
+                  (65, 68, 169), (3.0, 6.0)),
+        candidate(7.883513016666667, ((8, 99.257, 882), (17, 402.859, 883)),
+                  (64, 67), (7.0, 8.0), (842, 882), 0),
+    ]
+    frame85 = [
+        frame84[0], frame84[1],
+        candidate(7.069589714922744, ((7, 92.617, 888), (8, 147.855, 882), (17, 849.473, 883)),
+                  (65, 68, 169), (7.0, 8.0), (888, 882), 0),
+        replace(frame84[3], boundary_revision=(888, 882)),
+    ]
+    return cohort, frame84, frame85
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("renumber", [False, True])
+async def test_same_generation_route11_reserves_held_identity_before_frames84_85(reverse, renumber):
+    cohort, frame84, frame85 = _route11_identity_case()
+    key = ("GMB", "11", "seq-1")
+    tracker = MarkerTracker()
+    initial = await tracker.update(_snapshot(817, route_key=key), cohort)
+    old = list(tracker._routes[key].values())
+    frozen = [track.cohort_evidence for track in old]
+    held = old[0]
+    held.forward_after = 5
+    held.forward_frontier = (6, 7)
+    held.forward_revision = held.forward_started_revision = 805
+    held.forward_baselines = {6: 805, 7: 771}
+    invariants = {name: getattr(held, name) for name in (
+        "position", "motion_bracket", "display_bracket", "boundary_revision",
+        "boundary_observed_at", "committed_boundary_evidence", "position_authoritative",
+        "forward_frontier", "forward_after", "forward_revision", "forward_started_revision",
+        "forward_baselines", "cohort_evidence", "cohort_observed_at", "last_evidence_at",
+    )}
+    for number, candidates in enumerate((frame84, frame85), 1):
+        if renumber:
+            candidates = [replace(candidate, source_observations=frozenset(
+                (kind, 1000 * number - slot) for kind, slot in candidate.source_observations
+            )) for candidate in candidates]
+        current = await tracker.update(
+            _snapshot(817, collected_at=BASE_TIME + timedelta(seconds=40 + 10 * number),
+                      route_key=key),
+            list(reversed(candidates)) if reverse else candidates,
+        )
+        assert [item.track_id for item in current] == [item.track_id for item in initial]
+        assert [item.position for item in current] == pytest.approx(
+            [5.0, 6.0, cohort[2].position] if number == 1 else [5.0, 7.069589714922744, 7.883513016666667]
+        )
+        assert [track.cohort_evidence for track in old] == frozen
+        assert all(getattr(held, name) == value for name, value in invariants.items())
+        assert [item.checkpoint_evidence for item in current] == [
+            item.checkpoint_evidence for item in candidates[1:]
+        ]
+        assert all(count == 1 for count in Counter(
+            row for item in current for row in item.source_observations
+        ).values())
+        assert all(count == 1 for count in Counter(
+            row for item in current for row in item.checkpoint_evidence
+        ).values())
+    # Cached repetition cannot renew a reservation's evidence lifetime.
+    await tracker.update(_snapshot(817, collected_at=BASE_TIME + timedelta(seconds=70),
+                                   route_key=key), frame85)
+    assert all(getattr(held, name) == value for name, value in invariants.items())
+    atomic = await tracker.update(
+        _snapshot(894, collected_at=BASE_TIME + timedelta(seconds=80), route_key=key), frame85,
+    )
+    departed = [item for item in atomic if not item.unreliable]
+    assert [item.track_id for item in departed] == [item.track_id for item in initial]
+    assert [item.position for item in departed] == pytest.approx([5.0, 7.069589714922744, 7.883513016666667])
+
+
+@pytest.mark.parametrize("variant", ["cold", "scheduled", "equal", "malformed"])
+def test_same_generation_identity_census_keeps_nonmoving_competitors(variant):
+    cohort, _frame84, frame85 = _route11_identity_case()
+    old = [_Track(index + 1, item, item.position, 817,
+                   cohort_evidence=item.checkpoint_evidence,
+                   cohort_observed_at=BASE_TIME.timestamp()) for index, item in enumerate(cohort)]
+    duplicate = frame85[2]
+    if variant == "cold":
+        duplicate = replace(duplicate, bracket=None, position_authoritative=False)
+    elif variant == "scheduled":
+        duplicate = replace(duplicate, unreliable=True)
+    elif variant == "malformed":
+        duplicate = replace(duplicate, checkpoint_evidence=duplicate.checkpoint_evidence + ((-1, 0, 0),))
+    reservations, blocked_old, blocked_new = tracker_module._same_generation_identity_plan(
+        old, [*frame85, duplicate], BASE_TIME.timestamp() + 60,
+    )
+    assert (1, 2) not in reservations
+    assert 1 in blocked_old and {2, 4} <= blocked_new
+    if variant != "malformed":
+        assert reservations == {(0, 1), (2, 3)}
+
+
+@pytest.mark.asyncio
+async def test_same_generation_ambiguous_component_cannot_fall_through_to_motion():
+    cohort, _frame84, frame85 = _route11_identity_case()
+    key = ("GMB", "11", "seq-1")
+    tracker = MarkerTracker()
+    initial = await tracker.update(_snapshot(817, route_key=key), cohort)
+    candidate = replace(frame85[2], position=6.1, bracket=None, position_authoritative=False)
+    result = await tracker.update(
+        _snapshot(817, collected_at=BASE_TIME + timedelta(seconds=60), route_key=key),
+        [*frame85, candidate],
+    )
+    assert [marker.track_id for marker in result] == [marker.track_id for marker in initial]
+    assert [marker.position for marker in result] == pytest.approx([5.0, 6.0, 7.883513016666667])
+    assert result[1].checkpoint_evidence == initial[1].checkpoint_evidence
+    assert tracker.poll_lifecycle_routes() == {key}
+
+
+@pytest.mark.parametrize(("stops", "revisions", "elapsed", "expected"), [
+    ((7, 8), (11, 11), 30, True),
+    ((7, 7), (11, 11), 30, False),
+    ((7, 8), (10, 11), 30, False),
+    ((7, 8), (10, 10), 30, False),
+    ((7, 8), (11, 11), 121, False),
+])
+def test_same_generation_tolerant_identity_requires_distinct_newer_checkpoints(stops, revisions, elapsed, expected):
+    rows = tuple((stop, BASE_TIME.timestamp() + 120, 10) for stop in stops)
+    initial = replace(_candidate(5.0), checkpoint_evidence=rows)
+    candidate = replace(initial, checkpoint_evidence=tuple(
+        (stop, arrival + 20, revision)
+        for (stop, arrival, _), revision in zip(rows, revisions, strict=True)
+    ))
+    old = [_Track(1, initial, 5.0, 1, cohort_evidence=rows,
+                   cohort_observed_at=BASE_TIME.timestamp())]
+    reservations, _blocked_old, _blocked_new = tracker_module._same_generation_identity_plan(
+        old, [candidate], BASE_TIME.timestamp() + elapsed,
+    )
+    assert bool(reservations) is expected
+
+
+@pytest.mark.parametrize("distinct", [False, True])
+def test_same_generation_identity_plan_is_bounded_for_full_tied_route(distinct):
+    initial = _candidate(5.0)
+    old = [_Track(index, replace(initial, checkpoint_evidence=tuple(
+        (stop, 1000.0 + stop * 120 + (index * 0.1 if distinct else 0), 10)
+        for stop in range(64)
+    )), float(index), 1) for index in range(128)]
+    candidates = [replace(initial, checkpoint_evidence=tuple(
+        (stop, arrival + 30, 11) for stop, arrival, _ in track.estimate.checkpoint_evidence
+    )) for track in old]
+    started = process_time()
+    reservations, blocked_old, blocked_new = tracker_module._same_generation_identity_plan(
+        old, candidates, BASE_TIME.timestamp(),
+    )
+    assert not reservations
+    assert blocked_old == blocked_new == set(range(128))
+    # Bound algorithmic work, excluding scheduling delays on shared CI hosts.
+    assert process_time() - started < 5.0
+
+
+@pytest.mark.parametrize("spacing", [1.0, 10.0])
+def test_full_identity_census_is_bounded_with_32_occurrences_per_stop(spacing):
+    initial = _candidate(5.0)
+    old = [_Track(index, replace(initial, checkpoint_evidence=tuple(
+        (stop, 1000.0 + stop * 1000 + occurrence * spacing + index * 0.001, 10)
+        for stop in range(2) for occurrence in range(32)
+    )), float(index), 1) for index in range(128)]
+    candidates = [replace(initial, checkpoint_evidence=tuple(
+        (stop, arrival + 40, 11) for stop, arrival, _ in track.estimate.checkpoint_evidence
+    )) for track in old]
+    started = process_time()
+    reservations, blocked_old, blocked_new = tracker_module._same_generation_identity_plan(
+        old, candidates, BASE_TIME.timestamp(),
+    )
+    assert not reservations
+    assert blocked_old == blocked_new == set(range(128))
+    # Both all-to-all and partially overlapping arrival windows remain bounded.
+    # CPU time catches the original 15-second scan without host-scheduling noise.
+    assert process_time() - started < 5.0
+
+
+def test_repeated_checkpoint_masks_preserve_occurrence_and_revision_matching():
+    random = Random(93218)
+
+    def indexed(rows):
+        result = {}
+        for number, (stop, arrival, revision) in enumerate(rows):
+            result.setdefault(stop, []).append((arrival, revision, number))
+        return {stop: sorted(values, key=lambda row: (row[0], row[2]))
+                for stop, values in result.items()}
+
+    def reference(owned, current):
+        exact = set(tracker_module._checkpoint_overlap(owned, current))
+        temporal, unique, newer_stops = set(), Counter(), set()
+        for old_stop, old_arrival, old_revision in owned:
+            matches = set()
+            for number, (stop, arrival, revision) in enumerate(current):
+                if stop != old_stop:
+                    continue
+                drift = abs(arrival - old_arrival)
+                newer = revision > old_revision and drift <= 90.0
+                if newer:
+                    newer_stops.add(stop)
+                if drift <= 0.5 or newer:
+                    matches.add(number)
+            temporal.update(matches)
+            if len(matches) == 1:
+                unique.update(matches)
+        eligible = {row for row, count in unique.items() if count == 1}
+        return exact, temporal, eligible, len(newer_stops) >= 2, bool(exact)
+
+    for case in range(160):
+        current = tuple(
+            (random.choice((7, 8)), 1000.0 + random.randrange(12) * 30, random.randrange(1, 6))
+            for _ in range(random.randrange(1, 65))
+        )
+        current_index = indexed(current)
+        range_cache = {}
+        # Reuse the current index with different old revision populations, as
+        # the full census does; cached masks must remain strictly revision-local.
+        for _ in range(3):
+            owned = tuple(
+                (stop, arrival + random.choice((-90.001, -90.0, -0.5, 0.0, 0.5, 90.0, 90.001)),
+                 random.randrange(1, 6))
+                for stop, arrival, _revision in random.choices(current, k=random.randrange(1, 65))
+            )
+            actual = tracker_module._indexed_checkpoint_links(indexed(owned), current_index, range_cache)
+            assert actual == reference(owned, current), case
+
+
+@pytest.mark.parametrize(("prior", "arrival", "tolerance", "included"), [
+    (100.1, 10.099999999999993, 90.0, True),
+    (150.76253236201435, 60.76253236201435, 90.0, True),
+    (nextafter(float(2**31), -inf), nextafter(float(2**31), -inf) + 90.0, 90.0, False),
+    (-0.5, 1e-18, 0.5, True),
+    (nextafter(float(2**31), -inf), nextafter(float(2**31), -inf) + 0.5, 0.5, False),
+])
+@pytest.mark.parametrize("multiplicity", [1, 2, 32])
+def test_repeated_checkpoint_windows_match_original_arrival_predicate(prior, arrival, tolerance, included, multiplicity):
+    assert (abs(arrival - prior) <= tolerance) is included
+    revision = 11 if tolerance == 90.0 else 10
+    owned = {stop: [(prior, 10, group * multiplicity + number) for number in range(multiplicity)]
+             for group, stop in enumerate((7, 8))}
+    current = {
+        stop: [(arrival, revision, group * (multiplicity + 1) + number) for number in range(multiplicity)]
+        + [(prior + 1000.0, revision, group * (multiplicity + 1) + multiplicity)]
+        for group, stop in enumerate((7, 8))
+    }
+    exact, temporal, eligible, strong, exact_proof = tracker_module._indexed_checkpoint_links(owned, current)
+    expected = {group * (multiplicity + 1) + number for group in range(2)
+                for number in range(multiplicity)} if included else set()
+    assert exact == (expected if tolerance == 0.5 else set())
+    assert exact_proof is (included and tolerance == 0.5)
+    assert temporal == expected
+    assert eligible == (expected if multiplicity == 1 else set())
+    assert strong is (included and tolerance == 90.0)
+
+
+@pytest.mark.parametrize("center", [
+    100.1, 150.76253236201435, nextafter(float(2**31), -inf),
+    -90.0, -0.5, 1e-308, 1e308, -1e308,
+])
+@pytest.mark.parametrize("tolerance", [0.5, 90.0])
+def test_checkpoint_range_mask_preserves_subtraction_rounding(center, tolerance):
+    arrivals = tuple(sorted([
+        value for edge in (center - tolerance, center + tolerance)
+        for value in (nextafter(edge, -inf), edge, nextafter(edge, inf))
+    ] + [-1e-15, 1e-15]))
+    expected = sum(1 << index for index, arrival in enumerate(arrivals)
+                   if abs(arrival - center) <= tolerance)
+    assert tracker_module._checkpoint_arrival_range_mask(arrivals, center, tolerance) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_exact_census_owner_outranks_neighbour_temporal_continuation(reverse):
+    first = replace(_candidate(5.0, bracket=(4.0, 5.0), boundary_age=0,
+                               boundary_revision=(9, 9)),
+                    checkpoint_evidence=((7, 100.0, 9), (8, 200.0, 9)))
+    second = replace(_candidate(6.0, bracket=(5.0, 6.0), boundary_age=0,
+                                boundary_revision=(10, 10)),
+                     checkpoint_evidence=((7, 160.0, 10), (8, 260.0, 10)))
+    tracker = MarkerTracker()
+    initial = await tracker.update(_snapshot(1), [second, first] if reverse else [first, second])
+    candidate = replace(second, position=6.5, bracket=(6.0, 7.0), boundary_revision=(11, 11))
+    old = list(tracker._routes[("KMB", "R", "out")].values())
+    reservations, _, _ = tracker_module._same_generation_identity_plan(old, [candidate], BASE_TIME.timestamp())
+    assert reservations == {(1, 0)}
+    current = await tracker.update(_snapshot(1), [candidate])
+    assert [marker.track_id for marker in current] == [marker.track_id for marker in initial]
+    assert [marker.position for marker in current] == [5.0, 6.5]
+    assert current[0].checkpoint_evidence == first.checkpoint_evidence
+    assert current[1].checkpoint_evidence == second.checkpoint_evidence
+
+
+def test_exact_census_composes_shared_checkpoint_owners_before_temporal_claims():
+    shared = ((7, 100.0, 10), (8, 200.0, 10))
+    first = replace(_candidate(5.0), checkpoint_evidence=shared)
+    second = replace(_candidate(6.0), checkpoint_evidence=shared + ((9, 300.0, 10),))
+    old = [_Track(1, first, 5.0, 1), _Track(2, second, 6.0, 1)]
+    exact_first = first
+    exact_second = replace(second, checkpoint_evidence=((9, 300.0, 10),))
+    temporal = replace(first, checkpoint_evidence=((7, 120.0, 11), (8, 220.0, 11)))
+    reservations, _, _ = tracker_module._same_generation_identity_plan(
+        old, [exact_first, exact_second, temporal], BASE_TIME.timestamp(),
+    )
+    assert reservations == {(0, 0), (1, 1)}
+
+
+def test_ambiguous_exact_candidate_cannot_be_reserved_to_temporal_outsider():
+    temporal_owner = replace(_candidate(5.0), checkpoint_evidence=((7, 100.0, 9), (8, 200.0, 9)))
+    exact_owner = replace(_candidate(6.0), checkpoint_evidence=((7, 160.0, 10), (8, 260.0, 10)))
+    old = [_Track(1, temporal_owner, 5.0, 1), _Track(2, exact_owner, 6.0, 1),
+           _Track(3, exact_owner, 7.0, 1)]
+    reservations, blocked_old, blocked_new = tracker_module._same_generation_identity_plan(
+        old, [exact_owner], BASE_TIME.timestamp(),
+    )
+    assert not reservations
+    # The shared exact owners keep their existing motion-eligible fallback;
+    # tolerant evidence cannot manufacture a unique reservation for the outsider.
+    assert not blocked_old and not blocked_new
+
+
+@pytest.mark.parametrize("kind", ["exact", "temporal"])
+def test_invalid_candidate_cannot_force_another_edge_in_its_component(kind):
+    def candidate(rows):
+        return replace(_candidate(5.0), checkpoint_evidence=rows)
+
+    if kind == "exact":
+        initial = [candidate(((7, 100.0, 10), (8, 200.0, 10))),
+                   candidate(((7, 100.0, 10), (8, 300.0, 10)))]
+        shared = candidate(((7, 100.0, 10),))
+        invalid = candidate(((8, 200.0, 10), (9, 150.0, 10)))
+    else:
+        initial = [candidate(((7, 100.0, 10), (8, 200.0, 10))),
+                   candidate(((7, 230.0, 10), (8, 330.0, 10)))]
+        shared = candidate(((7, 170.0, 11), (8, 270.0, 11)))
+        invalid = candidate(((7, 120.0, 11), (8, 220.0, 11), (9, 50.0, 11)))
+    initial.append(candidate(((15, 600.0, 10), (16, 700.0, 10))))
+    unrelated = candidate(((15, 620.0, 11), (16, 720.0, 11)))
+    old = [_Track(index + 1, item, float(index), 1) for index, item in enumerate(initial)]
+    reservations, blocked_old, blocked_new = tracker_module._same_generation_identity_plan(
+        old, [shared, invalid, unrelated], BASE_TIME.timestamp(),
+    )
+    assert reservations == {(2, 2)}
+    assert blocked_old == blocked_new == {0, 1}
+
+
+@pytest.mark.parametrize("oversized_old", [False, True])
+def test_identity_census_rejects_ledgers_above_supported_checkpoint_bound(oversized_old):
+    valid = replace(_candidate(5.0), checkpoint_evidence=((7, 100.0, 10),))
+    oversized = replace(valid, checkpoint_evidence=tuple((stop, 100.0 + stop, 10) for stop in range(65)))
+    old = [_Track(1, oversized if oversized_old else valid, 5.0, 1)]
+    reservations, blocked_old, blocked_new = tracker_module._same_generation_identity_plan(
+        old, [valid if oversized_old else oversized], BASE_TIME.timestamp(),
+    )
+    assert not reservations
+    assert blocked_old == blocked_new == {0}
+
+
+@pytest.mark.asyncio
+async def test_public_partial_update_preserves_repeated_candidate_object_occurrences(monkeypatch):
+    first = replace(_candidate(4.0, bracket=(3.0, 4.0), boundary_age=0,
+                               boundary_revision=(10, 10)), checkpoint_evidence=((7, 100.0, 10),))
+    second = replace(first, position=5.0, bracket=(4.0, 5.0))
+    tracker = MarkerTracker()
+    initial = await tracker.update(_snapshot(1), [first, second])
+    current = replace(second, position=5.5, bracket=(5.0, 6.0), boundary_revision=(11, 11))
+    selected_pairs = []
+    transaction = tracker_module._select_valid_partial_transaction
+
+    def capture(old, population, updates, pairs, proposed, **kwargs):
+        selected_pairs.extend(pairs)
+        return transaction(old, population, updates, pairs, proposed, **kwargs)
+
+    monkeypatch.setattr(tracker_module, "_select_valid_partial_transaction", capture)
+    result = await tracker.update(_snapshot(1), [current, current])
+    assert {index for _, index in selected_pairs} == {0, 1}
+    assert {item.track_id for item in result} == {item.track_id for item in initial}
+    assert len(result) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omit_after_acceptance", [False, True])
+async def test_held_metadata_rejects_revisions_between_frozen_and_accepted(omit_after_acceptance):
+    initial = replace(_candidate(5.5, bracket=(5.0, 6.0), boundary_age=0,
+                                 boundary_revision=(10, 10)),
+                      checkpoint_evidence=((7, 100.0, 10), (8, 200.0, 10), (9, 300.0, 10)))
+    tracker = MarkerTracker()
+    seeded = await tracker.update(_snapshot(1), [initial])
+    track = tracker._routes[("KMB", "R", "out")][seeded[0].track_id]
+    current = replace(initial, position=8.0, bracket=None, boundary_revision=None,
+                      position_authoritative=False, eta_arrival_at=BASE_TIME + timedelta(seconds=120),
+                      eta_minutes=2.0, source_observations=frozenset({("probe", 30)}),
+                      source_indices=frozenset({7, 8}), priority_indices=frozenset({7}),
+                      checkpoint_evidence=((7, 120.0, 30), (8, 220.0, 30), (9, 320.0, 30)))
+    await tracker.update(_snapshot(1, collected_at=BASE_TIME + timedelta(seconds=30)), [current])
+    assert track.estimate.checkpoint_evidence == current.checkpoint_evidence
+    if omit_after_acceptance:
+        current = replace(current, checkpoint_evidence=current.checkpoint_evidence[1:])
+        await tracker.update(_snapshot(1, collected_at=BASE_TIME + timedelta(seconds=40)), [current])
+        assert track.estimate.checkpoint_evidence == current.checkpoint_evidence
+    accepted_bundle = track.estimate
+    stale = replace(current, eta_arrival_at=BASE_TIME + timedelta(seconds=130), eta_minutes=1.0,
+                    source_observations=frozenset({("probe", 20)}),
+                    source_indices=frozenset({7}), priority_indices=frozenset({8}),
+                    checkpoint_evidence=((7, 130.0, 20), (8, 230.0, 30), (9, 330.0, 30)))
+    result = await tracker.update(_snapshot(1, collected_at=BASE_TIME + timedelta(seconds=60)), [stale])
+    assert track.estimate == accepted_bundle
+    assert result[0].track_id == seeded[0].track_id
+    assert result[0].position == seeded[0].position
+    assert track.cohort_evidence == initial.checkpoint_evidence
+    assert track.last_evidence_at == BASE_TIME.timestamp()
+    if omit_after_acceptance:
+        complete = replace(current, checkpoint_evidence=((8, 220.0, 40), (9, 320.0, 40)))
+        await tracker.update(_snapshot(2, collected_at=BASE_TIME + timedelta(seconds=90)), [complete])
+        assert track.metadata_revision_floors == {8: 40, 9: 40}
+
+
+def test_regressing_metadata_keeps_retained_claim_in_birth_capacity_transaction():
+    retained = (7, 100.0, 30)
+    stale = (7, 100.0, 20)
+    old = [_capacity_track(1, retained, 4.0)]
+    candidate, birth = _capacity_candidate(stale, 4.0), _capacity_candidate(retained, 5.0)
+    accepted, birth_allowed, motion = _select_valid_partial_transaction(
+        old, [candidate, birth], [candidate], [(0, 0)], {}, metadata_indices={0},
+        birth_candidate=birth,
+    )
+    assert accepted == motion == set()
+    assert not birth_allowed
+
+
+def _revision_candidate(position, rows, revision=10):
+    return replace(_candidate(position, bracket=(float(int(position)), float(int(position) + 1)),
+                              boundary_age=0, boundary_revision=(revision, revision)),
+                   checkpoint_evidence=rows)
+
+
+@pytest.mark.asyncio
+async def test_regressing_exact_census_row_fences_frozen_owner_after_metadata_refresh():
+    tracker = MarkerTracker()
+    first = _revision_candidate(4.0, ((7, 100.0, 10), (8, 200.0, 10)))
+    second = _revision_candidate(6.0, ((7, 400.0, 10), (8, 500.0, 10)))
+    initial = await tracker.update(_snapshot(1), [first, second])
+    accepted = replace(second, bracket=None, boundary_revision=None, position_authoritative=False,
+                       checkpoint_evidence=((7, 420.0, 30), (8, 520.0, 30)),
+                       source_observations=frozenset({("probe", 30)}))
+    await tracker.update(_snapshot(1, collected_at=BASE_TIME + timedelta(seconds=30)), [accepted])
+    old = list(tracker._routes[("KMB", "R", "out")].values())
+    held_bundle = old[1].estimate
+    stale = replace(_revision_candidate(4.5, ((7, 400.0, 9), (8, 500.0, 9)), 40),
+                    source_observations=frozenset({("probe", 9)}))
+    unrelated = _revision_candidate(4.25, ((7, 120.0, 31), (8, 220.0, 31)), 31)
+    reservations, blocked_old, blocked_new = tracker_module._same_generation_identity_plan(
+        old, [stale, unrelated], BASE_TIME.timestamp() + 60,
+    )
+    assert reservations == {(0, 1)}
+    assert blocked_old == {1} and blocked_new == {0}
+    current = await tracker.update(
+        _snapshot(1, collected_at=BASE_TIME + timedelta(seconds=60)), [stale, unrelated],
+    )
+    assert [item.track_id for item in current] == [item.track_id for item in initial]
+    assert [item.position for item in current] == [4.25, 6.0]
+    assert old[1].estimate == held_bundle
+
+
+@pytest.mark.asyncio
+async def test_post_cohort_ttl_fallback_cannot_publish_regressing_response():
+    tracker = MarkerTracker()
+    initial = _revision_candidate(5.0, ((7, 100.0, 10), (8, 200.0, 10)))
+    seeded = await tracker.update(_snapshot(1), [initial])
+    accepted = replace(initial, bracket=None, boundary_revision=None, position_authoritative=False,
+                       checkpoint_evidence=((7, 120.0, 30), (8, 220.0, 30)),
+                       source_observations=frozenset({("probe", 30)}))
+    await tracker.update(_snapshot(1, collected_at=BASE_TIME + timedelta(seconds=30)), [accepted])
+    track = tracker._routes[("KMB", "R", "out")][seeded[0].track_id]
+    accepted_bundle = track.estimate
+    stale = _revision_candidate(5.5, ((7, 130.0, 20), (8, 230.0, 20)), 40)
+    held = await tracker.update(
+        _snapshot(1, collected_at=BASE_TIME + timedelta(seconds=121)), [stale],
+    )
+    assert held[0].position == 5.0
+    assert track.estimate == accepted_bundle
+    assert track.boundary_revision == (10, 10)
+    assert track.last_evidence_at == BASE_TIME.timestamp()
+    fresh = replace(stale, checkpoint_evidence=((7, 130.0, 40), (8, 230.0, 40)))
+    moved = await tracker.update(
+        _snapshot(1, collected_at=BASE_TIME + timedelta(seconds=130)), [fresh],
+    )
+    assert moved[0].track_id == seeded[0].track_id
+    assert moved[0].position == 5.5
+    assert track.estimate.checkpoint_evidence == fresh.checkpoint_evidence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_stale_extra_candidate_cannot_force_neighbour_motion(reverse):
+    tracker = MarkerTracker()
+    initial_candidates = [
+        _revision_candidate(4.0, ((7, 100.0, 10), (8, 200.0, 10))),
+        _revision_candidate(6.0, ((7, 230.0, 10), (8, 330.0, 10))),
+        _revision_candidate(10.0, ((15, 600.0, 10), (16, 700.0, 10))),
+    ]
+    initial = await tracker.update(_snapshot(1), initial_candidates)
+    accepted = replace(initial_candidates[0], bracket=None, boundary_revision=None,
+                       position_authoritative=False,
+                       checkpoint_evidence=((7, 120.0, 30), (8, 220.0, 30)))
+    await tracker.update(_snapshot(1, collected_at=BASE_TIME + timedelta(seconds=30)), [accepted])
+    old = list(tracker._routes[("KMB", "R", "out")].values())
+    held_bundles = [track.estimate for track in old[:2]]
+    candidates = [
+        _revision_candidate(4.5, ((7, 120.0, 20), (8, 220.0, 20)), 40),
+        _revision_candidate(6.5, ((7, 170.0, 40), (8, 270.0, 40)), 40),
+        _revision_candidate(10.5, ((15, 620.0, 40), (16, 720.0, 40)), 40),
+    ]
+    reservations, blocked_old, blocked_new = tracker_module._same_generation_identity_plan(
+        old, candidates, BASE_TIME.timestamp() + 60,
+    )
+    assert reservations == {(2, 2)}
+    assert blocked_old == blocked_new == {0, 1}
+    current = await tracker.update(
+        _snapshot(1, collected_at=BASE_TIME + timedelta(seconds=60)),
+        candidates[::-1] if reverse else candidates,
+    )
+    assert [item.track_id for item in current] == [item.track_id for item in initial]
+    assert [item.position for item in current] == [4.0, 6.0, 10.5]
+    assert [track.estimate for track in old[:2]] == held_bundles
+
+
+def test_nonreserved_fallback_transaction_obeys_other_tracks_response_revision_floor():
+    old = [_capacity_track(1, (7, 100.0, 10), 4.0),
+           _capacity_track(2, (7, 400.0, 30), 6.0)]
+    stale = _capacity_candidate((7, 130.0, 20), 4.5)
+    accepted, birth_allowed = _select_valid_partial_transaction(
+        old, [stale], [stale], [(0, 0)], {0: 4.5},
+    )
+    assert not accepted
+    assert birth_allowed
+
+
+def test_partial_metadata_transaction_rolls_back_claims_and_blocks_retained_owner_birth():
+    first, second, third = ((index, BASE_TIME.timestamp() + index, 10) for index in range(3))
+    old = [_capacity_track(1, first, 4.0), _capacity_track(2, second, 5.0)]
+    candidate = _capacity_candidate(second, 4.0)
+    birth = _capacity_candidate(third, 6.0)
+    accepted, birth_allowed, motion = _select_valid_partial_transaction(
+        old, [candidate, birth], [candidate], [(0, 0)], {}, metadata_indices={0},
+        birth_candidate=birth,
+    )
+    assert accepted == motion == set()
+    assert birth_allowed
+    conflicting_birth = _capacity_candidate(second, 6.0)
+    accepted, birth_allowed, motion = _select_valid_partial_transaction(
+        old, [conflicting_birth], [], [], {}, metadata_indices=set(),
+        birth_candidate=conflicting_birth,
+    )
+    assert accepted == motion == set()
+    assert not birth_allowed
 
 
 def test_unknown_candidate_cannot_demote_sticky_position_authority():
@@ -4838,12 +5422,14 @@ async def test_partial_birth_capacity_checks_final_public_population():
     candidate_multiplicity = Counter(
         row for candidate in candidates for row in candidate.checkpoint_evidence
     )
-    assert len(current) == len(initial) == 2
+    # The reserved held continuation releases the stale checkpoint-6 claim
+    # transactionally, leaving capacity for the already-certified surplus.
+    assert len(current) == len(initial) + 1 == 3
     assert multiplicity[(6, 1767226080.0, 31)] <= candidate_multiplicity[
         (6, 1767226080.0, 31)
     ]
     assert tracker.poll_lifecycle_routes() == {route_key}
-    assert route_key not in tracker._partial_birth_generations  # noqa: SLF001
+    assert route_key in tracker._partial_birth_generations  # noqa: SLF001
 
     ordinary_tracker = MarkerTracker()
     ordinary_initial = await ordinary_tracker.update(_snapshot(1), initial_candidates)
@@ -4883,6 +5469,9 @@ async def test_partial_birth_at_capacity_keeps_established_tracks():
     }
     assert [marker.position for marker in partial] == pytest.approx([1.0, 2.0])
     assert [marker.checkpoint_evidence for marker in partial] == [
+        candidate.checkpoint_evidence for candidate in candidates[1:]
+    ]
+    assert [track.committed_boundary_evidence for track in tracker._routes[route_key].values()] == [
         marker.checkpoint_evidence for marker in initial
     ]
     assert route_key not in tracker._partial_birth_generations  # noqa: SLF001

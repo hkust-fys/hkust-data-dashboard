@@ -364,7 +364,7 @@ class HttpClient:
             return False, value, self.cache._store[key].fetched_at  # noqa: SLF001
         try:
             value = await fetcher(spec.url.format(**url_kwargs))
-        except FetchError as exc:
+        except (TimeoutError, aiohttp.ClientError, FetchError) as exc:
             old_hit, old = self.cache.get(key, ttl=float("inf"))
             if old_hit:
                 log.warning("stale-on-error for %s: %s", key, exc)

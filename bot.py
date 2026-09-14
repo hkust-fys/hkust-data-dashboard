@@ -26,7 +26,6 @@ import secrets
 import sys
 import time
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,24 +33,25 @@ from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
-from dashboard import maps, road_policy
+from dashboard import maps, pipeline, road_policy  # noqa: F401
 from dashboard.config import ConfigError, Settings
 from dashboard.http import HttpClient
 from dashboard.models import (
     CameraFrame,
     DashboardPayload,
     ImageAsset,
-    WeatherConditions,
 )
-from dashboard.providers import cameras, transit
-from dashboard.providers import route_geometry as route_geometry_provider
-from dashboard.providers import tracked_roads as tracked_roads_provider
-from dashboard.providers import traffic as traffic_provider
-from dashboard.providers import weather as weather_provider
-from dashboard.render import (
-    build_payload,
-    traffic_map_filename,
+
+# Historical provider names remain importable for diagnostics and monkeypatches.
+from dashboard.providers import (
+    cameras,
+    transit,  # noqa: F401
 )
+from dashboard.providers import route_geometry as route_geometry_provider  # noqa: F401
+from dashboard.providers import tracked_roads as tracked_roads_provider  # noqa: F401
+from dashboard.providers import traffic as traffic_provider  # noqa: F401
+from dashboard.providers import weather as weather_provider  # noqa: F401
+from dashboard.render import traffic_map_filename
 from dashboard.runtime import startup_preflight
 
 log = logging.getLogger(__name__)
@@ -71,9 +71,9 @@ class _DashboardSendAttemptEvidence:
     wire_attempts: int = 0
 
 
-_active_dashboard_send_evidence: contextvars.ContextVar[
-    _DashboardSendAttemptEvidence | None
-] = contextvars.ContextVar("active_dashboard_send_evidence", default=None)
+_active_dashboard_send_evidence: contextvars.ContextVar[_DashboardSendAttemptEvidence | None] = (
+    contextvars.ContextVar("active_dashboard_send_evidence", default=None)
+)
 
 
 def _note_dashboard_send_wire_attempt(method: object, url: object) -> None:
@@ -150,9 +150,7 @@ def _configure_discord_http_deadlines(http) -> None:
     """Reject long 429 sleeps and make the library's global gate recoverable."""
     http.max_ratelimit_timeout = DISCORD_MAX_RATELIMIT_RETRY_SECONDS
     global_gate = getattr(http, "_global_over", None)
-    if global_gate is not None and not isinstance(
-        global_gate, _CancellationSafeDiscordGlobalGate
-    ):
+    if global_gate is not None and not isinstance(global_gate, _CancellationSafeDiscordGlobalGate):
         http._global_over = _CancellationSafeDiscordGlobalGate(  # noqa: SLF001
             global_gate,
             DISCORD_MAX_RATELIMIT_RETRY_SECONDS,
@@ -171,296 +169,29 @@ def _setup_logging(level: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def _map_road_paths_from_results(
-    traffic_result: object,
-    roads: object,
-) -> tuple[list[list[tuple[float, float]]], list[list[tuple[float, float]]]]:
-    """Derive map overlays from an already-published provider snapshot."""
-    important_paths = road_policy.important_road_paths(roads)
-    if not (isinstance(traffic_result, tuple) and len(traffic_result) >= 3):
-        return [], important_paths
-    segments_near = getattr(roads, "segments_near", None)
-    if segments_near is None:
-        return [], important_paths
-    paths: list[list[tuple[float, float]]] = []
-    seen_paths: set[tuple[tuple[float, float], ...]] = set()
-    for incident in traffic_result[1] or []:
-        latitude = getattr(incident, "latitude", None)
-        longitude = getattr(incident, "longitude", None)
-        keys = traffic_provider.resolve_incident_road_keys(incident, roads)
-        has_coordinates = (
-            isinstance(latitude, (int, float))
-            and isinstance(longitude, (int, float))
-            and 22.0 <= latitude <= 23.0
-            and 113.5 <= longitude <= 114.7
-        )
-        if not has_coordinates:
-            # A malformed, partial, or out-of-range coordinate is an explicit
-            # source signal, not permission to guess a whole road. Only a
-            # completely coordinate-less notice may use the conservative
-            # short-road fallback.
-            if latitude is not None or longitude is not None:
-                continue
-            near_landmark = str(getattr(incident, "near_landmark", "") or "").strip()
-            between_landmark = str(
-                getattr(incident, "between_landmark", "") or ""
-            ).strip()
-            if near_landmark or between_landmark:
-                # A landmark-only notice may still name a specific short
-                # sub-road (for example, "Lung Cheung Road flyover").
-                keys = traffic_provider.resolve_incident_road_keys(
-                    incident, roads, prefer_refinement=True
-                )
-                if not keys:
-                    continue
-            latitude = longitude = None
-        if not keys:
-            continue
-        for path in segments_near(keys, latitude, longitude) or ():
-            normalized = tuple((float(lat), float(lon)) for lat, lon in path)
-            if len(normalized) >= 2 and normalized not in seen_paths:
-                seen_paths.add(normalized)
-                paths.append(list(normalized))
-    return paths, important_paths
+# Compatibility forwarding names. Collection and payload adaptation live in
+# dashboard.pipeline; these names keep diagnostic scripts and older tests
+# importing bot's historical API working.
+_map_road_paths_from_results = pipeline.map_road_paths_from_results
+_fetch_traffic_map_from_results = pipeline.fetch_traffic_map_from_results
+_to_payload = pipeline.to_payload
 
-
-async def _fetch_traffic_map_from_results(
-    client: HttpClient,
-    settings: Settings,
-    results: dict[str, object],
-    tracker: object,
-) -> object:
-    """Render one map from retained inputs without joining provider network work."""
-    transit_result = results.get("transit")
-    groups = (
-        transit_result[0]
-        if isinstance(transit_result, tuple) and len(transit_result) == 3
-        else []
-    )
-    roads = results.get("tracked_roads")
-    if roads is None or isinstance(roads, Exception):
-        roads = tracked_roads_provider.fallback_roads()
-    affected_paths, important_paths = _map_road_paths_from_results(
-        results.get("traffic"), roads
-    )
-    return await maps.fetch_traffic_map(
-        client,
-        groups=groups,
-        cache_dir=settings.cache_dir,
-        affected_road_paths=affected_paths,
-        tracker=tracker,
-        important_road_paths=important_paths,
-    )
 
 async def collect_all(
     client: HttpClient,
     settings: Settings,
-    on_result: Callable[[str, object], None] | None = None,
+    on_result: pipeline.ResultCallback | None = None,
     tracker=None,
     include_traffic_map: bool = True,
-) -> dict[str, object]:
-    """Fetch all provider groups concurrently; return raw results keyed by name.
-
-    Each entry is either the provider's result object or an exception (callers
-    isolate failures).
-    """
-    from dashboard.providers import tracked_roads as tracked_roads_provider
-
-    tasks: dict[str, asyncio.Task] = {}
-
-    async def _tracked_roads():
-        return await tracked_roads_provider.fetch_tracked_roads(
-            client, cache_dir=settings.cache_dir, wait_for_refresh=False
-        )
-
-    async def _transit():
-        return await transit.fetch_transit_etas(client)
-
-    async def _weather():
-        return await weather_provider.fetch_weather_conditions(client)
-
-    async def _traffic():
-        # Road matching needs the tracked-roads table. A cold derivation can
-        # take a while, so give it a short grace period and fall back to the
-        # curated seed rather than delaying TD news.
-        try:
-            roads = await asyncio.wait_for(
-                asyncio.shield(tasks["tracked_roads"]),
-                timeout=TRACKED_ROADS_WAIT_SECONDS,
-            )
-        except Exception:  # noqa: BLE001
-            roads = tracked_roads_provider.fallback_roads()
-        return await traffic_provider.fetch_traffic_data(client, roads)
-
-    async def _map_road_paths() -> tuple[
-        list[list[tuple[float, float]]],
-        list[list[tuple[float, float]]],
-    ]:
-        """Return affected segments and full important-road OSM corridors."""
-        try:
-            traffic_result = await tasks["traffic"]
-        except Exception:  # noqa: BLE001
-            traffic_result = None
-        try:
-            roads = await asyncio.wait_for(
-                asyncio.shield(tasks["tracked_roads"]),
-                timeout=TRACKED_ROADS_WAIT_SECONDS,
-            )
-        except Exception:  # noqa: BLE001
-            roads = tracked_roads_provider.fallback_roads()
-        return _map_road_paths_from_results(traffic_result, roads)
-
-    async def _traffic_map():
-        # Transit ETA groups still drive retained estimated bus markers.
-        groups: list = []
-        try:
-            transit_result = await tasks["transit"]
-            if isinstance(transit_result, tuple) and len(transit_result) == 3:
-                groups = transit_result[0]
-        except Exception as exc:  # noqa: BLE001
-            log.warning("traffic map: transit groups unavailable: %s", exc)
-        affected_paths, important_paths = await _map_road_paths()
-        return await maps.fetch_traffic_map(
-            client,
-            groups=groups,
-            cache_dir=settings.cache_dir,
-            affected_road_paths=affected_paths,
-            tracker=tracker,
-            important_road_paths=important_paths,
-        )
-
-    for name, coro in (
-        ("tracked_roads", _tracked_roads()),
-        ("transit", _transit()),
-        ("weather", _weather()),
-        ("traffic", _traffic()),
-    ):
-        tasks[name] = asyncio.create_task(coro)
-
-    if include_traffic_map:
-        # One-shot callers retain the historical complete collection.
-        tasks["traffic_map"] = asyncio.create_task(_traffic_map())
-
-    results: dict[str, object] = {}
-    task_names = {task: name for name, task in tasks.items()}
-    pending = set(tasks.values())
-    try:
-        # Publish every provider as soon as it settles.  In particular, a slow
-        # browser capture no longer prevents weather/traffic/transit from reaching
-        # the snapshot used by the fixed-cadence presenter.
-        while pending:
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in done:
-                name = task_names[task]
-                try:
-                    value = task.result()
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("provider %s failed: %s", name, exc)
-                    value = exc
-                results[name] = value
-                if on_result is not None:
-                    on_result(name, value)
-        return results
-    finally:
-        # A cancelled collection must not leave provider tasks (especially the
-        # Playwright map capture) running after the caller has shut down.
-        remaining = [task for task in tasks.values() if not task.done()]
-        for task in remaining:
-            task.cancel()
-        if remaining:
-            await asyncio.gather(*remaining, return_exceptions=True)
-
-
-def _to_payload(results: dict[str, object]) -> DashboardPayload:
-    """Convert collected results into a renderable payload."""
-    errors: list[str] = []
-
-    transit_result = results.get("transit")
-    if isinstance(transit_result, Exception):
-        errors.append("transit ETA unavailable")
-        groups: list = []
-        transit_source_time = None
-    elif isinstance(transit_result, tuple) and len(transit_result) == 3:
-        groups, transit_source_time, failed_ops = transit_result
-        for op in failed_ops:
-            errors.append(f"{op} ETA unavailable")
-    else:
-        groups = []
-        transit_source_time = None
-
-    weather_result = results.get("weather")
-    weather: WeatherConditions | None = None
-    if isinstance(weather_result, Exception):
-        errors.append("HKO weather unavailable")
-    elif isinstance(weather_result, tuple) and len(weather_result) == 3:
-        snap, warnings, warn_time = weather_result
-        weather = WeatherConditions(
-            warnings=warnings, snapshot=snap, warning_time=warn_time
-        )
-    elif isinstance(weather_result, WeatherConditions):
-        weather = weather_result
-
-    traffic_result = results.get("traffic")
-    traffic_source_times: dict = {}
-    if isinstance(traffic_result, Exception):
-        errors.append("TD traffic unavailable")
-        statuses, incidents, roadworks, capture_time, traffic_stale = [], [], [], None, []
-    elif isinstance(traffic_result, tuple) and len(traffic_result) >= 6:
-        (
-            statuses,
-            incidents,
-            roadworks,
-            capture_time,
-            traffic_stale,
-            traffic_source_times,
-        ) = traffic_result[:6]
-    elif isinstance(traffic_result, tuple) and len(traffic_result) >= 5:
-        statuses, incidents, roadworks, capture_time, traffic_stale = traffic_result
-    elif isinstance(traffic_result, tuple) and len(traffic_result) == 4:
-        statuses, incidents, roadworks, capture_time = traffic_result
-        traffic_stale = []
-    else:
-        statuses, incidents, roadworks, capture_time, traffic_stale = [], [], [], None, []
-
-    # The map provider returns the Google base image and retained markers.
-    map_result_present = "traffic_map" in results
-    smap_result = results.get("traffic_map")
-    if isinstance(smap_result, Exception):
-        map_webp: bytes | None = None
-    elif isinstance(smap_result, tuple) and len(smap_result) >= 2:
-        map_webp = smap_result[0]
-    else:
-        map_webp = None
-    map_initializing = not map_result_present
-    if map_webp is None and map_result_present:
-        errors.append("traffic map unavailable")
-    map_source_time = None
-
-    # Bus-stop live view moved behind the dashboard button; the dashboard
-    # message itself no longer carries always-on camera embeds.
-    # Tracked-roads table (OSM-derived) drives affected-route listings.
-    roads_table = results.get("tracked_roads")
-    if isinstance(roads_table, Exception):
-        roads_table = None
-
-    return build_payload(
-        weather=weather,
-        groups=groups,
-        statuses=statuses,
-        incidents=incidents,
-        capture_time=capture_time,
-        traffic_map_webp=map_webp,
-        traffic_map_initializing=map_initializing,
-        transit_source_time=transit_source_time,
-        map_source_time=map_source_time,
-        roadworks=roadworks,
-        traffic_stale_sources=traffic_stale,
-        traffic_source_times=traffic_source_times,
-        traffic_source_time=capture_time,
-        errors=errors,
-        roads=roads_table,
+) -> pipeline.ProviderResults:
+    """Expose the collection capabilities used by updater feature detection."""
+    return await pipeline.collect_all(
+        client,
+        settings,
+        on_result=on_result,
+        tracker=tracker,
+        include_traffic_map=include_traffic_map,
+        tracked_roads_wait_seconds=TRACKED_ROADS_WAIT_SECONDS,
     )
 
 
@@ -579,8 +310,12 @@ class LiveViewSnapshotView(discord.ui.View):
         super().__init__(timeout=None)
         self.updater = updater
 
-    @discord.ui.button(label="Bus stops live", style=discord.ButtonStyle.primary,
-                       custom_id=LIVE_VIEW_BUTTON_ID, emoji="📷")
+    @discord.ui.button(
+        label="Bus stops live",
+        style=discord.ButtonStyle.primary,
+        custom_id=LIVE_VIEW_BUTTON_ID,
+        emoji="📷",
+    )
     async def snapshot(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         # Acknowledge within the 3-second window no matter how busy the loop
         # is; every outcome is delivered as an ephemeral followup.
@@ -625,8 +360,11 @@ class LiveViewSnapshotView(discord.ui.View):
                     ephemeral=True,
                 )
             return
-        if cache is None or not cache.fresh or updater.client is None or (
-            not updater.settings.ffmpeg_executable
+        if (
+            cache is None
+            or not cache.fresh
+            or updater.client is None
+            or (not updater.settings.ffmpeg_executable)
         ):
             with contextlib.suppress(Exception):
                 await interaction.followup.send(
@@ -678,9 +416,7 @@ async def _send_ephemeral_snapshot(
     try:
         ends = time.monotonic() + LIVE_VIEW_SNAPSHOT_SECONDS
         message = await interaction.followup.send(
-            embeds=_snapshot_embeds_with_countdown(
-                parts.embeds, ends, len(parts.assets)
-            ),
+            embeds=_snapshot_embeds_with_countdown(parts.embeds, ends, len(parts.assets)),
             files=parts.files(),
             ephemeral=True,
             wait=True,
@@ -699,9 +435,7 @@ async def _send_ephemeral_snapshot(
                 break
             with contextlib.suppress(Exception):
                 await message.edit(
-                    embeds=_snapshot_embeds_with_countdown(
-                        parts.embeds, ends, len(parts.assets)
-                    ),
+                    embeds=_snapshot_embeds_with_countdown(parts.embeds, ends, len(parts.assets)),
                     attachments=parts.files(),
                 )
         await asyncio.sleep(max(0.0, ends - time.monotonic()))
@@ -762,9 +496,7 @@ async def _refresh_ephemeral_snapshot(
                 break
             with contextlib.suppress(Exception):
                 await message.edit(
-                        embeds=_snapshot_embeds_with_countdown(
-                        parts.embeds, ends, len(parts.assets)
-                    ),
+                    embeds=_snapshot_embeds_with_countdown(parts.embeds, ends, len(parts.assets)),
                     attachments=parts.files(),
                 )
         await asyncio.sleep(max(0.0, ends - time.monotonic()))
@@ -801,9 +533,7 @@ async def _scan_dashboard_messages(
     before: datetime | None = None,
 ) -> list[object]:
     """Strictly scan history for this bot's dashboard messages."""
-    expected_author = expected_author or getattr(
-        getattr(channel, "guild", None), "me", None
-    )
+    expected_author = expected_author or getattr(getattr(channel, "guild", None), "me", None)
     history_options = {"limit": None, "after": after, "before": before}
     if after is None and before is None:
         history_options = {"limit": 50}
@@ -852,8 +582,7 @@ async def _resolve_dashboard_message(
         else:
             if not _is_dashboard_message(configured, expected_author):
                 log.warning(
-                    "configured message %s is not this bot's exact dashboard marker; "
-                    "scanning",
+                    "configured message %s is not this bot's exact dashboard marker; scanning",
                     configured_message_id,
                 )
                 configured = None
@@ -917,8 +646,11 @@ def _payload_fingerprint(payload: DashboardPayload) -> str:
             as_dict.pop("timestamp", None)
         embeds.append(as_dict)
     files = [
-        {"filename": asset.filename, "content_type": asset.content_type,
-         "data_sha256": hashlib.sha256(asset.data).hexdigest()}
+        {
+            "filename": asset.filename,
+            "content_type": asset.content_type,
+            "data_sha256": hashlib.sha256(asset.data).hexdigest(),
+        }
         for asset in payload.files
     ]
     serialized = json.dumps(
@@ -938,9 +670,7 @@ def _load_dashboard_runtime_state(settings: Settings) -> dict[str, object]:
     """Load rollover state only when it belongs to this announce channel."""
     try:
         raw = json.loads(
-            _dashboard_runtime_state_path(settings.cache_dir).read_text(
-                encoding="utf-8"
-            )
+            _dashboard_runtime_state_path(settings.cache_dir).read_text(encoding="utf-8")
         )
         if not isinstance(raw, dict):
             return {}
@@ -1121,6 +851,7 @@ class CollectionSnapshot:
     # generation.  The default keeps older test/dev constructors compatible.
     settled_providers: frozenset[str] = frozenset()
 
+
 class DashboardUpdater:
     """Owns the session, providers, caches, and the single update loop."""
 
@@ -1157,11 +888,15 @@ class DashboardUpdater:
         self._status_thread_id = loaded_thread_id or settings.dashboard_message_id
         self._persisted_status_thread_id = loaded_thread_id
         pending_ids = runtime_state.get("pending_dashboard_message_ids", [])
-        self._pending_dashboard_delete_ids = {
-            item
-            for item in pending_ids
-            if isinstance(item, int) and not isinstance(item, bool) and item > 0
-        } if isinstance(pending_ids, list) else set()
+        self._pending_dashboard_delete_ids = (
+            {
+                item
+                for item in pending_ids
+                if isinstance(item, int) and not isinstance(item, bool) and item > 0
+            }
+            if isinstance(pending_ids, list)
+            else set()
+        )
         uncertain_since = runtime_state.get("rollover_uncertain_since")
         self._rollover_uncertain_since = (
             float(uncertain_since)
@@ -1190,9 +925,7 @@ class DashboardUpdater:
         )
         # Any episode surviving a process boundary has an attempt whose
         # server-side outcome was not durably resolved.
-        self._dashboard_send_had_ambiguous_attempt = (
-            self._dashboard_send_nonce is not None
-        )
+        self._dashboard_send_had_ambiguous_attempt = self._dashboard_send_nonce is not None
         self._dashboard_send_retry_ready = False
         self._dashboard_messages_reconciled = False
         self._pending_dashboard_deletes: dict[int, object] = {}
@@ -1234,18 +967,12 @@ class DashboardUpdater:
 
     @property
     def is_running(self) -> bool:
-        return bool(
-            self._running
-            and self._loop_task is not None
-            and not self._loop_task.done()
-        )
+        return bool(self._running and self._loop_task is not None and not self._loop_task.done())
 
     def _persist_dashboard_runtime_state(self) -> bool:
         state: dict[str, object] = {
             "announce_channel_id": self.settings.announce_channel_id,
-            "pending_dashboard_message_ids": sorted(
-                self._pending_dashboard_delete_ids
-            ),
+            "pending_dashboard_message_ids": sorted(self._pending_dashboard_delete_ids),
         }
         if self._status_thread_id is not None:
             state["status_thread_id"] = self._status_thread_id
@@ -1256,9 +983,7 @@ class DashboardUpdater:
         if self._dashboard_send_nonce is not None:
             state["dashboard_send_nonce"] = self._dashboard_send_nonce
         if self._dashboard_send_predecessor_id is not None:
-            state["dashboard_send_predecessor_id"] = (
-                self._dashboard_send_predecessor_id
-            )
+            state["dashboard_send_predecessor_id"] = self._dashboard_send_predecessor_id
         return _store_dashboard_runtime_state(self.settings, state)
 
     def _mark_rollover_send_uncertain(self) -> bool:
@@ -1321,9 +1046,7 @@ class DashboardUpdater:
         message_id = getattr(message, "id", None)
         return (
             message_id
-            if isinstance(message_id, int)
-            and not isinstance(message_id, bool)
-            and message_id > 0
+            if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0
             else None
         )
 
@@ -1336,10 +1059,7 @@ class DashboardUpdater:
         if message is None:
             return
         key = self._dashboard_message_key(message)
-        if (
-            self._message is not None
-            and key == self._dashboard_message_key(self._message)
-        ):
+        if self._message is not None and key == self._dashboard_message_key(self._message):
             return
         self._pending_dashboard_deletes[key] = message
         if isinstance(getattr(message, "id", None), int):
@@ -1366,9 +1086,8 @@ class DashboardUpdater:
             self._persist_dashboard_runtime_state()
         if persisted_message_id is not None:
             current_message_id = self._dashboard_message_id(self._message)
-            if (
-                current_message_id == persisted_message_id
-                and _is_dashboard_message(self._message, expected_author)
+            if current_message_id == persisted_message_id and _is_dashboard_message(
+                self._message, expected_author
             ):
                 persisted_message = self._message
             else:
@@ -1398,13 +1117,9 @@ class DashboardUpdater:
                             self._message = None
                         self._persist_dashboard_runtime_state()
         try:
-            messages = await _bounded_discord(
-                _scan_dashboard_messages(channel, expected_author)
-            )
+            messages = await _bounded_discord(_scan_dashboard_messages(channel, expected_author))
             if self._rollover_uncertain_since is not None:
-                uncertain_at = datetime.fromtimestamp(
-                    self._rollover_uncertain_since, UTC
-                )
+                uncertain_at = datetime.fromtimestamp(self._rollover_uncertain_since, UTC)
                 messages.extend(
                     await _bounded_discord(
                         _scan_dashboard_messages(
@@ -1433,11 +1148,7 @@ class DashboardUpdater:
             reverse=True,
         )
         previous = self._message
-        previous_key = (
-            self._dashboard_message_key(previous)
-            if previous is not None
-            else None
-        )
+        previous_key = self._dashboard_message_key(previous) if previous is not None else None
         pending_delete_keys = {
             *self._pending_dashboard_delete_ids,
             *self._pending_dashboard_deletes,
@@ -1457,13 +1168,9 @@ class DashboardUpdater:
         elif previous_key in pending_delete_keys:
             self._message = None
         canonical_key = (
-            self._dashboard_message_key(self._message)
-            if self._message is not None
-            else None
+            self._dashboard_message_key(self._message) if self._message is not None else None
         )
-        self._persisted_dashboard_message_id = self._dashboard_message_id(
-            self._message
-        )
+        self._persisted_dashboard_message_id = self._dashboard_message_id(self._message)
         if canonical_key != previous_key:
             self._last_payload_fingerprint = None
         if canonical_key is not None:
@@ -1480,11 +1187,7 @@ class DashboardUpdater:
             if message is not None
         )
         predecessor_id = self._dashboard_send_predecessor_id
-        if (
-            nonce_resolved
-            and predecessor_id is not None
-            and predecessor_id != canonical_key
-        ):
+        if nonce_resolved and predecessor_id is not None and predecessor_id != canonical_key:
             self._pending_dashboard_delete_ids.add(predecessor_id)
 
         unresolved_pending_id = False
@@ -1500,9 +1203,7 @@ class DashboardUpdater:
                 if _is_discord_not_found(exc):
                     self._pending_dashboard_delete_ids.discard(message_id)
                 else:
-                    log.warning(
-                        "persisted stale dashboard fetch deferred: %s", exc
-                    )
+                    log.warning("persisted stale dashboard fetch deferred: %s", exc)
                     unresolved_pending_id = True
                 continue
             if _is_dashboard_message(stale, expected_author):
@@ -1524,16 +1225,10 @@ class DashboardUpdater:
             started_at = self._rollover_uncertain_since or 0.0
             nonce_age = max(0.0, time.time() - started_at)
             self._dashboard_send_retry_ready = (
-                not unresolved_pending_id
-                and nonce_age < DASHBOARD_SEND_NONCE_RETRY_SECONDS
+                not unresolved_pending_id and nonce_age < DASHBOARD_SEND_NONCE_RETRY_SECONDS
             )
-        self._dashboard_messages_reconciled = (
-            not unresolved_pending_id
-            and (
-                pending_nonce is None
-                or nonce_resolved
-                or self._dashboard_send_retry_ready
-            )
+        self._dashboard_messages_reconciled = not unresolved_pending_id and (
+            pending_nonce is None or nonce_resolved or self._dashboard_send_retry_ready
         )
         self._persist_dashboard_runtime_state()
         self._start_dashboard_cleanup_if_idle()
@@ -1550,9 +1245,7 @@ class DashboardUpdater:
         if not self._persist_dashboard_runtime_state():
             self._dashboard_send_retry_ready = False
             self._dashboard_messages_reconciled = False
-            raise RuntimeError(
-                "cannot persist dashboard-send recovery state; retry deferred"
-            )
+            raise RuntimeError("cannot persist dashboard-send recovery state; retry deferred")
         previous = self._message
         predecessor_id = self._dashboard_send_predecessor_id
         self._dashboard_send_retry_ready = False
@@ -1568,15 +1261,9 @@ class DashboardUpdater:
             )
         )
 
-        candidates = [
-            message
-            for message in (previous, replacement)
-            if message is not None
-        ]
+        candidates = [message for message in (previous, replacement) if message is not None]
         self._message = max(candidates, key=self._dashboard_message_key)
-        self._persisted_dashboard_message_id = self._dashboard_message_id(
-            self._message
-        )
+        self._persisted_dashboard_message_id = self._dashboard_message_id(self._message)
         # A nonce replay returns the payload accepted by the original POST,
         # which may predate this tick. Let the normal edit path apply and hash
         # the current payload before claiming its fingerprint.
@@ -1589,9 +1276,7 @@ class DashboardUpdater:
         if predecessor_id is not None and predecessor_id != canonical_key:
             if predecessor_id not in known_keys:
                 try:
-                    predecessor = await _bounded_discord(
-                        channel.fetch_message(predecessor_id)
-                    )
+                    predecessor = await _bounded_discord(channel.fetch_message(predecessor_id))
                 except Exception as exc:  # noqa: BLE001
                     if not _is_discord_not_found(exc):
                         log.warning(
@@ -1600,9 +1285,7 @@ class DashboardUpdater:
                         )
                         self._pending_dashboard_delete_ids.add(predecessor_id)
                 else:
-                    expected_author = getattr(
-                        getattr(channel, "guild", None), "me", None
-                    )
+                    expected_author = getattr(getattr(channel, "guild", None), "me", None)
                     if _is_dashboard_message(predecessor, expected_author):
                         self._queue_dashboard_delete(predecessor)
             elif predecessor_id not in self._pending_dashboard_deletes:
@@ -1668,9 +1351,7 @@ class DashboardUpdater:
     ) -> object:
         replacement, stale = result
         self._message = replacement
-        self._persisted_dashboard_message_id = self._dashboard_message_id(
-            replacement
-        )
+        self._persisted_dashboard_message_id = self._dashboard_message_id(replacement)
         self._last_payload_fingerprint = fingerprint
         if stale is not None:
             # Persist cleanup ownership before clearing the send episode. If
@@ -1690,13 +1371,9 @@ class DashboardUpdater:
     ) -> object:
         """Finish and adopt one bounded rollover even if the loop is stopped."""
         if self._dashboard_send_nonce is not None:
-            raise RuntimeError(
-                "uncertain dashboard send must reconcile before rollover"
-            )
+            raise RuntimeError("uncertain dashboard send must reconcile before rollover")
         if not self._mark_rollover_send_uncertain():
-            raise RuntimeError(
-                "cannot persist rollover recovery state; replacement deferred"
-            )
+            raise RuntimeError("cannot persist rollover recovery state; replacement deferred")
         attempt_evidence = _DashboardSendAttemptEvidence()
         task = asyncio.create_task(
             _rollover_dashboard_message(
@@ -1740,9 +1417,7 @@ class DashboardUpdater:
         thread_id = self._status_thread_id
         if thread_id is None or self._message is None:
             return None
-        fetch_channel = getattr(
-            getattr(self._message, "guild", None), "fetch_channel", None
-        )
+        fetch_channel = getattr(getattr(self._message, "guild", None), "fetch_channel", None)
         if fetch_channel is None:
             return None
         try:
@@ -1792,9 +1467,7 @@ class DashboardUpdater:
                 thread = next(
                     (
                         item
-                        for item in getattr(
-                            getattr(self._message, "channel", None), "threads", []
-                        )
+                        for item in getattr(getattr(self._message, "channel", None), "threads", [])
                         if getattr(item, "id", None) == self._message.id
                     ),
                     None,
@@ -1816,16 +1489,12 @@ class DashboardUpdater:
                     )
                     if fetch_channel is not None:
                         try:
-                            thread = await _bounded_discord(
-                                fetch_channel(self._message.id)
-                            )
+                            thread = await _bounded_discord(fetch_channel(self._message.id))
                         except discord.NotFound:
                             thread = None
             if thread is None:
                 thread = await _bounded_discord(
-                    self._message.create_thread(
-                        name="status updates", auto_archive_duration=10080
-                    )
+                    self._message.create_thread(name="status updates", auto_archive_duration=10080)
                 )
                 log.info("created status thread %s", thread.id)
             if getattr(thread, "archived", False):
@@ -1876,14 +1545,9 @@ class DashboardUpdater:
             )
         await self._flush_alert_messages()
 
-    def _queue_alert_snapshot_if_ready(
-        self, snapshot: CollectionSnapshot | None
-    ) -> None:
+    def _queue_alert_snapshot_if_ready(self, snapshot: CollectionSnapshot | None) -> None:
         """Retain each completed alert generation until the presenter consumes it."""
-        if (
-            snapshot is None
-            or snapshot.generation <= self._last_queued_alert_generation
-        ):
+        if snapshot is None or snapshot.generation <= self._last_queued_alert_generation:
             return
         settled = snapshot.settled_providers
         if settled and not {"weather", "traffic"}.issubset(settled):
@@ -1998,9 +1662,7 @@ class DashboardUpdater:
             # A map capture is an independent single-flight stream.  Its task
             # identity was checked above, so an ordinary collection starting
             # while it was running does not make this newest map obsolete.
-            self._publish_provider_result(
-                generation, "traffic_map", value, independent_map=True
-            )
+            self._publish_provider_result(generation, "traffic_map", value, independent_map=True)
 
     def _collection_finished(self, task: asyncio.Task) -> None:
         """Publish a completed collection without blocking the presenter."""
@@ -2027,15 +1689,12 @@ class DashboardUpdater:
         snapshot = self._snapshot
         settled = (
             snapshot.settled_providers
-            if snapshot is not None
-            and snapshot.generation == self._collection_generation
+            if snapshot is not None and snapshot.generation == self._collection_generation
             else frozenset()
         )
         for name, value in fresh.items():
             if name not in settled:
-                self._publish_provider_result(
-                    self._collection_generation, name, value
-                )
+                self._publish_provider_result(self._collection_generation, name, value)
 
     def _publish_provider_result(
         self,
@@ -2072,7 +1731,11 @@ class DashboardUpdater:
             # stale until their owning provider has supplied this generation.
             if previous.generation != generation:
                 stale.update(merged)
-        if isinstance(value, Exception) and name in merged and not isinstance(merged[name], Exception):
+        if (
+            isinstance(value, Exception)
+            and name in merged
+            and not isinstance(merged[name], Exception)
+        ):
             stale.add(name)
         else:
             merged[name] = value
@@ -2145,9 +1808,7 @@ class DashboardUpdater:
         # uncertain create needs adoption.
         if self._message is None:
             if not self._mark_rollover_send_uncertain():
-                raise RuntimeError(
-                    "cannot persist dashboard-send recovery state; create deferred"
-                )
+                raise RuntimeError("cannot persist dashboard-send recovery state; create deferred")
             attempt_evidence = _DashboardSendAttemptEvidence()
             try:
                 self._message = await _bounded_discord(
@@ -2168,9 +1829,7 @@ class DashboardUpdater:
                 # require a strict history reconciliation before another send.
                 self._record_dashboard_send_failure(exc, attempt_evidence)
                 raise
-            self._persisted_dashboard_message_id = self._dashboard_message_id(
-                self._message
-            )
+            self._persisted_dashboard_message_id = self._dashboard_message_id(self._message)
             self._clear_rollover_send_uncertainty()
         fingerprint = _payload_fingerprint(payload)
         try:
@@ -2179,16 +1838,9 @@ class DashboardUpdater:
                     self._dashboard_messages_reconciled
                     and _dashboard_message_needs_rollover(self._message)
                 )
-                rollover_ready = (
-                    not rollover
-                    or await self._status_thread_ready_for_rollover()
-                )
+                rollover_ready = not rollover or await self._status_thread_ready_for_rollover()
                 try:
-                    if (
-                        rollover
-                        and rollover_ready
-                        and not self._pending_dashboard_delete_ids
-                    ):
+                    if rollover and rollover_ready and not self._pending_dashboard_delete_ids:
                         edited_message = await self._rollover_dashboard(
                             channel,
                             payload,
@@ -2202,13 +1854,10 @@ class DashboardUpdater:
                             )
                         elif rollover:
                             log.warning(
-                                "dashboard rollover deferred until stale-message "
-                                "cleanup succeeds"
+                                "dashboard rollover deferred until stale-message cleanup succeeds"
                             )
                         edited_message = await _bounded_discord(
-                            _apply_payload(
-                                self._message, payload, view=self.live_view
-                            )
+                            _apply_payload(self._message, payload, view=self.live_view)
                         )
                 except Exception as edit_exc:
                     if (
@@ -2232,8 +1881,11 @@ class DashboardUpdater:
                     self._message = edited_message
                 self._last_payload_fingerprint = fingerprint
                 map_asset = next(
-                    (asset for asset in payload.files
-                     if asset.filename == traffic_map_filename(asset.data)),
+                    (
+                        asset
+                        for asset in payload.files
+                        if asset.filename == traffic_map_filename(asset.data)
+                    ),
                     None,
                 )
                 if map_asset is not None:
@@ -2242,14 +1894,18 @@ class DashboardUpdater:
                         "dashboard edit succeeded collection_generation=%s "
                         "payload_fingerprint=%s traffic_map_sha256=%s "
                         "traffic_map_filename=%s",
-                        payload_generation, fingerprint[:12], map_hash, map_asset.filename,
+                        payload_generation,
+                        fingerprint[:12],
+                        map_hash,
+                        map_asset.filename,
                     )
                 else:
                     log.info(
                         "dashboard edit succeeded collection_generation=%s "
                         "payload_fingerprint=%s traffic_map_sha256=none "
                         "traffic_map_filename=none",
-                        payload_generation, fingerprint[:12],
+                        payload_generation,
+                        fingerprint[:12],
                     )
                 self._last_good_payload = payload
         except Exception as exc:  # noqa: BLE001
@@ -2307,10 +1963,7 @@ class DashboardUpdater:
         self._map_task = None
         self._map_generation = None
         self.marker_tracker.clear()
-        await maps.shutdown_gmaps_browser()
-        await route_geometry_provider.shutdown_background_refreshes()
-        await tracked_roads_provider.shutdown_background_refreshes()
-        await transit.shutdown_background_refreshes()
+        await pipeline.shutdown_background_resources()
         if self.session is not None:
             await self.session.close()
             self.session = None
@@ -2320,6 +1973,7 @@ class DashboardUpdater:
 # --------------------------------------------------------------------------
 # Discord bot wiring
 # --------------------------------------------------------------------------
+
 
 async def run_discord_bot(settings: Settings) -> None:
     from discord.ext import commands
@@ -2413,10 +2067,7 @@ async def run_dev_webhook(settings: Settings) -> None:
                 len(payload.files),
             )
         finally:
-            await maps.shutdown_gmaps_browser()
-            await route_geometry_provider.shutdown_background_refreshes()
-            await tracked_roads_provider.shutdown_background_refreshes()
-            await transit.shutdown_background_refreshes()
+            await pipeline.shutdown_background_resources()
 
 
 async def run_dry_run(settings: Settings) -> None:
@@ -2455,15 +2106,13 @@ async def run_dry_run(settings: Settings) -> None:
                         f.write(asset.data)
             log.info("dry-run preview written to %s", preview_path)
         finally:
-            await maps.shutdown_gmaps_browser()
-            await route_geometry_provider.shutdown_background_refreshes()
-            await tracked_roads_provider.shutdown_background_refreshes()
-            await transit.shutdown_background_refreshes()
+            await pipeline.shutdown_background_resources()
 
 
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
+
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(

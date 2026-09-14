@@ -4,14 +4,17 @@ A Discord bot that edits one persistent dashboard message with public-transport
 ETAs from the HKUST gates, HKO weather and warnings, traffic information, a
 Google Maps traffic-layer base map, and live North/South Gate camera frames.
 
+The runtime boundaries and provider dependency graph are described in
+[docs/architecture.md](docs/architecture.md).
+
 ## What it shows
 
 - KMB, Citybus, and green-minibus ETAs in a stable order. Scheduled or otherwise
   non-realtime estimates are labelled, and routes with no departures are hidden.
 - A Google Maps traffic-layer screenshot with coarse bus estimates and official
   bus-stop markers offset beside their route direction. Bus markers are
-  estimates, not vehicle GPS; the screenshot is the map base and is refreshed
-  with each dashboard update.
+  estimates, not vehicle GPS; the screenshot is the map base and uses the
+  latest completed browser capture.
 - HKO observations and active warning signals, plus official TD incidents and
   roadworks relevant to the campus approaches.
 - Fresh JPEG frames decoded from the official HKUST North and South Gate HLS
@@ -93,15 +96,17 @@ timestamps—not the dashboard edit time—are displayed.
 
 ## Test
 
-The default test run includes live smoke tests against public transit, weather,
-and Transport Department endpoints. Internet access is required for those
-tests; they do not require API keys or credentials.
+The default test run is local and uses fixtures. Live endpoint checks, when
+needed, should be run explicitly because they depend on upstream availability.
 
 ```bash
 ruff check .
 python -m compileall -q bot.py dashboard tests
 python -m pytest
 ```
+
+Use `.venv/Scripts/python.exe` on Windows. The suite does not require
+production credentials; keep `.env` local.
 
 The bot exposes a `hkust-dashboard` console command after installation. It also
 supports one persistent message recovery: if the configured message is absent,

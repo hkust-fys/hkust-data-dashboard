@@ -1,7 +1,9 @@
 """HttpClient tests: caching, stale-on-error, and per-origin pacing."""
 
 import asyncio
+import time
 
+import aiohttp
 import pytest
 
 from dashboard.http import (
@@ -75,6 +77,68 @@ async def test_fetch_json_cached_stale_on_error(monkeypatch):
     stale, value, _ = await client.fetch_json_cached(spec)
     assert stale is True
     assert value == {"a": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [TimeoutError("timed out"), aiohttp.ClientError("connection failed")],
+)
+async def test_fetch_json_cached_stale_on_terminal_transport_error(monkeypatch, failure):
+    client = HttpClient(object(), retry_attempts=1)
+    calls = 0
+
+    async def fetch_json(_url, _headers=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"a": 1}
+        raise failure
+
+    monkeypatch.setattr(client, "fetch_json", fetch_json)
+    spec = CachedFetch("https://example.test/data.json", ttl=60, cache_key="data")
+    _, value, _ = await client.fetch_json_cached(spec)
+    client.cache._store["data"].fetched_at = time.time() - 61  # noqa: SLF001
+    fetched_at = client.cache._store["data"].fetched_at  # noqa: SLF001
+
+    stale, stale_value, stale_at = await client.fetch_json_cached(spec)
+    assert stale is True
+    assert stale_value == value
+    assert stale_at == fetched_at
+
+    client.cache._store["data"].fetched_at = 0  # noqa: SLF001
+    monkeypatch.setattr(client, "fetch_json", lambda *_args, **_kwargs: _recovered_json())
+    stale, value, recovered_at = await client.fetch_json_cached(spec)
+    assert stale is False
+    assert value == {"a": 2}
+    assert recovered_at != fetched_at
+
+
+async def _recovered_json():
+    return {"a": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", [asyncio.CancelledError(), RequestNotStarted("admission"), ValueError("bug")]
+)
+async def test_fetch_cached_propagates_non_transport_control_errors(monkeypatch, failure):
+    client = HttpClient(object(), retry_attempts=1)
+
+    async def fetch_json(_url, _headers=None):
+        return {"a": 1}
+
+    monkeypatch.setattr(client, "fetch_json", fetch_json)
+    spec = CachedFetch("https://example.test/data.json", ttl=60, cache_key="control")
+    await client.fetch_json_cached(spec)
+    client.cache._store["control"].fetched_at = 0  # noqa: SLF001
+
+    async def fail(_url, _headers=None):
+        raise failure
+
+    monkeypatch.setattr(client, "fetch_json", fail)
+    with pytest.raises(type(failure)):
+        await client.fetch_json_cached(spec)
 
 
 @pytest.mark.asyncio

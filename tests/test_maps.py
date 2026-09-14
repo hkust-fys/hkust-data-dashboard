@@ -2318,7 +2318,7 @@ def test_duplicate_estimates_stack_rows_but_share_one_anchor_marker(scale, relia
     assert arrow.polygons == 1
 
 
-def test_nonauthoritative_position_gets_uncertain_style_without_coalescing():
+def test_nonauthoritative_realtime_position_keeps_live_style_without_coalescing():
     common = dict(
         label="91 Diamond Hill", lat=22.334, lon=114.230,
         operator=Operator.KMB, heading=0.0,
@@ -2333,7 +2333,23 @@ def test_nonauthoritative_position_gets_uncertain_style_without_coalescing():
     )
 
     assert len(markers) == 2
-    assert {marker.unreliable for marker in markers} == {False, True}
+    assert {marker.unreliable for marker in markers} == {False}
+
+
+def test_scheduled_style_comes_only_from_estimate_reliability():
+    common = dict(
+        label="91 Diamond Hill", lat=22.334, lon=114.230,
+        operator=Operator.KMB, heading=0.0,
+    )
+    estimates = [
+        BusEstimate(**common, unreliable=False, position_authoritative=False),
+        BusEstimate(**common, unreliable=True, position_authoritative=True),
+    ]
+    markers = renderer._merge_bus_markers(
+        estimates, renderer.BASE_MAP_LAT, renderer.BASE_MAP_LON,
+        renderer.BASE_MAP_ZOOM, (renderer.MAP_WIDTH, renderer.MAP_HEIGHT),
+    )
+    assert [marker.unreliable for marker in markers] == [False, True]
 
 
 def test_off_map_bus_prediction_has_no_marker_or_label():

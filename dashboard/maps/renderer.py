@@ -16,6 +16,8 @@ from typing import NamedTuple
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
+from dashboard.maps.label_layout import place_label_box
+from dashboard.maps.label_layout import rects_overlap as _rects_overlap
 from dashboard.maps.tiles import BASE_CACHE_FILENAME, TILE_SIZE
 from dashboard.models import Operator
 
@@ -753,19 +755,6 @@ def _merged_public_stop_markers(
     return [(x, y, heading) for x, y, heading, _name in merged_named]
 
 
-def _rects_overlap(
-    first: tuple[float, float, float, float],
-    second: tuple[float, float, float, float],
-    padding: float = 2,
-) -> bool:
-    return not (
-        first[2] + padding <= second[0]
-        or second[2] + padding <= first[0]
-        or first[3] + padding <= second[1]
-        or second[3] + padding <= first[1]
-    )
-
-
 def _layout_bus_labels(
     markers: Iterable[BusMarker],
     draw: ImageDraw.ImageDraw,
@@ -810,385 +799,44 @@ def _layout_bus_labels(
         else:
             group.append(marker)
 
+    # Sort rows once so the reserved arrow footprint and the final placement
+    # use the same actual marker as their representative.
+    anchor_groups = [
+        sorted(group, key=lambda marker: (marker.operator.value, marker.routes))
+        for group in anchor_groups
+    ]
     placed: list[LabelPlacement] = []
-    occupied: list[tuple[float, float, float, float]] = list(placed_rects)
+    occupied = list(placed_rects)
     arrow_footprints = [
         _arrow_footprint((group[0].x, group[0].y), metrics) for group in anchor_groups
     ]
-    pill_height = metrics.px(18.0)
-    edge_margin = metrics.px(2.0)
-    label_gap = metrics.px(10.0)
-    row_gap = metrics.px(4.0)
-    text_padding = metrics.px(8.0)
-    spiral_step = metrics.px(6.0)
-    collision_padding = metrics.px(2.0)
-
-    def overlap_costs(
-        rect: tuple[float, float, float, float],
-    ) -> tuple[bool, float]:
-        important_overlap = False
-        if important_roads is not None:
-            overlap, _area = important_roads.overlap(rect)
-            important_overlap = bool(overlap)
-        traffic_penalty = 0.0
-        if traffic is not None:
-            overlap, area = traffic.overlap(rect)
-            if overlap and area:
-                # Any road overlap is meaningful; density adds only a bounded
-                # increment. At most two logical label rows of displacement
-                # can be justified, so unavoidable traffic stays local.
-                traffic_penalty = metrics.px(24) + metrics.px(20) * overlap / area
-        return important_overlap, traffic_penalty
-
-    def local_score(
-        rect: tuple[float, float, float, float],
-        displacement: float,
-        side: int,
-    ) -> tuple[bool, float, float, int, float]:
-        """Protect important corridors, then prefer nearby clear traffic."""
-        important_overlap, traffic_penalty = overlap_costs(rect)
-        # Initial and spiral candidates are bounded near the anchor, so strict
-        # lexicographic avoidance cannot send a label across the map. Within
-        # that local set, any zero-overlap slot beats an important-road slot,
-        # even when the former covers ordinary Google traffic pixels.
-        return (
-            important_overlap,
-            displacement + traffic_penalty,
-            traffic_penalty,
-            side,
-            rect[0],
-        )
-
-    def whole_canvas_score(
-        rect: tuple[float, float, float, float],
-        displacement: float,
-        side: int,
-    ) -> tuple[float, float, float, int, float]:
-        """Keep last-resort global searches local despite road priority."""
-        important_overlap, traffic_penalty = overlap_costs(rect)
-        # Unlike bounded local searches, this grid spans the whole canvas. A
-        # fixed 48-logical-pixel cost is greater than traffic's 44-pixel
-        # ceiling, but remains bounded so road priority alone cannot pull a
-        # grouped label map-wide.
-        important_penalty = metrics.px(48) if important_overlap else 0.0
-        return (
-            displacement + traffic_penalty + important_penalty,
-            important_penalty,
-            traffic_penalty,
-            side,
-            rect[0],
-        )
     for group in anchor_groups:
-        # Deterministic order within a stack: operator then routes.
-        group = sorted(group, key=lambda m: (m.operator.value, m.routes))
-        if len(group) > 1:
-            anchor = group[0]
-            rows = tuple(
-                ("/".join(marker.routes), marker.operator, marker.unreliable)
-                for marker in group
-            )
-            row_height = pill_height
-            cluster_height = row_height * len(rows)
-            cluster_width = max(
-                float(draw.textlength(text, font=font)) + text_padding
-                for text, _operator, _unreliable in rows
-            )
-            chosen = None
-            # Anchor first, then symmetric escape candidates.  The road arrow
-            # always remains at the immutable anchor even when the label moves.
-            cluster_candidates: list[
-                tuple[
-                    tuple[float, float, float, float],
-                    tuple[bool, float, float, int, float],
-                ]
-            ] = []
-            for offset_y in (
-                0.0,
-                -(cluster_height + row_gap), cluster_height + row_gap,
-                -2 * (cluster_height + row_gap), 2 * (cluster_height + row_gap),
-            ):
-                top = anchor.y + offset_y - cluster_height / 2
-                for side in (1, -1):
-                    left = (
-                        anchor.x + label_gap
-                        if side > 0 else anchor.x - label_gap - cluster_width
-                    )
-                    candidate = (left, top, left + cluster_width, top + cluster_height)
-                    if (
-                        candidate[0] < edge_margin or candidate[1] < edge_margin
-                        or candidate[2] > size[0] - edge_margin
-                        or candidate[3] > size[1] - edge_margin
-                        or any(_rects_overlap(candidate, footprint, padding=0) for footprint in arrow_footprints)
-                        or any(
-                            _rects_overlap(candidate, other, padding=collision_padding)
-                            for other in occupied
-                        )
-                    ):
-                        continue
-                    cluster_candidates.append(
-                        (
-                            candidate,
-                            local_score(candidate, abs(offset_y), 0 if side < 0 else 1),
-                        )
-                    )
-            if cluster_candidates:
-                chosen, _score = min(cluster_candidates, key=lambda item: item[1])
-            if chosen is None:
-                # Bounded spiral search handles a busy junction without
-                # clamping a group onto another occupied label.
-                spiral_candidates = []
-                for radius in range(1, 40):
-                    for dx, dy in (
-                        (-radius * spiral_step, 0), (radius * spiral_step, 0),
-                        (0, -radius * (cluster_height + row_gap)),
-                        (0, radius * (cluster_height + row_gap)),
-                    ):
-                        left = anchor.x + dx + (
-                            label_gap if dx >= 0 else -label_gap - cluster_width
-                        )
-                        top = anchor.y + dy - cluster_height / 2
-                        candidate = (left, top, left + cluster_width, top + cluster_height)
-                        if (candidate[0] >= edge_margin and candidate[1] >= edge_margin
-                                and candidate[2] <= size[0] - edge_margin
-                                and candidate[3] <= size[1] - edge_margin
-                                and not any(
-                                    _rects_overlap(candidate, other, padding=collision_padding)
-                                    for other in occupied
-                                )
-                                and not any(_rects_overlap(candidate, footprint, padding=0) for footprint in arrow_footprints)):
-                            spiral_candidates.append(
-                                (candidate, local_score(
-                                    candidate,
-                                    math.hypot(dx, dy),
-                                    0 if dx < 0 else 1,
-                                ))
-                            )
-                    # Keep this a local search: strict important-road ordering
-                    # applies only within the established 48-pixel window.
-                    if spiral_candidates and radius * spiral_step > metrics.px(48):
-                        break
-                if spiral_candidates:
-                    chosen, _score = min(spiral_candidates, key=lambda item: item[1])
-                if chosen is None:
-                    # Preserve every arrow even when label-label overlap is
-                    # unavoidable: search the canvas before the final clamp.
-                    grid_step = metrics.integer(6)
-                    start = max(1, round(edge_margin))
-                    grid_candidates = []
-                    relaxed_grid_candidates = []
-                    for top in range(
-                        start, max(start + 1, size[1] - math.ceil(cluster_height)), grid_step
-                    ):
-                        for left in range(
-                            start, max(start + 1, size[0] - math.ceil(cluster_width)), grid_step
-                        ):
-                            candidate = (float(left), float(top), left + cluster_width, top + cluster_height)
-                            if any(_rects_overlap(candidate, footprint, padding=0) for footprint in arrow_footprints):
-                                continue
-                            displacement = math.hypot(
-                                (candidate[0] + candidate[2]) / 2 - anchor.x,
-                                (candidate[1] + candidate[3]) / 2 - anchor.y,
-                            )
-                            scored_candidate = (
-                                candidate,
-                                whole_canvas_score(candidate, displacement, 0),
-                            )
-                            relaxed_grid_candidates.append(scored_candidate)
-                            if not any(
-                                _rects_overlap(candidate, other, padding=collision_padding)
-                                for other in occupied
-                            ):
-                                grid_candidates.append(scored_candidate)
-                    if grid_candidates:
-                        chosen, _score = min(grid_candidates, key=lambda item: item[1])
-                    elif relaxed_grid_candidates:
-                        # Only overlap an occupied label as a last resort when
-                        # every arrow-safe grid slot is already occupied.
-                        chosen, _score = min(
-                            relaxed_grid_candidates, key=lambda item: item[1]
-                        )
-                if chosen is None:
-                    top = min(
-                        max(edge_margin, anchor.y - cluster_height / 2),
-                        size[1] - cluster_height - edge_margin,
-                    )
-                    fallback_candidates = []
-                    for side in (1, -1):
-                        proposed = (
-                            anchor.x + label_gap
-                            if side > 0 else anchor.x - label_gap - cluster_width
-                        )
-                        left = min(
-                            max(edge_margin, proposed),
-                            size[0] - cluster_width - edge_margin,
-                        )
-                        candidate = (left, top, left + cluster_width, top + cluster_height)
-                        if not _rects_overlap(
-                            candidate, _arrow_footprint((anchor.x, anchor.y), metrics),
-                            padding=0,
-                        ):
-                            fallback_candidates.append((
-                                candidate,
-                                local_score(candidate, 0, 0 if side < 0 else 1),
-                            ))
-                    if fallback_candidates:
-                        chosen, _score = min(fallback_candidates, key=lambda item: item[1])
-                    else:
-                        left = min(
-                            max(edge_margin, anchor.x + label_gap),
-                            size[0] - cluster_width - edge_margin,
-                        )
-                        chosen = (left, top, left + cluster_width, top + cluster_height)
-            occupied.append(chosen)
-            placed.append(LabelPlacement(
-                "/".join(text for text, _operator, _unreliable in rows),
-                chosen, (anchor.x, anchor.y), anchor.operator, anchor.heading,
-                all(unreliable for _text, _operator, unreliable in rows), rows,
-            ))
-            continue
-        for marker in group:
-            text = "/".join(marker.routes)
-            pill_width = float(draw.textlength(text, font=font)) + text_padding
-            chosen = None
-            # Candidate rows are scored symmetrically around the anchor. Every
-            # candidate keeps the FULL pill size —
-            # never squashed — so boxes stay readable at map edges.
-            label_step = pill_height + row_gap
-            candidate_offsets = [0.0, -label_step, label_step, -2 * label_step, 2 * label_step]
-            candidates: list[
-                tuple[
-                    tuple[float, float, float, float],
-                    tuple[bool, float, float, int, float],
-                ]
-            ] = []
-            for offset_y in candidate_offsets:
-                top = marker.y + offset_y - pill_height / 2
-                bottom = top + pill_height
-                for text_side in (1, -1):
-                    if text_side > 0:
-                        left, right = marker.x + label_gap, marker.x + label_gap + pill_width
-                    else:
-                        left, right = marker.x - label_gap - pill_width, marker.x - label_gap
-                    rect = (left, top, right, bottom)
-                    if (
-                        rect[0] < edge_margin
-                        or rect[1] < edge_margin
-                        or rect[2] > size[0] - edge_margin
-                        or rect[3] > size[1] - edge_margin
-                    ):
-                        continue
-                    if any(
-                        _rects_overlap(rect, other, padding=collision_padding)
-                        for other in occupied
-                    ):
-                        continue
-                    if any(_rects_overlap(rect, footprint, padding=0) for footprint in arrow_footprints):
-                        continue
-                    # Prefer the nearest unobstructed row; when left/right
-                    # are equally good, choose left for stable, edge-friendly
-                    # presentation of long route names.
-                    candidates.append((
-                        rect,
-                        local_score(rect, abs(offset_y), 0 if text_side < 0 else 1),
-                    ))
-            if candidates:
-                chosen, _score = min(candidates, key=lambda item: item[1])
-            if chosen is None:
-                # No clean slot in the stack columns: spiral outward over
-                # progressively larger offsets (up, down, left, right) until
-                # a free full-size slot exists. A pill NEVER ends up on top
-                # of another one.
-                chosen = None
-                spiral_candidates = []
-                for radius in range(1, 40):
-                    for dx, dy in (
-                        (-radius * spiral_step, 0),
-                        (radius * spiral_step, 0),
-                        (0, radius * (pill_height + row_gap)),
-                        (0, -radius * (pill_height + row_gap)),
-                        (-radius * spiral_step, -radius * (pill_height + row_gap)),
-                        (radius * spiral_step, -radius * (pill_height + row_gap)),
-                        (-radius * spiral_step, radius * (pill_height + row_gap)),
-                        (radius * spiral_step, radius * (pill_height + row_gap)),
-                    ):
-                        left = marker.x + dx + (
-                            label_gap if dx >= 0 else -label_gap - pill_width
-                        )
-                        right = left + pill_width
-                        top = marker.y + dy - pill_height / 2
-                        bottom = top + pill_height
-                        rect = (left, top, right, bottom)
-                        if (
-                            rect[0] < edge_margin
-                            or rect[1] < edge_margin
-                            or rect[2] > size[0] - edge_margin
-                            or rect[3] > size[1] - edge_margin
-                        ):
-                            continue
-                        if any(
-                            _rects_overlap(rect, other, padding=collision_padding)
-                            for other in occupied
-                        ):
-                            continue
-                        if any(_rects_overlap(rect, footprint, padding=0) for footprint in arrow_footprints):
-                            continue
-                        spiral_candidates.append((
-                            rect, local_score(
-                                rect, math.hypot(dx, dy), 0 if dx < 0 else 1
-                            )
-                        ))
-                    # Keep this a local search: strict important-road ordering
-                    # applies only within the established 48-pixel window.
-                    if spiral_candidates and radius * spiral_step > metrics.px(48):
-                        break
-                if spiral_candidates:
-                    chosen, _score = min(spiral_candidates, key=lambda item: item[1])
-            if chosen is None:
-                # Truly nowhere free (map wall-to-wall buses): keep the
-                # full-size pill on the road row, clipped into the canvas —
-                # never squashed.
-                top = min(
-                    max(edge_margin, marker.y - pill_height / 2),
-                    size[1] - pill_height - edge_margin,
-                )
-                fallback_candidates = []
-                for side in (1, -1):
-                    proposed = (
-                        marker.x + label_gap
-                        if side > 0 else marker.x - label_gap - pill_width
-                    )
-                    left = min(
-                        max(edge_margin, proposed),
-                        size[0] - pill_width - edge_margin,
-                    )
-                    candidate = (left, top, left + pill_width, top + pill_height)
-                    if not _rects_overlap(
-                        candidate, _arrow_footprint((marker.x, marker.y), metrics),
-                        padding=0,
-                    ):
-                        fallback_candidates.append((
-                            candidate,
-                            local_score(candidate, 0, 0 if side < 0 else 1),
-                        ))
-                if fallback_candidates:
-                    chosen, _score = min(fallback_candidates, key=lambda item: item[1])
-                else:
-                    left = min(
-                        max(edge_margin, marker.x + label_gap),
-                        size[0] - pill_width - edge_margin,
-                    )
-                    chosen = (left, top, left + pill_width, top + pill_height)
-            occupied.append(chosen)
-            placed.append(
-                LabelPlacement(
-                    text,
-                    chosen,
-                    (marker.x, marker.y),
-                    marker.operator,
-                    marker.heading,
-                    marker.unreliable,
-                )
-            )
+        anchor = group[0]
+        rows = tuple(
+            ("/".join(marker.routes), marker.operator, marker.unreliable)
+            for marker in group
+        )
+        width = max(
+            float(draw.textlength(text, font=font)) + metrics.px(8)
+            for text, _operator, _unreliable in rows
+        )
+        chosen = place_label_box(
+            (anchor.x, anchor.y),
+            (width, metrics.px(18) * len(rows)),
+            size,
+            occupied,
+            arrow_footprints,
+            scale=metrics.scale,
+            traffic=traffic,
+            important_roads=important_roads,
+        )
+        occupied.append(chosen)
+        placed.append(LabelPlacement(
+            "/".join(text for text, _operator, _unreliable in rows),
+            chosen, (anchor.x, anchor.y), anchor.operator, anchor.heading,
+            all(unreliable for _text, _operator, unreliable in rows),
+            rows if len(rows) > 1 else (),
+        ))
     return placed
 
 
@@ -1535,14 +1183,11 @@ def _merge_bus_markers(
             x, y = _point_on_left(x, y, estimate.heading, 2.5, metrics)
         # Group by the full label so same-route opposite-destination markers
         # (e.g. 91 Diamond Hill vs 91 Clear Water Bay) stay distinct.
-        # Position uncertainty is a rendering concern: keep it separate from
-        # timetable reliability in the estimate, but use the same pale/dashed
-        # marker treatment at this boundary.  Including the combined state in
-        # the grouping key also prevents an uncertain marker from disappearing
-        # into an authoritative marker at the same pixel.
-        visually_uncertain = bool(getattr(estimate, "unreliable", False)) or (
-            getattr(estimate, "position_authoritative", None) is False
-        )
+        # Timetable reliability is the sole source of scheduled marker style.
+        # Positional authority remains internal estimator metadata: all map
+        # positions are ETA interpolations and must not look scheduled merely
+        # because their upstream frontier is provisional.
+        scheduled = bool(getattr(estimate, "unreliable", False))
         projected.append(
             (
                 estimate.operator.value,
@@ -1552,11 +1197,14 @@ def _merge_bus_markers(
                 estimate.operator,
                 estimate.heading,
                 route_supported,
-                visually_uncertain,
+                scheduled,
             )
         )
     for row in sorted(projected):
-        _operator_name, label, x, y, operator, heading, route_supported, unreliable = row
+        (
+            _operator_name, label, x, y, operator, heading, route_supported,
+            unreliable,
+        ) = row
         key = (
             operator,
             label,

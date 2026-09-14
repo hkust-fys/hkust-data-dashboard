@@ -52,7 +52,9 @@ class BusEstimate:
     ``unreliable`` marks estimates derived from timetable ('scheduled')
     observations rather than live tracking: the position is plausible but the
     operator has not confirmed the vehicle, so the marker renders paler with
-    a dashed outline.
+    a dashed outline.  ``position_authoritative`` is separate evidence
+    metadata for estimator/tracker decisions; it does not classify an ETA as
+    scheduled because every displayed position is an ETA interpolation.
     """
 
     label: str

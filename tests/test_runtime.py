@@ -2559,6 +2559,60 @@ async def test_presenter_does_not_wait_for_slow_background_collection(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_real_collection_wrapper_keeps_incremental_updates_and_independent_map(
+    monkeypatch,
+):
+    """The production wrapper must expose the capabilities the updater inspects."""
+    import bot as bot_module
+
+    collection_started = asyncio.Event()
+    map_started = asyncio.Event()
+    release = asyncio.Event()
+    received = {}
+    weather = (None, [], None)
+    pipeline_timeout = bot_module.pipeline.TRACKED_ROADS_WAIT_SECONDS
+
+    async def collect(_client, _settings, **kwargs):
+        received.update(kwargs)
+        callback = kwargs.get("on_result")
+        if callback is not None:
+            callback("weather", weather)
+        collection_started.set()
+        await release.wait()
+        return {"weather": weather}
+
+    async def fetch_map(_client, _settings, _results, _tracker):
+        map_started.set()
+        await release.wait()
+        return (None, [])
+
+    # Patch the pipeline, not bot.collect_all: the real compatibility wrapper
+    # and the updater's signature-based capability discovery remain exercised.
+    monkeypatch.setattr(bot_module.pipeline, "collect_all", collect)
+    monkeypatch.setattr(bot_module, "_fetch_traffic_map_from_results", fetch_map)
+    monkeypatch.setattr(bot_module, "TRACKED_ROADS_WAIT_SECONDS", 0.25)
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True
+    updater.client = object()
+
+    try:
+        await updater._tick()
+        await asyncio.wait_for(collection_started.wait(), timeout=1)
+        assert received["include_traffic_map"] is False
+        assert received["tracker"] is updater.marker_tracker
+        assert callable(received["on_result"])
+        assert received["tracked_roads_wait_seconds"] == 0.25
+        assert pipeline_timeout == bot_module.pipeline.TRACKED_ROADS_WAIT_SECONDS
+        assert updater._snapshot.results["weather"] == weather
+        assert not updater._collection_task.done()
+        await asyncio.wait_for(map_started.wait(), timeout=1)
+        assert not updater._map_task.done()
+    finally:
+        release.set()
+        await updater.stop()
+
+
+@pytest.mark.asyncio
 async def test_independent_map_restarts_while_ordinary_collection_is_still_pending(
     monkeypatch,
 ):

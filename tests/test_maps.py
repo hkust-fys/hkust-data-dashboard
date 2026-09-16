@@ -114,7 +114,7 @@ async def test_probe_failure_still_renders_google_base(monkeypatch):
     monkeypatch.setattr(maps, "fetch_probe_snapshot", failed_probes)
     monkeypatch.setattr(maps, "render_map", render)
 
-    png, _ = await maps.fetch_traffic_map(object())
+    png = (await maps.fetch_traffic_map(object())).webp
     assert png == b"rendered"
     assert captured["base"] == base
 
@@ -142,7 +142,7 @@ async def test_fetch_traffic_map_forwards_important_road_paths(monkeypatch):
     monkeypatch.setattr(maps, "fetch_probe_snapshot", probes)
     monkeypatch.setattr(maps, "render_map", render)
 
-    image, _ = await maps.fetch_traffic_map(object(), important_road_paths=[path])
+    image = (await maps.fetch_traffic_map(object(), important_road_paths=[path])).webp
 
     assert image == b"rendered"
     assert captured["important_road_paths"] == [path]
@@ -179,11 +179,11 @@ async def test_marker_audit_failure_never_blocks_a_rendered_frame(monkeypatch, c
     monkeypatch.setattr(maps, "audit_marker_positions", broken_audit)
     monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
 
-    image, _ = await maps.fetch_traffic_map(object())
+    image = (await maps.fetch_traffic_map(object())).webp
 
     assert image == b"rendered"
     assert audit_calls == 1
-    assert "marker audit unavailable" in caplog.text
+    assert "marker candidate audit unavailable" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -560,8 +560,9 @@ async def test_invalid_black_cache_is_not_reused(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "playwright.async_api", fake_api)
 
     result = await tiles.capture_gmaps_base(str(tmp_path), viewport=(40, 20))
-    assert result.size == (40, 20)
-    assert result.getpixel((20, 10)) == (240, 242, 245)
+    assert result.image is None
+    assert result.captured_at is None
+    assert result.stale
 
 
 @pytest.mark.asyncio
@@ -631,20 +632,24 @@ async def test_disconnected_capture_failure_closes_shared_browser_without_deadlo
     result = await asyncio.wait_for(
         tiles.capture_gmaps_base(str(tmp_path), viewport=(40, 20)), timeout=2.0
     )
-    assert result.size == (40, 20)
+    assert result.image is None
+    assert result.stale
     assert tiles._shared_browser is None
     assert tiles._playwright_manager is None
     await tiles.shutdown_gmaps_browser()
 
 
 @pytest.mark.asyncio
-async def test_capture_reuses_page_and_skips_unchanged_cache_write(tmp_path, monkeypatch):
+async def test_capture_exports_each_time_even_when_pixels_are_unchanged(tmp_path, monkeypatch):
     class Browser:
         def is_connected(self):
             return True
 
     class Page:
+        exports = 0
+
         async def evaluate(self, _script):
+            self.exports += 1
             return ["valid"]
 
         async def close(self):
@@ -652,12 +657,17 @@ async def test_capture_reuses_page_and_skips_unchanged_cache_write(tmp_path, mon
 
     page = Page()
     create_calls = []
-    image = Image.new("RGB", (40, 20), (20, 40, 60))
+    image = Image.new("RGB", (40, 20))
+    image.putdata([
+        ((x * 17) % 256, (y * 29) % 256, ((x + y) * 13) % 256)
+        for y in range(20) for x in range(40)
+    ])
     async def create(_key):
         create_calls.append(1)
         tiles._shared_page = page
         tiles._shared_context = object()
         tiles._capture_key = _key
+        tiles._page_loaded_at = tiles.time.monotonic()
         return page
 
     monkeypatch.setattr(tiles, "_get_shared_browser", lambda: _resolved(Browser()))
@@ -671,14 +681,24 @@ async def test_capture_reuses_page_and_skips_unchanged_cache_write(tmp_path, mon
     tiles._last_capture_image = None
     tiles._last_capture_identity = None
     tiles._capture_retry_after = 0.0
+    tiles._page_base_updated_at = None
+    tiles._page_loaded_at = 0.0
     first = await tiles.capture_gmaps_base(str(tmp_path), viewport=(40, 20))
     cache_path = tmp_path / tiles.cache_filename(tiles.GMAPS_BASE_URL, (40, 20))
     first_mtime = cache_path.stat().st_mtime_ns
     await asyncio.sleep(0.01)
     second = await tiles.capture_gmaps_base(str(tmp_path), viewport=(40, 20))
-    assert first.tobytes() == second.tobytes() and first is not second
+    assert first.image.tobytes() == second.image.tobytes() and first.image is not second.image
+    assert page.exports == 2
+    assert second.captured_at > first.captured_at
+    assert not first.stale and not second.stale
     assert len(create_calls) == 1
+    assert first.base_updated_at == second.base_updated_at
     assert cache_path.stat().st_mtime_ns == first_mtime
+    assert cache_path.stat().st_mtime == pytest.approx(first.base_updated_at.timestamp())
+    retained = tiles._cached_capture(str(cache_path), (40, 20))
+    assert retained.captured_at == second.captured_at
+    assert retained.base_updated_at == first.base_updated_at
     await tiles.shutdown_gmaps_browser()
 
 
@@ -701,6 +721,7 @@ async def test_identical_pixels_switching_cache_directory_writes_both_targets(tm
         tiles._shared_page = page
         tiles._shared_context = object()
         tiles._capture_key = key
+        tiles._page_loaded_at = tiles.time.monotonic()
         return page
     monkeypatch.setattr(tiles, "_get_shared_browser", lambda: _resolved(object()))
     monkeypatch.setattr(tiles, "_create_capture_page", create)
@@ -736,7 +757,10 @@ async def test_capture_page_settles_through_placeholders_before_valid_export(mon
             return context
     page, context = Page(), Context()
     monkeypatch.setattr(tiles, "_get_shared_browser", lambda: _resolved(Browser()))
-    outcomes = iter([ValueError("placeholder"), ValueError("placeholder"), Image.new("RGB", (40, 20))])
+    outcomes = iter([
+        ValueError("placeholder"), ValueError("placeholder"),
+        Image.new("RGB", (40, 20)), Image.new("RGB", (40, 20)),
+    ])
     def decode(*_args):
         outcome = next(outcomes)
         if isinstance(outcome, Exception):
@@ -746,7 +770,7 @@ async def test_capture_page_settles_through_placeholders_before_valid_export(mon
     monkeypatch.setattr(tiles.asyncio, "sleep", lambda _delay: _resolved(None))
     tiles._shared_page = tiles._shared_context = tiles._capture_key = None
     await tiles._create_capture_page(("https://example.test", (40, 20)))
-    assert page.calls == 3
+    assert page.calls == 4
     await tiles._recycle_capture_page()
 
 
@@ -1940,13 +1964,14 @@ def test_legend_operator_examples_form_an_aligned_table(monkeypatch):
     )
     renderer._draw_legend(renderer.ImageDraw.Draw(canvas, "RGBA"), canvas.size)
 
-    assert len(placements) == 6
+    assert len(placements) == 5
     live, scheduled = placements[:3], placements[3:]
     assert [placement.operator for placement in live] == [
         Operator.KMB, Operator.CITYBUS, Operator.GMB
     ]
     assert [placement.marker[0] for placement in live] == [75, 200, 325]
-    assert [placement.marker[0] for placement in scheduled] == [75, 200, 325]
+    assert [placement.operator for placement in scheduled] == [Operator.KMB, Operator.GMB]
+    assert [placement.marker[0] for placement in scheduled] == [75, 325]
     assert {placement.marker[1] for placement in live} == {30}
     assert {placement.marker[1] for placement in scheduled} == {50}
     assert [
@@ -1957,7 +1982,7 @@ def test_legend_operator_examples_form_an_aligned_table(monkeypatch):
             strict=True,
         )
     ] == [20, 20, 20, 20, 20]
-    for first, second in zip(live, scheduled, strict=True):
+    for first, second in zip((live[0], live[2]), scheduled, strict=True):
         assert first.rect[0] == second.rect[0]
         assert first.rect[2] == second.rect[2]
         assert first.rect[3] < second.rect[1]

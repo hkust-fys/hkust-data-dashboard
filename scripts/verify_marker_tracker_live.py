@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from dashboard.http import HttpClient  # noqa: E402
 from dashboard.maps import _authoritative_etas, _destination_map  # noqa: E402
+from dashboard.maps.marker_audit import audit_marker_positions  # noqa: E402
 from dashboard.maps.positions import estimate_bus_positions  # noqa: E402
 from dashboard.maps.tracker import MarkerTracker  # noqa: E402
 from dashboard.providers.route_geometry import (  # noqa: E402
@@ -90,6 +91,7 @@ def frame_record(
     route_max=None,
     timestamp=None,
     priorities=None,
+    source_audit=None,
 ):
     def evidence(x):
         arrival = getattr(x, "eta_arrival_at", None)
@@ -104,13 +106,34 @@ def frame_record(
             "source_indices": sorted(getattr(x, "source_indices", ()) or ()),
             "source_observations": sorted(getattr(x, "source_observations", ()) or ()),
             "priority_indices": sorted(getattr(x, "priority_indices", ()) or ()),
+            "position_authoritative": getattr(x, "position_authoritative", None),
+            "checkpoint_evidence": sorted(
+                getattr(x, "checkpoint_evidence", ()) or ()
+            ),
         }
     def evidence_record(x):
         e = evidence(x)
         return {"position": float(getattr(x, "position", 0)), **e}
     checkpoint_ages = {}
+    source_rows = {}
     positioning_rows = getattr(snapshot, "positioning_rows", None)
-    for row in positioning_rows if positioning_rows is not None else ():
+    for input_index, row in enumerate(
+        positioning_rows if positioning_rows is not None else ()
+    ):
+        key = route_key(row)
+        arrival = getattr(row, "arrival_at", None)
+        kind = getattr(row, "kind", None)
+        source_rows.setdefault(key, []).append({
+            "observation": ("probe", input_index),
+            "index": getattr(row, "index", None),
+            "minutes": getattr(row, "minutes", None),
+            "kind": getattr(kind, "value", kind),
+            "arrival_at": (
+                arrival.isoformat() if hasattr(arrival, "isoformat") else arrival
+            ),
+            "cache_age_seconds": getattr(row, "cache_age_seconds", None),
+            "refresh_generation": getattr(row, "refresh_generation", None),
+        })
         try:
             index = int(row.index)
             age = float(row.cache_age_seconds)
@@ -121,7 +144,7 @@ def frame_record(
         key = route_key(row)
         by_index = checkpoint_ages.setdefault(key, {})
         by_index[index] = max(age, by_index.get(index, 0.0))
-    return {
+    record = {
         "utc": timestamp or datetime.now(UTC).isoformat(),
         "generations": {
             tuple(x.route_key): (int(x.generation), x.collected_at.isoformat())
@@ -143,8 +166,12 @@ def frame_record(
             for key, indices in (priorities or {}).items()
         },
         "checkpoint_ages": checkpoint_ages,
+        "source_rows": source_rows,
         "route_max": route_max or {},
     }
+    if source_audit is not None:
+        record["source_audit"] = source_audit
+    return record
 
 
 def _json_safe_record(x):
@@ -160,17 +187,150 @@ def _json_safe_record(x):
     return x
 
 
+def _audit_issue_has_duplicate_ownership(issue):
+    """Keep duplicated displayed-source ownership hard without lifecycle proof."""
+    detail = issue.get("detail", {}) if isinstance(issue, dict) else {}
+    match = detail.get("match", {}) if isinstance(detail, dict) else {}
+    return bool(match.get("duplicate_sources"))
+
+
+def _source_audit_generation_context(snapshot, route_keys, previous):
+    """Classify routes whose current frame carries a new complete generation."""
+    current = {
+        tuple(item.route_key): int(item.generation)
+        for item in getattr(snapshot, "complete_routes", ())
+    }
+    strict = {
+        key for key, generation in current.items()
+        if previous.get(key) != generation
+    }
+    reasons = {}
+    for key in route_keys:
+        if key in strict:
+            continue
+        if key not in current:
+            reasons[key] = (
+                "no complete generation available; displayed population is "
+                "not comparable to partial source rows"
+                if key not in previous
+                else
+                "complete generation omitted; displayed population may be held"
+            )
+        else:
+            reasons[key] = (
+                "complete generation unchanged; displayed population may be "
+                "held against newer partial source rows"
+            )
+    previous.update(current)
+    return strict, reasons
+
+
+def source_audit_result(audit, *, strict_routes=None, route_reasons=None):
+    """Return a bounded frame record plus hard verifier issues.
+
+    The auditor has already compared raw source rows with the tracker output.
+    Preserve its exact issue details for diagnosis, but keep successful frame
+    records compact by retaining only summary counters and inconclusive checks.
+    """
+    audit = audit if isinstance(audit, dict) else {}
+    checks = tuple(audit.get("checks", ()) or ())
+    raw_issues = tuple(audit.get("issues", ()) or ())
+    strict_routes = (
+        None if strict_routes is None
+        else {tuple(key) for key in strict_routes}
+    )
+    route_reasons = {
+        tuple(key): reason for key, reason in (route_reasons or {}).items()
+    }
+    inconclusive = [
+        {
+            name: check.get(name)
+            for name in ("key", "kind", "checkpoint", "marker_id", "reason")
+            if check.get(name) is not None
+        }
+        for check in checks
+        if check.get("inconclusive")
+    ]
+    generation_context_count = 0
+    hard_raw_issues = [
+        issue for issue in raw_issues
+        if (
+            strict_routes is None
+            or tuple(issue.get("key", ())) in strict_routes
+            or _audit_issue_has_duplicate_ownership(issue)
+        )
+    ]
+    deferred_issues = [
+        issue for issue in raw_issues
+        if issue not in hard_raw_issues
+    ]
+    for issue in deferred_issues:
+        key = tuple(issue.get("key", ()))
+        detail = issue.get("detail", {}) or {}
+        inconclusive.append({
+            "key": key,
+            "kind": issue.get("kind"),
+            "checkpoint": detail.get("checkpoint", detail.get("gate_index")),
+            "reason": route_reasons.get(
+                key, "no new complete generation for strict source comparison"
+            ),
+            "deferred_issue": True,
+        })
+    deferred_routes = {
+        tuple(issue.get("key", ())) for issue in deferred_issues
+    }
+    audited_routes = {
+        tuple(check.get("key", ())) for check in checks
+        if check.get("key") is not None
+    }
+    for key in sorted(audited_routes - deferred_routes):
+        if strict_routes is not None and key not in strict_routes:
+            inconclusive.append({
+                "key": key,
+                "kind": "generation-context",
+                "reason": route_reasons.get(
+                    key, "no new complete generation for strict source comparison"
+                ),
+            })
+            generation_context_count += 1
+    issues = [
+        {
+            "kind": "source_audit_failure",
+            "route": tuple(issue.get("key", ())),
+            "audit_kind": issue.get("kind"),
+            "detail": issue.get("detail", {}),
+        }
+        for issue in hard_raw_issues
+    ]
+    stats = dict(audit.get("stats", {}) or {})
+    stats["inconclusive"] = len(inconclusive)
+    return (
+        {
+            "ok": not hard_raw_issues,
+            "check_count": len(checks) + generation_context_count,
+            "inconclusive_count": len(inconclusive),
+            "inconclusive_checks": inconclusive,
+            "stats": stats,
+            "issues": hard_raw_issues,
+            "deferred_issues": deferred_issues,
+        },
+        issues,
+    )
+
+
 def _evidence_state(state=None):
     if state is None:
         return {
         "last_generation_by_route": {}, "last_ids_by_route": {},
         "latest_complete_collected_at": {},
         "minute_baselines": {}, "minute_checks": {}, "gap_checks": {},
-        "gap_inconclusive": {}, "lifecycle_inconclusive": {},
+        "gap_inconclusive": {}, "gap_inconclusive_reasons": {},
+        "lifecycle_inconclusive": {},
         "bracket_checks": {}, "bracket_inconclusive": {},
         }
     for key in ("last_generation_by_route", "last_ids_by_route", "latest_complete_collected_at",
                 "minute_baselines", "minute_checks", "gap_checks", "gap_inconclusive",
+                "gap_inconclusive_reasons",
                 "lifecycle_inconclusive", "bracket_checks", "bracket_inconclusive"):
         state.setdefault(key, {})
     return state
@@ -260,6 +420,12 @@ def _source_observation_signature(evidence):
     )
 
 
+def _track_evidence(record, key, track):
+    """Read in-memory integer or JSON-round-tripped string track keys."""
+    route_evidence = record.get("track_evidence", {}).get(key, {})
+    return route_evidence.get(track, route_evidence.get(str(track), {}))
+
+
 def _duplicate_candidate_observation_issues(record, key):
     """Reject one current ETA observation feeding multiple marker candidates."""
     owners = {}
@@ -284,28 +450,50 @@ def _duplicate_candidate_observation_issues(record, key):
 
 
 def _spacing_provenance_comparable(record, key, tracks, candidates):
-    """Check whether current candidate/track positions have a safe bijection."""
+    """Return whether positions have authoritative, one-to-one evidence."""
     candidate_evidence = record.get("candidate_evidence", {}).get(key)
     track_evidence = record.get("track_evidence", {}).get(key)
-    if candidate_evidence is None and track_evidence is None:
-        return True
-    candidate_signatures = [
-        _provenance_signature(evidence) for evidence in (candidate_evidence or ())
-    ]
-    track_signatures = [
-        _provenance_signature((track_evidence or {}).get(track))
+    if candidate_evidence is None or track_evidence is None:
+        return False, "missing_position_evidence"
+    candidate_evidence = list(candidate_evidence or ())
+    track_evidence_rows = [
+        _track_evidence(record, key, track)
         for track, _ in tracks
     ]
+    if (
+        len(candidate_evidence) != len(candidates)
+        or len(track_evidence_rows) != len(tracks)
+    ):
+        return False, "missing_position_evidence"
+    if not all(
+        evidence.get("position_authoritative") is True
+        for evidence in candidate_evidence + track_evidence_rows
+    ):
+        return False, "non_authoritative_position"
+    candidate_signatures = [
+        _provenance_signature(evidence) for evidence in candidate_evidence
+    ]
+    track_signatures = [
+        _provenance_signature(evidence) for evidence in track_evidence_rows
+    ]
     if not any(candidate_signatures) and not any(track_signatures):
-        return True
+        return True, None
     if any(signature is None for signature in candidate_signatures + track_signatures):
-        return False
-    return Counter(candidate_signatures) == Counter(track_signatures)
+        return False, "provenance_mismatch"
+    if Counter(candidate_signatures) != Counter(track_signatures):
+        return False, "provenance_mismatch"
+    return True, None
+
+
+def _record_gap_inconclusive(state, key, reason):
+    state["gap_inconclusive"][key] = state["gap_inconclusive"].get(key, 0) + 1
+    route_reasons = state["gap_inconclusive_reasons"].setdefault(key, {})
+    route_reasons[reason] = route_reasons.get(reason, 0) + 1
 
 
 def _eta_allows_motion(old, new, key, track):
-    before = old.get("track_evidence", {}).get(key, {}).get(track, {})
-    after = new.get("track_evidence", {}).get(key, {}).get(track, {})
+    before = _track_evidence(old, key, track)
+    after = _track_evidence(new, key, track)
     fields = ("bracket", "bracket_eta_offsets", "eta_minutes", "eta_arrival_at",
               "source_indices", "source_observations")
     changed = tuple(after.get(k) for k in fields) != tuple(before.get(k) for k in fields)
@@ -320,7 +508,9 @@ def _eta_allows_motion(old, new, key, track):
             and after_revision is not None
             and _boundary_age(after) is not None
             and (before_revision is None
-                 or all(a > b for a, b in zip(after_revision, before_revision)))
+                 or all(a > b for a, b in zip(
+                     after_revision, before_revision, strict=True
+                 )))
         )
     if before_revision is not None:
         return False
@@ -343,7 +533,7 @@ def _observed_checkpoint_map(snapshot):
 
 
 def _direct_bracket_evidence(record, key, track, position):
-    evidence = record.get("track_evidence", {}).get(key, {}).get(track, {})
+    evidence = _track_evidence(record, key, track)
     bracket = evidence.get("bracket") or ()
     sources = {int(index) for index in evidence.get("source_indices", ())}
     observed = {
@@ -427,6 +617,17 @@ def compare_adjacent(old, new, state=None):
         state["last_generation_by_route"].setdefault(key, generation[0])
         state["latest_complete_collected_at"].setdefault(key, generation[1])
     issues, checks = [], 0
+    for key, values in new.get("tracks", {}).items():
+        track_ids = [int(track) for track, _position in values]
+        duplicates = sorted(
+            track for track, count in Counter(track_ids).items() if count > 1
+        )
+        for track in duplicates:
+            issues.append({
+                "kind": "duplicate_track_identity",
+                "route": key,
+                "track_id": track,
+            })
     old_tracks, new_tracks = _route_maps(old), _route_maps(new)
     old_routes = {track: key for key, values in old_tracks.items() for track in values}
     new_routes = {track: key for key, values in new_tracks.items() for track in values}
@@ -440,6 +641,7 @@ def compare_adjacent(old, new, state=None):
         issues.extend(_duplicate_candidate_observation_issues(new, key))
         signatures = {}
         source_signatures = {}
+        source_owners = {}
         for track in b:
             route_evidence = new.get("track_evidence", {}).get(key, {})
             track_evidence = route_evidence.get(
@@ -464,6 +666,18 @@ def compare_adjacent(old, new, state=None):
             if signature is not None:
                 signatures[signature] = track
             if source_signature is not None:
+                for observation in source_signature:
+                    other_owner = source_owners.get(observation)
+                    if other_owner is not None and other_owner != track:
+                        issues.append({
+                            "kind": "duplicate_track_observation",
+                            "route": key,
+                            "track_id": track,
+                            "other_track_id": other_owner,
+                            "source_observation": observation,
+                        })
+                    else:
+                        source_owners[observation] = track
                 source_signatures[source_signature] = track
         current_generation = new.get("generations", {}).get(key)
         last_generation = state["last_generation_by_route"].get(key)
@@ -523,7 +737,9 @@ def compare_adjacent(old, new, state=None):
                 issues.append({"kind": "identity_order_crossing", "route": key})
         # Gap evidence is a property of this complete frame, never an inferred match.
         candidates = new.get("candidates", {}).get(key, ())
-        provenance_comparable = _spacing_provenance_comparable(new, key, b.items(), candidates)
+        provenance_comparable, spacing_reason = _spacing_provenance_comparable(
+            new, key, b.items(), candidates
+        )
         if current_generation and len(candidates) == len(b) >= 2 and provenance_comparable:
             checks += len(candidates) - 1
             state["gap_checks"][key] = state["gap_checks"].get(key, 0) + len(candidates) - 1
@@ -532,7 +748,12 @@ def compare_adjacent(old, new, state=None):
                    for i in range(len(candidates) - 1)):
                 issues.append({"kind": "spacing_mismatch", "route": key})
         elif current_generation and (len(candidates) != len(b) or not provenance_comparable):
-            state["gap_inconclusive"][key] = state["gap_inconclusive"].get(key, 0) + 1
+            _record_gap_inconclusive(
+                state,
+                key,
+                "cardinality_mismatch" if len(candidates) != len(b)
+                else spacing_reason or "unknown",
+            )
         valid_tracks = [
             (track, position)
             for track, position in b.items()
@@ -542,9 +763,9 @@ def compare_adjacent(old, new, state=None):
             track
             for track, position in b.items()
             if (
-                len(new.get("track_evidence", {}).get(key, {}).get(track, {}).get("bracket") or ()) == 2
+                len(_track_evidence(new, key, track).get("bracket") or ()) == 2
                 and _boundary_evidence_attempted(
-                    new.get("track_evidence", {}).get(key, {}).get(track, {})
+                    _track_evidence(new, key, track)
                 )
                 and not _direct_bracket_evidence(new, key, track, position)
             )
@@ -650,11 +871,14 @@ def fresh_routes(collected, started, ended):
 
 
 def evaluate_run(
-    requested, fresh, tracks_seen, minute_count, spacing_count, violations, provider_errors=(), lifecycle_inconclusive=(), bracket_count=()
+    requested, fresh, tracks_seen, minute_count, spacing_count, violations,
+    provider_errors=(), lifecycle_inconclusive=(), bracket_count=(),
+    source_audit_inconclusive=0,
 ):
     if violations:
         return 1
-    if provider_errors or lifecycle_inconclusive or missing_complete_routes(requested, fresh):
+    if (provider_errors or lifecycle_inconclusive or source_audit_inconclusive
+            or missing_complete_routes(requested, fresh)):
         return 2
     active = tracks_seen if isinstance(tracks_seen, dict) else ({key: 1 for key in requested} if tracks_seen else {})
     minutes = minute_count if isinstance(minute_count, dict) else ({key: minute_count for key in requested} if minute_count else {})
@@ -680,6 +904,12 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
     baselines = {}
     evidence = _evidence_state()
     completed_frames = 0
+    source_audit_checks = 0
+    source_audit_inconclusive = 0
+    source_audit_matched = 0
+    source_audit_excluded_undeparted = 0
+    source_audit_deferred = 0
+    audit_complete_generations = {}
     try:
         async with aiohttp.ClientSession() as session:
             client = HttpClient(session, timeout_seconds=HTTP_TIMEOUT_SECONDS)
@@ -712,14 +942,40 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
                 positioning_rows = getattr(snap, "positioning_rows", None)
                 rows = list(snap.rows) if positioning_rows is None else list(positioning_rows)
                 observed = _observed_checkpoint_map(snap)
+                authoritative = _authoritative_etas(groups, lines)
                 cand = estimate_bus_positions(
                     rows,
                     lines,
                     _destination_map(groups, lines),
-                    _authoritative_etas(groups, lines),
+                    authoritative,
                     observed_checkpoint_indices=observed,
                 )
                 tracked = await tracker.update(snap, cand, lines)
+                audit = audit_marker_positions(
+                    rows,
+                    authoritative,
+                    tracked,
+                    lines,
+                    frame_id=n + 1,
+                    observed_checkpoint_indices=observed,
+                )
+                strict_audit_routes, audit_route_reasons = (
+                    _source_audit_generation_context(
+                        snap, requested, audit_complete_generations
+                    )
+                )
+                audit_record, audit_issues = source_audit_result(
+                    audit,
+                    strict_routes=strict_audit_routes,
+                    route_reasons=audit_route_reasons,
+                )
+                source_audit_checks += audit_record["check_count"]
+                source_audit_inconclusive += audit_record["inconclusive_count"]
+                source_audit_deferred += len(audit_record["deferred_issues"])
+                source_audit_matched += int(audit_record["stats"].get("matched", 0) or 0)
+                source_audit_excluded_undeparted += int(
+                    audit_record["stats"].get("excluded_undeparted", 0) or 0
+                )
                 completed_frames += 1
                 cur = frame_record(
                     snap,
@@ -727,6 +983,7 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
                     tracked,
                     {route_key(x): max(0, len(getattr(x, "stops", ())) - 1) for x in lines},
                     priorities=priorities,
+                    source_audit=audit_record,
                 )
                 iss, g = compare_adjacent(previous, cur, evidence)
                 spacing_count += g
@@ -734,6 +991,7 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
                     baselines, cur, evidence_state=evidence
                 )
                 iss.extend(minute_issues)
+                iss.extend(audit_issues)
                 minute_count += minute_checks_count
                 violations += len(iss)
                 checks += g
@@ -742,15 +1000,35 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
                     "minute_checks": dict(evidence["minute_checks"]),
                     "gap_checks": dict(evidence["gap_checks"]),
                     "gap_inconclusive": dict(evidence["gap_inconclusive"]),
+                    "gap_inconclusive_reasons": {
+                        key: dict(reasons)
+                        for key, reasons in evidence["gap_inconclusive_reasons"].items()
+                    },
                     "lifecycle_inconclusive": dict(evidence["lifecycle_inconclusive"]),
                     "bracket_checks": dict(evidence["bracket_checks"]),
                     "bracket_inconclusive": dict(evidence["bracket_inconclusive"]),
+                    "source_audit_checks": source_audit_checks,
+                    "source_audit_inconclusive": source_audit_inconclusive,
+                    "source_audit_matched": source_audit_matched,
+                    "source_audit_excluded_undeparted": source_audit_excluded_undeparted,
+                    "source_audit_deferred": source_audit_deferred,
                 }
                 if handle:
                     handle.write(json.dumps(_json_safe_record(cur), separators=(",", ":")) + "\n")
                     handle.flush()
+                frame_status = (
+                    "FAIL" if iss else
+                    "INCONCLUSIVE" if audit_record["inconclusive_count"] else
+                    "PASS"
+                )
                 print(
-                    f"FRAME {n + 1}/{cycles} violations={len(iss)} status={'FAIL' if iss else 'PASS'}"
+                    f"FRAME {n + 1}/{cycles} violations={len(iss)} "
+                    f"source_audit_matched={audit_record['stats'].get('matched', 0)} "
+                    f"source_audit_excluded_undeparted="
+                    f"{audit_record['stats'].get('excluded_undeparted', 0)} "
+                    f"source_audit_inconclusive={audit_record['inconclusive_count']} "
+                    f"source_audit_deferred={len(audit_record['deferred_issues'])} "
+                    f"status={frame_status}"
                 )
                 previous = cur
                 if iss and fail_fast:
@@ -779,9 +1057,16 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
         provider_errors,
         evidence["lifecycle_inconclusive"],
         evidence["bracket_checks"],
+        source_audit_inconclusive,
+    )
+    gap_inconclusive_reasons = Counter(
+        reason
+        for reasons in evidence["gap_inconclusive_reasons"].values()
+        for reason, count in reasons.items()
+        for _ in range(count)
     )
     print(
-        f"SUMMARY frames={completed_frames} gap_checks={sum(evidence['gap_checks'].values())} minute_checks={sum(evidence['minute_checks'].values())} bracket_checks={sum(evidence['bracket_checks'].values())} bracket_inconclusive={sum(evidence['bracket_inconclusive'].values())} lifecycle_inconclusive={sum(evidence['lifecycle_inconclusive'].values())} violations={violations} status={'FAIL' if violations else ('INCONCLUSIVE' if return_code == 2 else 'PASS')}"
+        f"SUMMARY frames={completed_frames} gap_checks={sum(evidence['gap_checks'].values())} gap_inconclusive={sum(evidence['gap_inconclusive'].values())} gap_inconclusive_reasons={dict(sorted(gap_inconclusive_reasons.items()))} minute_checks={sum(evidence['minute_checks'].values())} bracket_checks={sum(evidence['bracket_checks'].values())} bracket_inconclusive={sum(evidence['bracket_inconclusive'].values())} lifecycle_inconclusive={sum(evidence['lifecycle_inconclusive'].values())} source_audit_checks={source_audit_checks} source_audit_matched={source_audit_matched} source_audit_excluded_undeparted={source_audit_excluded_undeparted} source_audit_inconclusive={source_audit_inconclusive} source_audit_deferred={source_audit_deferred} violations={violations} status={'FAIL' if violations else ('INCONCLUSIVE' if return_code == 2 else 'PASS')}"
     )
     return return_code
 

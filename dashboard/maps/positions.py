@@ -12,7 +12,7 @@ arclength-interpolated on the matching official direction.
 from __future__ import annotations
 
 import math
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from itertools import combinations
 from statistics import median
@@ -233,11 +233,78 @@ def _checkpoint_evidence(rows):
     return tuple(sorted(evidence)[:64])
 
 
+def _refine_fresh_kmb_unbracketed_position(
+    key: tuple[str, str, str],
+    rows: Collection[object],
+) -> float | None:
+    """Refine an unbracketed live KMB cohort at its nearest future stop.
+
+    Identity association has already completed, and common-stop separation has
+    supplied a provisional coordinate.  Neither is revisited here.  In the
+    all-positive case the nearest owned ETA is the strongest local position
+    evidence; a farther rung must not pull the marker to or beyond it.  This
+    refinement establishes no global vehicle order and grants no authority.
+    """
+    if key[0] != "KMB" or not rows:
+        return None
+    revisions: set[int] = set()
+    prepared: list[tuple[int, float]] = []
+    for row in rows:
+        try:
+            index = int(row.index)
+            minutes = float(row.minutes)
+            age = float(row.cache_age_seconds)
+            revision = int(row.refresh_generation)
+            arrival = float(row.arrival_at.timestamp())
+        except (AttributeError, TypeError, ValueError, OverflowError, OSError):
+            return None
+        if (
+            isinstance(getattr(row, "index", None), bool)
+            or isinstance(getattr(row, "minutes", None), bool)
+            or isinstance(getattr(row, "cache_age_seconds", None), bool)
+            or isinstance(getattr(row, "refresh_generation", None), bool)
+            or index <= 0
+            or not math.isfinite(minutes)
+            or minutes <= 0.0
+            or not math.isfinite(age)
+            or not 0.0 <= age < ATOMIC_LADDER_FRESHNESS_SECONDS
+            or revision <= 0
+            or not math.isfinite(arrival)
+            or not any(
+                getattr(row, "kind", None) is live_kind
+                for live_kind in LIVE_PROBE_ETA_KINDS
+            )
+        ):
+            return None
+        revisions.add(revision)
+        prepared.append((index, minutes))
+    if len(revisions) != 1:
+        return None
+    nearest_index = min(index for index, _minutes in prepared)
+    nearest_rows = [
+        minutes for index, minutes in prepared if index == nearest_index
+    ]
+    if len(nearest_rows) != 1:
+        return None
+    projected = nearest_index - nearest_rows[0] / MINUTES_PER_STOP
+    if not math.isfinite(projected) or not 0.0 <= projected < nearest_index:
+        return None
+    return projected
+
+
+def _has_future_origin_departure(ladder_rows: Collection[tuple]) -> bool:
+    """Return direct evidence that a source cohort has not left stop zero."""
+    return any(
+        rung[1] == 0
+        and rung[0] < 0.0
+        for rung in ladder_rows
+    )
+
+
 MINUTES_PER_STOP = 2.0
-# Exact timestamps can lead the rounded departure state by a few seconds.
-# Keep a narrow grace window so a gate-confirmed vehicle is not hidden at the
-# instant it leaves, while a genuinely future terminus ETA remains decisive.
-TERMINUS_DEPARTURE_GRACE_MINUTES = 0.5
+# This window only associates gate handoffs; it never permits a future
+# terminus departure to appear on the map.
+GATE_HANDOFF_GRACE_MINUTES = 0.5
 GATE_DOWNSTREAM_DRIFT_MINUTES = 15.0
 GATE_UPSTREAM_DRIFT_MINUTES = 25.0
 GATE_PASSAGE_SKEW_MINUTES = 3.0
@@ -445,6 +512,7 @@ def _align_gate_arrivals(
     checkpoint: int,
     rank_first: bool = False,
     allow_downstream_clock_skew: bool = False,
+    pair_allowed: Callable[[int, int], bool] | None = None,
 ) -> list[tuple[int, int]]:
     """Associate one stop's ordered arrivals with ordered HKUST arrivals.
 
@@ -520,7 +588,10 @@ def _align_gate_arrivals(
                     expected_delta - GATE_UPSTREAM_DRIFT_MINUTES
                     <= delta <= upstream_upper
                 )
-            if compatible:
+            if compatible and (
+                pair_allowed is None
+                or pair_allowed(probe_input_index, gate_input_index)
+            ):
                 previous = states[gate_offset - 1][probe_offset - 1]
                 choices.append(
                     (
@@ -767,7 +838,7 @@ def _atomic_kmb_frontier_certificate(
                 leading_minutes = float("nan")
             two_rank_handoff = (
                 math.isfinite(leading_minutes)
-                and 0.0 <= leading_minutes <= TERMINUS_DEPARTURE_GRACE_MINUTES
+                and 0.0 <= leading_minutes <= GATE_HANDOFF_GRACE_MINUTES
                 and (carried or first_failure)
             )
     ordered_gate_sources = [source for _minutes, source, _gate in ordered_gates]
@@ -1201,8 +1272,44 @@ def _plan_gate_associations(
         frontier_checkpoint = gate_index
         atomic_frontier = False
         atomic_frontier_broken = False
+        blocked_gate_inputs: set[int] = set()
         route_probe_rows = probe_rows_by_occurrence.get(key, {})
         route_empty_occurrences = explicit_empty_probe_occurrences.get(key, set())
+
+        def arrival_timestamp(row: object) -> float | None:
+            arrival_at = getattr(row, "arrival_at", None)
+            if arrival_at is None:
+                return None
+            try:
+                timestamp = float(arrival_at.timestamp())
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return None
+            return timestamp if math.isfinite(timestamp) else None
+
+        def follows_gate_arrival_chronology(
+            probe_input_index: int,
+            gate_input_index: int,
+            blocked_inputs: set[int] = blocked_gate_inputs,
+        ) -> bool:
+            """Keep one gate identity on a strictly forward arrival ladder."""
+            if gate_input_index in blocked_inputs:
+                return False
+            current_row = probe_inputs[probe_input_index]
+            current_timestamp = arrival_timestamp(current_row)
+            if current_timestamp is None:
+                # Legacy/incomplete rows have no absolute chronology proof;
+                # retain the existing ETA-order behavior for those rows.
+                return True
+            prior_timestamps = [
+                timestamp
+                for prior_input, prior_gate in gate_assignment.items()
+                if prior_gate == gate_input_index
+                and int(probe_inputs[prior_input].index) < int(current_row.index)
+                and (timestamp := arrival_timestamp(probe_inputs[prior_input]))
+                is not None
+            ]
+            return not prior_timestamps or current_timestamp > max(prior_timestamps)
+
         for checkpoint in sorted(set(route_probe_rows) | route_empty_occurrences):
             checkpoint_rows = route_probe_rows.get(checkpoint, [])
             explicit_empty = checkpoint in route_empty_occurrences
@@ -1254,6 +1361,7 @@ def _plan_gate_associations(
                 gate_index=gate_index,
                 checkpoint=checkpoint,
                 rank_first=True,
+                pair_allowed=follows_gate_arrival_chronology,
             )
             atomic_fresh_pairs = _atomic_kmb_fresh_root_pairs(
                 key,
@@ -1268,6 +1376,10 @@ def _plan_gate_associations(
                 checkpoint=checkpoint,
                 prior_gate_assignments=gate_assignment,
             )
+            atomic_fresh_pairs = [
+                pair for pair in atomic_fresh_pairs
+                if follows_gate_arrival_chronology(*pair)
+            ]
             frontier_pairs = (
                 _align_gate_arrivals(
                     frontier,
@@ -1360,6 +1472,7 @@ def _plan_gate_associations(
                         gate_index=gate_index,
                         checkpoint=checkpoint,
                         allow_downstream_clock_skew=True,
+                        pair_allowed=follows_gate_arrival_chronology,
                     ):
                         # Without a whole atomic frontier certificate, retain
                         # direct-gate revalidation and normal rematching.
@@ -1393,11 +1506,36 @@ def _plan_gate_associations(
             # A gate is reserved only after its prior identity actually
             # propagated. If propagation failed due to a transient ETA gap,
             # leave that gate available for a fresh compatible match here.
+            # A gate with a compatible ETA but only backward absolute-arrival
+            # rows has crossed into an already-passed cohort.  Once crossed,
+            # do not let that identity rejoin a later row in this generation.
+            for gate_input_index, gate_row in gate_rows:
+                if (
+                    gate_input_index in blocked_gate_inputs
+                    or gate_input_index in propagated_gate_inputs
+                    or gate_input_index in fresh_gate_inputs
+                ):
+                    continue
+                candidate_gate = [(gate_input_index, gate_row)]
+                if _align_gate_arrivals(
+                    candidate_gate,
+                    checkpoint_rows,
+                    gate_index=gate_index,
+                    checkpoint=checkpoint,
+                ) and not _align_gate_arrivals(
+                    candidate_gate,
+                    checkpoint_rows,
+                    gate_index=gate_index,
+                    checkpoint=checkpoint,
+                    pair_allowed=follows_gate_arrival_chronology,
+                ):
+                    blocked_gate_inputs.add(gate_input_index)
             available_gate_rows = [
                 pair
                 for pair in gate_rows
                 if pair[0] not in propagated_gate_inputs
                 and pair[0] not in fresh_gate_inputs
+                and pair[0] not in blocked_gate_inputs
             ]
 
             # A raw-past row is seeded as an independent passed vehicle only
@@ -1413,6 +1551,7 @@ def _plan_gate_associations(
                         [(input_index, row)],
                         gate_index=gate_index,
                         checkpoint=checkpoint,
+                        pair_allowed=follows_gate_arrival_chronology,
                     )
                 )
                 if raw_position > gate_index and not compatible:
@@ -1428,6 +1567,7 @@ def _plan_gate_associations(
                 gate_index=gate_index,
                 checkpoint=checkpoint,
                 rank_first=True,
+                pair_allowed=follows_gate_arrival_chronology,
             )
             for probe_index, gate_input_index in pairs:
                 gate_assignment[probe_index] = gate_input_index
@@ -1569,7 +1709,7 @@ def _plan_gate_associations(
                     provisional_gate_tracks[probe_input] = gate_input
                 elif (
                     checkpoint == 0
-                    and float(row.minutes) > TERMINUS_DEPARTURE_GRACE_MINUTES
+                    and float(row.minutes) > 0.0
                 ):
                     # A future origin is veto evidence only.  It suppresses
                     # the matched provisional identity but never bypasses the
@@ -1643,8 +1783,6 @@ def _plan_gate_associations(
                 and int(probe_inputs[probe_input].index)
                 - float(probe_inputs[probe_input].minutes) / MINUTES_PER_STOP
                 < 0
-                and float(probe_inputs[probe_input].minutes)
-                > TERMINUS_DEPARTURE_GRACE_MINUTES
                 for probe_input in assigned_probe_inputs
             )
             has_departed_probe = any(
@@ -2298,8 +2436,15 @@ def estimate_bus_positions(
             False,
             observation,
         )
-        # Remaining probe-only evidence must imply a position on the route.
-        if not is_authoritative and minutes > 0 and identity_position(row) < 0:
+        # Retain a future origin row long enough to veto its whole associated
+        # cohort. Other negative probe projections cannot place a vehicle on
+        # the rendered route and supply no departure evidence.
+        if (
+            not is_authoritative
+            and minutes > 0
+            and identity_position(row) < 0
+            and idx != 0
+        ):
             continue
         if raw_position > stops_count - 1:
             continue
@@ -2380,6 +2525,11 @@ def estimate_bus_positions(
             )
 
         for ladder in ladders:
+            # Departure evidence is an identity-level veto. Apply it before
+            # provisional spacing or local checkpoint refinement can turn a
+            # farther positive rung into a visible marker.
+            if _has_future_origin_departure(ladder):
+                continue
             # A direct gate ETA overrides downstream inference. Otherwise use
             # the maximum implied position, closest to the gate ETA. The ladder
             # is unreliable only when
@@ -2420,6 +2570,8 @@ def estimate_bus_positions(
         operator_name, route, bound = key
         stops_count = len(list(lines_by_key[key].stops))
         for gate_input, ladder in gate_ladders.items():
+            if _has_future_origin_departure(ladder):
+                continue
             direct = [rung for rung in ladder if rung[4] == ("probe", gate_input)]
             if len(direct) != 1:
                 continue
@@ -2725,6 +2877,23 @@ def estimate_bus_positions(
                     # observation when the first rung becomes due or vanishes.
                     refresh_frontier.update(positive_indices[:2])
                 priority_indices = frozenset(refresh_frontier)
+                if position_authoritative is False and not any(
+                    kind == "gate" for kind, _index in source_observations
+                ):
+                    # Final position precedence is: associated source cohort,
+                    # provisional common-stop spacing, then this local
+                    # checkpoint refinement. It never changes cohort identity.
+                    nearest_anchor = _refine_fresh_kmb_unbracketed_position(
+                        (operator_name, route, bound), source_rows
+                    )
+                    if nearest_anchor is not None:
+                        position = nearest_anchor
+                        exploratory_indices = frozenset(
+                            index for index in {
+                                math.floor(position), math.ceil(position)
+                            }
+                            if 0 <= index < stops_count
+                        )
                 boundary_index = first_present
                 if zero_indices:
                     # Owned due/future evidence is a physical boundary even
@@ -3236,6 +3405,10 @@ def rebuild_estimate_from_probe_sources(
         selected.append(row)
     if not selected:
         return None
+    # Ownership reconstruction must enforce the same departure veto as the
+    # estimator before either a boundary or a downstream fallback is used.
+    if any(row.index == 0 and float(row.minutes) > 0.0 for row in selected):
+        return None
     # Boundary reconstruction may use a successful-empty response or another
     # bus's upstream checkpoint. Reject malformed route context instead of
     # allowing such a row to manufacture a lower endpoint.
@@ -3279,8 +3452,9 @@ def rebuild_estimate_from_probe_sources(
         return rebuilt
     # An owned all-positive fragment can legitimately have an unknown lower
     # frontier. Keep it visible as a bounded, non-authoritative projection.
+    nearest_anchor = _refine_fresh_kmb_unbracketed_position(key, selected)
     try:
-        projected = max(
+        projected = nearest_anchor if nearest_anchor is not None else max(
             float(row.index) - float(row.minutes) / MINUTES_PER_STOP
             for row in selected
         )

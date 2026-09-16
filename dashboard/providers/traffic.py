@@ -1,27 +1,40 @@
 """Transport Department traffic provider: detector speeds/volume/occupancy,
 Special Traffic News, roadworks GeoJSON.
 
-Official TD/data.gov.hk feeds only. RTHK scraping is explicitly out of scope.
+Official TD/data.gov.hk feeds and RTHK's public current traffic-news page.
 Speed bands are dashboard heuristics (documented), not TD classifications.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
+from html.parser import HTMLParser
 from typing import Any
 
-from dashboard.http import CachedFetch, HttpClient, as_datetime
+from dashboard.http import CachedFetch, FetchError, HttpClient, as_datetime
 from dashboard.models import (
     Roadwork,
     SpeedBand,
     TrafficCorridorStatus,
     TrafficIncident,
     TrafficObservation,
+)
+from dashboard.providers.traffic_news import (
+    RTHK_TRAFFIC_NEWS_URL,
+    is_cleared_notice,
+    parse_rthk_traffic_news,
+    rthk_latest_report_time,
+)
+from dashboard.providers.traffic_reconciliation import (
+    pair_td_bilingual_pages,
+    reconcile_incident_reports,
 )
 
 log = logging.getLogger(__name__)
@@ -35,17 +48,19 @@ DETECTOR_META_URL = (
     "https://static.data.gov.hk/td/traffic-data-strategic-major-roads/info/"
     "traffic_speed_volume_occ_info.csv"
 )
-DETECTOR_OBS_URL = (
-    "https://resource.data.one.gov.hk/td/traffic-detectors/rawSpeedVol-all.xml"
-)
+DETECTOR_OBS_URL = "https://resource.data.one.gov.hk/td/traffic-detectors/rawSpeedVol-all.xml"
+# Retained for offline parser compatibility only; runtime never collects it.
 SPECIAL_NEWS_URL = "https://www.td.gov.hk/en/special_news/trafficnews.xml"
+SPECIAL_NEWS_PAGE_URL = "https://www.td.gov.hk/en/special_news/spnews.htm"
+SPECIAL_NEWS_TC_PAGE_URL = "https://www.td.gov.hk/tc/special_news/spnews.htm"
 ROADWORKS_URL = (
     "https://resource.data.one.gov.hk/td/roadworks-location/get_all_the_roadworks.geojson"
 )
 
 # Refresh cadences.
 OBS_TTL_SECONDS = 55.0
-NEWS_TTL_SECONDS = 295.0
+# Both current news pages are checked independently once per minute.
+NEWS_TTL_SECONDS = 60.0
 ROADWORKS_TTL_SECONDS = 15 * 60.0
 META_TTL_SECONDS = 24 * 60 * 60.0
 
@@ -63,6 +78,21 @@ SPECIAL_NEWS_SPEC = CachedFetch(
     SPECIAL_NEWS_URL,
     NEWS_TTL_SECONDS,
     cache_key="td-special-news",
+)
+SPECIAL_NEWS_PAGE_SPEC = CachedFetch(
+    SPECIAL_NEWS_PAGE_URL,
+    NEWS_TTL_SECONDS,
+    cache_key="td-special-news-page",
+)
+SPECIAL_NEWS_TC_PAGE_SPEC = CachedFetch(
+    SPECIAL_NEWS_TC_PAGE_URL,
+    NEWS_TTL_SECONDS,
+    cache_key="td-special-news-page-tc",
+)
+RTHK_NEWS_SPEC = CachedFetch(
+    RTHK_TRAFFIC_NEWS_URL,
+    NEWS_TTL_SECONDS,
+    cache_key="rthk-traffic-news-page0",
 )
 ROADWORKS_SPEC = CachedFetch(
     ROADWORKS_URL,
@@ -107,6 +137,7 @@ class _DetectorMeta:
 # Detector metadata CSV
 # --------------------------------------------------------------------------
 
+
 def parse_detector_metadata(csv_text: str) -> dict[str, _DetectorMeta]:
     """Parse the TD detector CSV into {detector_id: meta}.
 
@@ -146,9 +177,7 @@ def parse_detector_metadata(csv_text: str) -> dict[str, _DetectorMeta]:
         meta[detector_id] = _DetectorMeta(
             detector_id=detector_id,
             description=(
-                fields[desc_col].strip()
-                if desc_col is not None and len(fields) > desc_col
-                else ""
+                fields[desc_col].strip() if desc_col is not None and len(fields) > desc_col else ""
             ),
             latitude=(
                 _to_float(fields[lat_col])
@@ -161,9 +190,7 @@ def parse_detector_metadata(csv_text: str) -> dict[str, _DetectorMeta]:
                 else None
             ),
             direction=(
-                fields[dir_col].strip()
-                if dir_col is not None and len(fields) > dir_col
-                else ""
+                fields[dir_col].strip() if dir_col is not None and len(fields) > dir_col else ""
             ),
         )
     return meta
@@ -196,6 +223,7 @@ def _to_float(value: str) -> float | None:
 # --------------------------------------------------------------------------
 # Detector observations XML
 # --------------------------------------------------------------------------
+
 
 def parse_detector_observations(xml_text: str) -> dict[str, dict[str, Any]]:
     """Parse rawSpeedVol-all.xml into {detector_id: aggregate lane stats}.
@@ -298,6 +326,7 @@ def _to_int(value: str | None) -> int | None:
 # Road matching (the road table comes from dashboard.providers.tracked_roads)
 # --------------------------------------------------------------------------
 
+
 def match_roads(text: str, roads: Any) -> list[str]:
     """Return canonical road keys whose aliases appear in ``text``.
 
@@ -387,9 +416,7 @@ def resolve_incident_road_keys(
     explicit_parents = [
         _road_words(field) for field in explicit_fields if _ROAD_DESIGNATOR.search(field)
     ]
-    narrative = _without_direction_parentheticals(
-        " ".join((incident.title, incident.description))
-    )
+    narrative = _without_direction_parentheticals(" ".join((incident.title, incident.description)))
     narrative_matches = match_roads(narrative, roads)
     refinements = [
         key
@@ -496,6 +523,7 @@ def speed_band(speed_kmh: float | None, stale: bool = False) -> SpeedBand:
 # Special Traffic News (XML v2)
 # --------------------------------------------------------------------------
 
+
 def parse_special_news(xml_text: str) -> list[TrafficIncident]:
     """Parse current and legacy TD special traffic news XML schemas."""
     try:
@@ -516,10 +544,7 @@ def parse_special_news(xml_text: str) -> list[TrafficIncident]:
             tag = child.tag.split("}")[-1].lower()
             fields[tag] = (child.text or "").strip()
         identifier = (
-            fields.get("incident_number")
-            or fields.get("identifier")
-            or fields.get("id")
-            or ""
+            fields.get("incident_number") or fields.get("identifier") or fields.get("id") or ""
         )
         title = fields.get("incident_heading_en") or fields.get("title") or ""
         description = (
@@ -554,9 +579,184 @@ def parse_special_news(xml_text: str) -> list[TrafficIncident]:
                 longitude=_to_float(fields.get("longitude") or ""),
                 near_landmark=fields.get("near_landmark_en", ""),
                 between_landmark=fields.get("between_landmark_en", ""),
+                source="TD",
+                source_url=SPECIAL_NEWS_PAGE_URL,
             )
         )
     return _dedupe_incidents(incidents)
+
+
+def _validate_special_news_feed(xml_text: str) -> None:
+    """Reject malformed or unrecognized TD news before it enters the cache.
+
+    A recognized root with no ``item``/``message`` children is a legitimate
+    empty feed.  Once entries exist, each must retain one of the identity/title
+    fields understood by :func:`parse_special_news`; otherwise a schema change
+    must be observable as a fetch failure rather than fresh "no notices" data.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise FetchError("Invalid TD special news XML") from exc
+
+    root_name = _local_name(root.tag).casefold()
+    if root_name not in {"list", "trafficnews"}:
+        raise FetchError(f"Unexpected TD special news root {root_name!r}")
+
+    identity_fields = {
+        "incident_number",
+        "identifier",
+        "id",
+        "incident_heading_en",
+        "title",
+    }
+    items = [
+        element
+        for element in root.iter()
+        if _local_name(element.tag).casefold() in {"item", "message"}
+    ]
+    for item in items:
+        fields = {_local_name(child.tag).casefold() for child in item}
+        if not fields.intersection(identity_fields):
+            raise FetchError("Unrecognized TD special news item schema")
+
+
+async def _fetch_validated_special_news(client: HttpClient, url: str) -> str:
+    xml_text = await client.fetch_xml_text(url)
+    _validate_special_news_feed(xml_text)
+    return xml_text
+
+
+class _SpecialNewsPageParser(HTMLParser):
+    """Extract list-item text from TD's small, legacy-markup news page."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.found_ordered_list = False
+        self.items: list[str] = []
+        self.page_text: list[str] = []
+        self._ordered_list_depth = 0
+        self._item_parts: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        lowered = tag.casefold()
+        if lowered == "ol":
+            self.found_ordered_list = True
+            self._ordered_list_depth += 1
+        elif lowered == "li" and self._ordered_list_depth:
+            self._item_parts = []
+        elif lowered == "br" and self._item_parts is not None:
+            self._item_parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.casefold()
+        if lowered == "li" and self._item_parts is not None:
+            text = _sanitize_text(" ".join(self._item_parts))
+            if text:
+                self.items.append(text)
+            self._item_parts = None
+        elif lowered == "ol" and self._ordered_list_depth:
+            self._ordered_list_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        self.page_text.append(data)
+        if self._item_parts is not None:
+            self._item_parts.append(data)
+
+
+_REOPENED = re.compile(r"\bre[\s-]?opened\s+to\s+all\s+traffic\b", re.IGNORECASE)
+_BOUND_DIRECTION = re.compile(r"\(([^()]*(?:bound|bounds))\)", re.IGNORECASE)
+
+
+def parse_special_news_page(html_text: str) -> list[TrafficIncident]:
+    """Parse the complete official TD special-news HTML list.
+
+    The page is authoritative for the current list.  Its page timestamp is a
+    refresh time, not an event announcement time, so parsed entries deliberately
+    leave ``announcement_time`` unset.
+    """
+    parser = _SpecialNewsPageParser()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception as exc:  # HTMLParser can surface malformed entity input
+        raise FetchError("Invalid TD special news HTML") from exc
+
+    page_text = _sanitize_text(" ".join(parser.page_text)).casefold()
+    if "special traffic news" not in page_text or not parser.found_ordered_list:
+        raise FetchError("Unrecognized TD special news page")
+
+    incidents: list[TrafficIncident] = []
+    for text in parser.items:
+        lowered = text.casefold()
+        reopened = bool(_REOPENED.search(text))
+        if "traffic accident" in lowered:
+            title = "Traffic accident"
+        elif "vehicle breakdown" in lowered:
+            title = "Vehicle breakdown"
+        elif "roadwork" in lowered or "works" in lowered:
+            title = "Road works"
+        else:
+            title = "TD special traffic news"
+        direction_match = _BOUND_DIRECTION.search(text)
+        digest = hashlib.sha256(text.casefold().encode("utf-8")).hexdigest()[:16]
+        incidents.append(
+            TrafficIncident(
+                identifier=f"TD-WEB-{digest}",
+                title=title,
+                description=text,
+                road="",
+                location="",
+                direction=(direction_match.group(1).strip() if direction_match else ""),
+                status="CLOSED" if reopened else "ACTIVE",
+                source="TD",
+                source_url=SPECIAL_NEWS_PAGE_URL,
+            )
+        )
+    return incidents
+
+
+async def _fetch_validated_special_news_page(client: HttpClient, url: str) -> str:
+    html_text = await client.fetch_html(url, max_bytes=256 * 1024)
+    parse_special_news_page(html_text)
+    return html_text
+
+
+async def _fetch_validated_special_news_tc_page(client: HttpClient, url: str) -> str:
+    html_text = await client.fetch_html(url, max_bytes=256 * 1024)
+    parser = _SpecialNewsPageParser()
+    parser.feed(html_text)
+    page_text = _sanitize_text(" ".join(parser.page_text))
+    if "\u7279\u5225\u4ea4\u901a\u6d88\u606f" not in page_text or not parser.found_ordered_list:
+        raise FetchError("Unrecognized TD Chinese special news page")
+    return html_text
+
+
+def special_news_page_time(html_text: str) -> datetime | None:
+    """Read TD's displayed page update time, separately from our fetch time."""
+    parser = _SpecialNewsPageParser()
+    parser.feed(html_text)
+    text = _sanitize_text(" ".join(parser.page_text))
+    match = re.search(
+        r"(\d{4})(?:/|\u5e74)(\d{1,2})(?:/|\u6708)(\d{1,2})(?:\u65e5)?\s+"
+        r"(\d{1,2}:\d{2}:\d{2})\s+([AP]M)",
+        text,
+        re.I,
+    )
+    if match is None:
+        return None
+    try:
+        normalized = "/".join(match.group(1, 2, 3)) + " " + " ".join(match.group(4, 5))
+        return datetime.strptime(normalized.upper(), "%Y/%m/%d %I:%M:%S %p").replace(tzinfo=HKT)
+    except ValueError:
+        return None
+
+
+async def _fetch_validated_rthk_news(client: HttpClient, url: str, roads: Any) -> str:
+    html_text = await client.fetch_html(url, max_bytes=512 * 1024)
+    parse_rthk_traffic_news(html_text, roads)
+    return html_text
 
 
 def _sanitize_text(text: str) -> str:
@@ -577,21 +777,76 @@ def _dedupe_incidents(incidents: list[TrafficIncident]) -> list[TrafficIncident]
     return out
 
 
+def _incident_event_key(incident: TrafficIncident, road_key: str) -> tuple[str, ...]:
+    """Return a conservative key pairing a closure with its re-opening item."""
+    text = _road_words(" ".join((incident.title, incident.description, incident.direction)))
+
+    def detail(pattern: str) -> str:
+        match = re.search(pattern, text)
+        return match.group(1).strip() if match else ""
+
+    direction = detail(r"\b((?:[a-z]+\s+){0,3}bound|both bounds)\b")
+    landmark = detail(r"\bnear\s+(.+?)(?=\s+(?:which|is|was)\b|$)")
+    cause = detail(r"\bdue to\s+(.+?)(?=\s+(?:is|was|which|part|the)\b|$)")
+    lane = detail(r"\b((?:fast|slow|middle) lane|part of the lanes|all lanes|the lane)\b")
+    original_text = " ".join((incident.title, incident.description, incident.direction))
+    if not direction:
+        match = re.search(r"往(.{1,12}?)方向", original_text)
+        direction = match.group(1).strip() if match else ""
+    if not landmark:
+        match = re.search(r"近(.+?)(?=的|有|，|。|$)", original_text)
+        landmark = match.group(1).strip() if match else ""
+        # RTHK uses both "近港鐵站慢線的..." and "近港鐵站的慢線...".
+        # Lane wording is not part of the landmark's identity.
+        landmark = re.sub(r"(?:慢線|快線|中線|部分行車線|所有行車線)$", "", landmark)
+    if not cause:
+        for phrase in ("交通意外", "壞車", "水管緊急維修", "道路工程"):
+            if phrase in original_text:
+                cause = phrase
+                break
+    return road_key, direction, landmark, cause, lane
+
+
+def _is_reopened_incident(incident: TrafficIncident) -> bool:
+    return is_cleared_notice(incident)
+
+
 def filter_relevant_incidents(
-    incidents: list[TrafficIncident], roads: Any = None, limit: int = 3
+    incidents: list[TrafficIncident], roads: Any = None, limit: int | None = None
 ) -> list[TrafficIncident]:
-    """Keep incidents resolved to tracked roads; dedupe already done."""
-    relevant = [
-        inc
-        for inc in incidents
-        if resolve_incident_road_keys(inc, roads)
-    ]
-    return relevant[:limit]
+    """Keep tracked-road updates and suppress closures already re-opened.
+
+    TD's HTML list is newest-first and can briefly contain both a re-opening
+    notice and the older closure.  A matching earlier re-opening therefore
+    cancels the older closure.  The re-opening remains as a ``CLOSED`` update
+    so the renderer can attribute the latest state without treating it as
+    active congestion evidence.
+    """
+    cleared: set[tuple[str, ...]] = set()
+    relevant: list[TrafficIncident] = []
+    for incident in incidents:
+        road_keys = resolve_incident_road_keys(incident, roads)
+        if not road_keys:
+            continue
+        event_keys = {_incident_event_key(incident, key) for key in road_keys}
+        if _is_reopened_incident(incident):
+            cleared.update(event_keys)
+            relevant.append(incident)
+            if limit is not None and len(relevant) >= limit:
+                break
+            continue
+        if event_keys.intersection(cleared):
+            continue
+        relevant.append(incident)
+        if limit is not None and len(relevant) >= limit:
+            break
+    return relevant
 
 
 # --------------------------------------------------------------------------
 # Roadworks GeoJSON
 # --------------------------------------------------------------------------
+
 
 def parse_roadworks(geojson: dict[str, Any], roads: Any = None) -> list[Roadwork]:
     """Parse TD roadworks GeoJSON; match against our tracked roads."""
@@ -600,8 +855,7 @@ def parse_roadworks(geojson: dict[str, Any], roads: Any = None) -> list[Roadwork
     for feature in features:
         props = feature.get("properties") or {}
         description = " ".join(
-            str(props.get(k) or "")
-            for k in ("description", "name", "location", "road")
+            str(props.get(k) or "") for k in ("description", "name", "location", "road")
         )
         if not match_roads(description, roads):
             continue
@@ -618,9 +872,95 @@ def parse_roadworks(geojson: dict[str, Any], roads: Any = None) -> list[Roadwork
     return out
 
 
+async def _collect_td_news(
+    client: HttpClient, roads: Any
+) -> tuple[list[TrafficIncident], list[str], dict[str, datetime]]:
+    markers: list[str] = []
+    times: dict[str, datetime] = {}
+    raw_incidents: list[TrafficIncident] = []
+    fetched_at: float | None = None
+    page_updated_at: datetime | None = None
+    page_text = ""
+    chinese_page_text = ""
+    english_result, chinese_result = await asyncio.gather(
+        client._fetch_cached(  # noqa: SLF001
+            SPECIAL_NEWS_PAGE_SPEC,
+            lambda url: _fetch_validated_special_news_page(client, url),
+        ),
+        client._fetch_cached(  # noqa: SLF001
+            SPECIAL_NEWS_TC_PAGE_SPEC,
+            lambda url: _fetch_validated_special_news_tc_page(client, url),
+        ),
+        return_exceptions=True,
+    )
+    if isinstance(english_result, BaseException):
+        log.warning("TD special news page fetch failed: %s", english_result)
+        markers.append("TD traffic news page unavailable")
+    else:
+        stale, page_text, fetched_at = english_result
+        if stale:
+            markers.append("TD traffic news")
+        raw_incidents = parse_special_news_page(page_text)
+        page_updated_at = special_news_page_time(page_text)
+        raw_incidents = [
+            replace(incident, page_updated_at=page_updated_at) for incident in raw_incidents
+        ]
+    if isinstance(chinese_result, BaseException):
+        log.warning("TD Chinese special news page fetch failed: %s", chinese_result)
+    else:
+        _tc_stale, chinese_page_text, _tc_fetched_at = chinese_result
+
+    if raw_incidents and chinese_page_text:
+        sidecars = pair_td_bilingual_pages(page_text, chinese_page_text, raw_incidents, roads)
+        raw_incidents = [
+            replace(
+                incident,
+                translated_description=sidecars.get(incident.identifier, ""),
+            )
+            for incident in raw_incidents
+        ]
+
+    incidents = filter_relevant_incidents(raw_incidents, roads)
+    if fetched_at is not None:
+        checked_time = datetime.fromtimestamp(fetched_at, UTC)
+        times["traffic_news_checked"] = checked_time
+        official_time = max(
+            (incident.announcement_time for incident in incidents if incident.announcement_time),
+            default=None,
+        )
+        times["traffic_news"] = page_updated_at or official_time or checked_time
+        if page_updated_at is not None:
+            times["traffic_news_updated"] = page_updated_at
+    return incidents, markers, times
+
+
+async def _collect_rthk_news(
+    client: HttpClient, roads: Any
+) -> tuple[list[TrafficIncident], list[str], dict[str, datetime]]:
+    markers: list[str] = []
+    times: dict[str, datetime] = {}
+    try:
+        stale, page_text, fetched_at = await client._fetch_cached(  # noqa: SLF001
+            RTHK_NEWS_SPEC,
+            lambda url: _fetch_validated_rthk_news(client, url, roads),
+        )
+        if stale:
+            markers.append("RTHK traffic news")
+        incidents = filter_relevant_incidents(parse_rthk_traffic_news(page_text, roads), roads)
+        times["rthk_news_checked"] = datetime.fromtimestamp(fetched_at, UTC)
+        report_time = rthk_latest_report_time(page_text)
+        if report_time is not None:
+            times["rthk_news"] = report_time
+        return incidents, markers, times
+    except Exception as exc:  # noqa: BLE001
+        log.warning("RTHK traffic news fetch failed: %s", exc)
+        return [], ["RTHK traffic news unavailable"], {}
+
+
 # --------------------------------------------------------------------------
 # Public facade
 # --------------------------------------------------------------------------
+
 
 async def fetch_traffic_data(
     client: HttpClient,
@@ -661,9 +1001,7 @@ async def fetch_traffic_data(
     statuses: list[TrafficCorridorStatus] = []
     capture_time: datetime | None = None
     try:
-        stale, obs_text, fetched_at = await client.fetch_xml_text_cached(
-            DETECTOR_OBS_SPEC
-        )
+        stale, obs_text, fetched_at = await client.fetch_xml_text_cached(DETECTOR_OBS_SPEC)
         if stale:
             stale_sources.append("TD detector observations")
         obs = parse_detector_observations(obs_text)
@@ -672,29 +1010,19 @@ async def fetch_traffic_data(
             (o.capture_time for s in statuses for o in s.observations if o.capture_time),
             default=None,
         )
-        source_times["detectors"] = capture_time or datetime.fromtimestamp(
-            fetched_at, UTC
-        )
+        source_times["detectors"] = capture_time or datetime.fromtimestamp(fetched_at, UTC)
     except Exception as exc:  # noqa: BLE001
         log.warning("TD detector observations fetch failed: %s", exc)
 
-    incidents: list[TrafficIncident] = []
-    try:
-        stale, news_text, fetched_at = await client.fetch_xml_text_cached(
-            SPECIAL_NEWS_SPEC
-        )
-        if stale:
-            stale_sources.append("TD traffic news")
-        incidents = filter_relevant_incidents(parse_special_news(news_text), roads)
-        official_time = max(
-            (incident.announcement_time for incident in incidents if incident.announcement_time),
-            default=None,
-        )
-        source_times["traffic_news"] = official_time or datetime.fromtimestamp(
-            fetched_at, UTC
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("TD special news fetch failed: %s", exc)
+    td_news, rthk_news = await asyncio.gather(
+        _collect_td_news(client, roads),
+        _collect_rthk_news(client, roads),
+    )
+    incidents = reconcile_incident_reports(td_news[0] + rthk_news[0], roads)
+    stale_sources.extend(td_news[1])
+    stale_sources.extend(rthk_news[1])
+    source_times.update(td_news[2])
+    source_times.update(rthk_news[2])
 
     roadworks: list[Roadwork] = []
     try:

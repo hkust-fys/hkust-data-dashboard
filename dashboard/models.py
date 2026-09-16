@@ -15,11 +15,25 @@ from enum import StrEnum
 # Freshness / errors
 # --------------------------------------------------------------------------
 
+MAP_CAPTURE_STALE_AFTER_SECONDS = 30.0
+MAP_CAPTURE_MAX_AGE_SECONDS = 60.0
+
 @dataclass
 class ProviderError:
     """A provider failed; carry a human-readable reason."""
 
     message: str
+
+
+@dataclass(frozen=True)
+class TrafficMapResult:
+    """Rendered map paired with the actual Google canvas capture time."""
+
+    webp: bytes | None
+    captured_at: datetime | None
+    stale: bool = False
+    base_updated_at: datetime | None = None
+    markers_refreshed_at: datetime | None = None
 
 
 @dataclass
@@ -176,7 +190,7 @@ class TrafficCorridorStatus:
 
 @dataclass
 class TrafficIncident:
-    """A TD Special Traffic News notice relevant to our corridors."""
+    """An attributed traffic report relevant to our corridors."""
 
     identifier: str
     title: str
@@ -184,7 +198,7 @@ class TrafficIncident:
     road: str
     location: str
     direction: str
-    status: str  # raw status string from TD
+    status: str  # CLOSED means the incident has cleared, not a closed road
     start_time: datetime | None = None
     end_time: datetime | None = None
     announcement_time: datetime | None = None
@@ -192,6 +206,22 @@ class TrafficIncident:
     longitude: float | None = None
     near_landmark: str = ""
     between_landmark: str = ""
+    source: str = "TD"
+    source_url: str = ""
+    # TD publishes one clock for the page; never treat it as publication time.
+    page_updated_at: datetime | None = None
+    translated_description: str = ""
+    related_reports: tuple[TrafficIncident, ...] = ()
+    reconciliation_key: str = ""
+    # Populated only by location/route-geometry reconciliation. Road-name
+    # membership alone is insufficient evidence that a bus is affected.
+    affected_routes: tuple[str, ...] = ()
+    affected_paths: tuple[tuple[tuple[float, float], ...], ...] = ()
+    location_resolution: str = ""
+
+    @property
+    def is_cleared(self) -> bool:
+        return self.status.strip().casefold() in {"closed", "cleared", "resolved", "完結"}
 
 
 @dataclass

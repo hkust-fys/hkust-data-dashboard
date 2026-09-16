@@ -1,8 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 
-from PIL import Image
+import pytest
+from PIL import Image, ImageDraw
 
 from dashboard.maps import renderer
+from dashboard.models import Operator
 
 
 def _base(size=(32, 20), color=(80, 90, 100)):
@@ -60,6 +62,24 @@ def test_traffic_cache_is_bounded_and_concurrent():
     assert stats["traffic_evictions"] >= 1
 
 
+def test_known_google_legend_and_canvas_colors_exclude_unrelated_saturated_colors():
+    swatches = (*renderer.GOOGLE_TRAFFIC_LEGEND_COLORS, *renderer.GOOGLE_TRAFFIC_COLORS)
+    base = _base((len(swatches) * 20 + 80, 30))
+    draw = ImageDraw.Draw(base)
+    for index, color in enumerate(swatches):
+        # Include small anti-aliasing/resize differences from the solid cores.
+        shifted = tuple(min(255, channel + 7) for channel in color)
+        draw.rectangle((index * 20 + 4, 10, index * 20 + 12, 18), fill=shifted)
+    offset = len(swatches) * 20
+    for index, color in enumerate(((0, 255, 0), (255, 0, 0), (202, 239, 211))):
+        draw.rectangle((offset + index * 20 + 4, 10, offset + index * 20 + 12, 18), fill=color)
+    traffic = renderer._cached_traffic_occupancy(base)
+    for index in range(len(swatches)):
+        assert traffic.overlap((index * 20 + 5, 11, index * 20 + 11, 17))[0] > 0
+    for index in range(3):
+        assert traffic.overlap((offset + index * 20 + 5, 11, offset + index * 20 + 11, 17))[0] == 0
+
+
 def test_quality_hint_is_reused_then_periodically_probed_upward():
     size = (960, 540)
     renderer._remember_quality(size, 74, 80_000)
@@ -86,3 +106,42 @@ def test_no_exact_render_cache_can_reuse_stale_overlays():
     # Traffic occupancy is intentionally the only derived cache. There is no
     # final-render cache whose signature could accidentally omit live ETAs.
     assert not hasattr(renderer, "_render_cache")
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("color", renderer.GOOGLE_TRAFFIC_COLORS)
+def test_refreshed_traffic_pixels_move_labels_and_cleared_pixels_release_space(grouped, color):
+    class FixedWidthDraw:
+        def textlength(self, _text, font=None):
+            return 60
+
+    base = _base((320, 200))
+    markers = [renderer.BusMarker(("91",), 130, 100, Operator.KMB, 0)]
+    if grouped:
+        markers.append(renderer.BusMarker(("11",), 130, 100, Operator.GMB, 0))
+
+    def place(image):
+        traffic = renderer._cached_traffic_occupancy(image)
+        placement = renderer._layout_bus_labels(
+            markers, FixedWidthDraw(), renderer._font(13), image.size,
+            traffic=traffic,
+        )[0]
+        return placement, traffic
+
+    original, original_mask = place(base)
+    # Simulate a refreshed Google frame that introduces a traffic stroke at
+    # yesterday's chosen label location, including mutation of the same image.
+    ImageDraw.Draw(base).rectangle(original.rect, fill=color)
+    updated, updated_mask = place(base)
+    assert updated_mask is not original_mask
+    assert updated_mask.overlap(original.rect)[0] > 0
+    assert updated.rect != original.rect
+    assert updated.marker == original.marker
+    assert updated_mask.overlap(updated.rect)[0] == 0
+
+    # When the stroke disappears, no retained traffic mask may keep steering
+    # labels away from space that is now clear.
+    base.paste((80, 90, 100), (0, 0, *base.size))
+    cleared, cleared_mask = place(base)
+    assert cleared_mask.overlap(original.rect)[0] == 0
+    assert cleared.rect == original.rect

@@ -243,7 +243,7 @@ def test_alerts_read_the_central_important_road_policy(monkeypatch):
     assert events[0].ping
 
 
-def test_congestion_alert_names_affected_routes():
+def test_detector_alert_does_not_invent_roadwide_affected_routes():
     from dashboard.providers.route_geometry import RouteLine
     from dashboard.providers.tracked_roads import build_tracked_roads
 
@@ -256,7 +256,8 @@ def test_congestion_alert_names_affected_routes():
     slow = _status("clear water bay road", SpeedBand.RED, speed=8)
     mon.update([], [slow])
     events = mon.update([], [slow])
-    assert events and "affects: 91" in events[0].text
+    assert events and "Clear Water Bay Road" in events[0].text
+    assert "affects:" not in events[0].text
 
 
 def test_congestion_clears_when_band_leaves_red():
@@ -270,6 +271,34 @@ def test_congestion_clears_when_band_leaves_red():
     assert len(events) == 1
     assert "easing" in events[0].text
     assert not events[0].ping
+
+
+def test_missing_detector_status_does_not_clear_or_restart_active_congestion():
+    mon = AlertMonitor()
+    mon.update([], [])
+    slow = _status("Clear Water Bay Road", SpeedBand.RED, speed=10)
+    clear = _status("Clear Water Bay Road", SpeedBand.GREEN, speed=60)
+
+    mon.update([], [slow])
+    assert mon.update([], [slow])[0].ping
+    assert mon.update([], []) == []
+    assert mon.update([], [slow]) == []
+    easing = mon.update([], [clear])
+    assert len(easing) == 1
+    assert "easing" in easing[0].text
+    assert not easing[0].ping
+
+
+def test_missing_detector_status_breaks_pre_alert_red_streak():
+    mon = AlertMonitor()
+    mon.update([], [])
+    slow = _status("Clear Water Bay Road", SpeedBand.RED, speed=10)
+
+    assert mon.update([], [slow]) == []
+    assert mon.update([], []) == []
+    assert mon.update([], [slow]) == []
+    events = mon.update([], [slow])
+    assert len(events) == 1 and events[0].ping
 
 
 def test_relevant_td_traffic_notice_posts_and_clears():
@@ -291,7 +320,7 @@ def test_relevant_td_traffic_notice_posts_and_clears():
 
     events = mon.update([], [], [])
     assert len(events) == 1
-    assert "TD traffic notice cleared" in events[0].text
+    assert "TD traffic notice no longer listed" in events[0].text
 
 
 def test_traffic_notice_thread_messages_preserve_full_source_within_limits():
@@ -340,6 +369,84 @@ def test_priority_road_traffic_news_pings_only_when_new():
         cleared = mon.update([], [], [])
         assert len(cleared) == 1 and not cleared[0].ping
         assert "<@&123456789>" not in mon.ping_for(cleared[0], role_id=123456789)
+
+
+def test_followup_id_does_not_reping_ongoing_source_road_episode(monkeypatch):
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    clock = [1000.0]
+    monkeypatch.setattr("dashboard.alerts.time.monotonic", lambda: clock[0])
+    mon = AlertMonitor(roads=fallback_roads())
+    mon.update([], [], [])
+    initial = TrafficIncident(
+        "td-cwb-1", "CWB incident", "Lane closed", "Clear Water Bay Road",
+        "", "Sai Kung bound", "ACTIVE", source="TD",
+    )
+    followup = TrafficIncident(
+        "td-cwb-2", "CWB incident update", "Queue growing", "Clear Water Bay Road",
+        "", "Sai Kung bound", "UPDATED", source="TD",
+    )
+
+    assert mon.update([], [], [initial])[0].ping
+    clock[0] += ROAD_ALERT_COOLDOWN_SECONDS + 1
+    events = mon.update([], [], [followup])
+
+    update = next(event for event in events if event.source_text == "Queue growing")
+    assert not update.ping
+
+
+def test_explicit_clear_ends_notice_episode_without_ping(monkeypatch):
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    clock = [1000.0]
+    monkeypatch.setattr("dashboard.alerts.time.monotonic", lambda: clock[0])
+    mon = AlertMonitor(roads=fallback_roads())
+    mon.update([], [], [])
+    active = TrafficIncident(
+        "rthk-cwb-1", "Traffic report", "Lane closed", "Clear Water Bay Road",
+        "", "Sai Kung bound", "ACTIVE", source="RTHK",
+    )
+    closed = TrafficIncident(
+        "rthk-cwb-2", "Traffic report", "Incident cleared", "Clear Water Bay Road",
+        "", "Sai Kung bound", "CLOSED", source="RTHK",
+    )
+    later = TrafficIncident(
+        "rthk-cwb-3", "New traffic report", "New collision", "Clear Water Bay Road",
+        "", "Sai Kung bound", "ACTIVE", source="RTHK",
+    )
+
+    assert mon.update([], [], [active])[0].ping
+    cleared_events = mon.update([], [], [closed])
+    assert all(not event.ping for event in cleared_events)
+    clock[0] += ROAD_ALERT_COOLDOWN_SECONDS + 1
+    later_events = mon.update([], [], [later])
+    later_start = next(event for event in later_events if event.source_text == "New collision")
+    assert later_start.ping
+
+
+def test_missing_notice_rows_do_not_manufacture_a_new_episode(monkeypatch):
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    clock = [1000.0]
+    monkeypatch.setattr("dashboard.alerts.time.monotonic", lambda: clock[0])
+    mon = AlertMonitor(roads=fallback_roads())
+    mon.update([], [], [])
+    first = TrafficIncident(
+        "td-cwb-1", "CWB incident", "Lane closed", "Clear Water Bay Road",
+        "", "Sai Kung bound", "ACTIVE", source="TD",
+    )
+    resumed = TrafficIncident(
+        "td-cwb-2", "CWB update", "Still closed", "Clear Water Bay Road",
+        "", "Sai Kung bound", "UPDATED", source="TD",
+    )
+
+    assert mon.update([], [], [first])[0].ping
+    mon.update([], [], [])
+    clock[0] += ROAD_ALERT_COOLDOWN_SECONDS + 1
+    events = mon.update([], [], [resumed])
+
+    update = next(event for event in events if event.source_text == "Still closed")
+    assert not update.ping
 
 
 def test_direction_only_parenthetical_does_not_feed_incident_alert_keys(monkeypatch):
@@ -394,6 +501,38 @@ def test_other_traffic_news_and_roadworks_do_not_ping():
     assert all(not event.ping for event in events)
 
 
+def test_all_supplied_tracked_road_notices_post_with_priority_ping_split():
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    roads = fallback_roads()
+    mon = AlertMonitor(roads=roads)
+    mon.update([], [], [])
+    road_names = [
+        "Clear Water Bay Road",
+        "New Clear Water Bay Road",
+        "Lung Cheung Road",
+        "Hang Hau Road",
+        "Wan Po Road",
+    ]
+    incidents = [
+        TrafficIncident(
+            identifier=f"notice-{index}",
+            title=f"Notice on {road}",
+            description="Lane closed",
+            road=road,
+            location="",
+            direction="",
+            status="ACTIVE",
+        )
+        for index, road in enumerate(road_names)
+    ]
+
+    events = mon.update([], [], incidents)
+
+    assert len(events) == len(incidents)
+    assert [event.ping for event in events] == [True, True, False, False, False]
+
+
 def test_relevant_roadwork_posts_once_and_clears_with_description():
     mon = AlertMonitor()
     roadwork = Roadwork(
@@ -433,12 +572,60 @@ def test_no_events_when_nothing_changes():
     assert events == []
 
 
+def test_rthk_clearance_is_attributed_and_does_not_ping_congestion_role():
+    mon = AlertMonitor()
+    report = TrafficIncident(
+        identifier="rthk-clear", title="Traffic report", description="清水灣道行車線重開",
+        road="Clear Water Bay Road", location="", direction="", status="CLOSED",
+        source="RTHK",
+    )
+    mon.update([], [], [])
+    events = mon.update([], [], [report])
+    assert len(events) == 1 and not events[0].ping
+    assert "RTHK:" in events[0].text
+    assert "Full RTHK source text:" in mon.messages_for(events[0], None)[0]
+    removed = mon.update([], [], [])
+    assert "RTHK traffic notice no longer listed" in removed[0].text
+
+
 def test_family_grouping():
     assert _family_of("TC1") == "TC"
     assert _family_of("TC8NE") == "TC"
     assert _family_of("WRAINA") == "WRAIN"
     assert _family_of("WRAINB") == "WRAIN"
     assert _family_of("WHOT") == "WHOT"
+
+
+def test_second_source_corroboration_posts_full_records_without_reping(monkeypatch):
+    from dataclasses import replace
+    from datetime import UTC, datetime, timedelta
+
+    clock = [100.0]
+    monkeypatch.setattr("dashboard.alerts.time.monotonic", lambda: clock[0])
+    mon = AlertMonitor()
+    mon.update([], [], [])
+    published = datetime.now(UTC) - timedelta(minutes=2)
+    first = TrafficIncident(
+        "r1", "Traffic report", "清水灣道交通繁忙", "Clear Water Bay Road", "", "", "NEW",
+        source="RTHK", announcement_time=published, reconciliation_key="same-incident",
+    )
+    assert mon.update([], [], [first])[0].ping
+    clock[0] += ROAD_ALERT_COOLDOWN_SECONDS + 1
+    td = replace(
+        first, identifier="t1", source="TD", description="Traffic is busy on Clear Water Bay Road.",
+        announcement_time=None, page_updated_at=published + timedelta(minutes=1), related_reports=(first,),
+    )
+    events = mon.update([], [], [td])
+    assert len(events) == 1 and not events[0].ping
+    message = mon.messages_for(events[0], 123)[0]
+    assert td.description in message and first.description in message
+    assert f"page updated <t:{int(td.page_updated_at.timestamp())}:t>" in message
+    assert f"<t:{int(published.timestamp())}:t>" in message
+    assert "<@&" not in message
+    # A page-wide clock change is not a new report.
+    assert mon.update([], [], [replace(td, page_updated_at=published + timedelta(minutes=2))]) == []
+    cleared = replace(td, status="CLOSED", identifier="t2", related_reports=())
+    assert all(not event.ping for event in mon.update([], [], [cleared]))
 
 
 def test_critical_codes_cover_t8_and_black():

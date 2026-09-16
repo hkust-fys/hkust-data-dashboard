@@ -17,11 +17,13 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import aiohttp
 
 from dashboard.http import HttpClient
+from dashboard.providers import road_names
+from dashboard.providers.official_roads import fetch_official_road_ways
 from dashboard.providers.route_geometry import RouteLine, fetch_route_geometry
 
 log = logging.getLogger(__name__)
@@ -110,6 +112,8 @@ class TrackedRoads:
     paths: dict[str, tuple[tuple[tuple[float, float], ...], ...]] = field(default_factory=dict)
     source: str = ""
     fetched_at: float = 0.0
+    # Additional official / OSM names, including Traditional Chinese.
+    name_aliases: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def match(self, text: str) -> list[str]:
         """Return canonical road keys whose aliases appear in ``text``.
@@ -118,14 +122,18 @@ class TrackedRoads:
         overlapping "clear water bay road" substring match so one notice maps
         to one road.
         """
-        lowered = text.lower().replace("\u2019", "'")
+        lowered = road_names.normalize_name(text)
         hits: list[tuple[int, int, str]] = []
-        for key, alias in self.aliases.items():
-            phrase = alias.replace("\u2019", "'")
-            start = lowered.find(phrase)
-            while start != -1:
-                hits.append((start, start + len(phrase), key))
-                start = lowered.find(phrase, start + 1)
+        for key in self.display_names:
+            variants = (self.aliases.get(key, key), *self.name_aliases.get(key, ()))
+            for alias in variants:
+                phrase = road_names.normalize_name(alias)
+                if not phrase:
+                    continue
+                start = lowered.find(phrase)
+                while start != -1:
+                    hits.append((start, start + len(phrase), key))
+                    start = lowered.find(phrase, start + 1)
         kept: list[tuple[int, int, str]] = [
             hit
             for hit in hits
@@ -495,7 +503,8 @@ def collect_way_roads(raw: dict) -> list[dict]:
         ]
         if len(points) < 2:
             continue
-        ways.append({"name": name, "name_en": name_en, "points": points})
+        name_zh = str(tags.get("name:zh-Hant") or tags.get("name:zh") or "").strip()
+        ways.append({"name": name, "name_en": name_en, "name_zh": name_zh, "points": points})
     return ways
 
 
@@ -590,16 +599,22 @@ def build_tracked_roads(
     for line, roads in zip(lines, roads_by_line, strict=True):
         label = line.route
         for name in roads:
-            key = name.lower()
+            key = road_names.normalize_name(name)
             display_by_key.setdefault(key, name)
             road_routes.setdefault(key, set()).add(label)
     paths_by_key: dict[str, list[tuple[tuple[float, float], ...]]] = {}
+    variants_by_key: dict[str, set[str]] = {}
     for way in ways or []:
         display = way.get("name_en") or way.get("name")
         points = tuple(way.get("points") or ())
-        key = str(display or "").lower()
+        key = road_names.normalize_name(str(display or ""))
         if key in display_by_key and len(points) >= 2 and points not in paths_by_key.setdefault(key, []):
             paths_by_key[key].append(points)
+        if key in display_by_key:
+            variants_by_key.setdefault(key, set()).update(
+                value for label in ("name", "name_en", "name_zh")
+                if (value := str(way.get(label) or "").strip())
+            )
     return TrackedRoads(
         display_names=dict(display_by_key),
         aliases={key: key for key in display_by_key},
@@ -608,6 +623,7 @@ def build_tracked_roads(
         },
         paths={key: tuple(value) for key, value in paths_by_key.items()},
         source="osm",
+        name_aliases={key: tuple(sorted(value)) for key, value in variants_by_key.items()},
     )
 
 
@@ -617,6 +633,10 @@ def _fallback_roads() -> TrackedRoads:
         aliases={name.lower(): name.lower() for name in FALLBACK_ROADS},
         road_routes={},
         source="fallback",
+        name_aliases={
+            "clear water bay road": ("清水灣道",),
+            "new clear water bay road": ("新清水灣道",),
+        },
     )
 
 
@@ -677,6 +697,10 @@ def _load_disk_cache(cache_dir: str) -> TrackedRoads | None:
             paths=_parse_cached_paths(raw.get("paths")),
             source=str(raw.get("source") or ""),
             fetched_at=float(raw.get("fetched_at") or 0),
+            name_aliases={
+                key: tuple(value) for key, value in (raw.get("name_aliases") or {}).items()
+                if isinstance(value, list) and all(isinstance(item, str) for item in value)
+            },
         )
     except (OSError, ValueError, TypeError):
         return None
@@ -691,6 +715,7 @@ def _save_disk_cache(roads: TrackedRoads, cache_dir: str) -> None:
         "source": roads.source,
         "display_names": roads.display_names,
         "aliases": roads.aliases,
+        "name_aliases": roads.name_aliases,
         "road_routes": {key: list(value) for key, value in roads.road_routes.items()},
         "paths": {
             key: [[list(point) for point in path] for path in paths]
@@ -781,37 +806,39 @@ async def _refresh_roads(client: HttpClient, cache_dir: str) -> TrackedRoads:
         for point in _sample_path(line.path)
     ]
     budget = float(getattr(client, "timeout_seconds", OVERPASS_TIMEOUT_SECONDS))
-    raw = await _fetch_overpass(client, build_overpass_query(samples, budget), budget)
-    ways = collect_way_roads(raw)
-    if not ways:
-        raise RuntimeError("Overpass returned no named road geometry")
+    source = "osm"
+    try:
+        raw = await _fetch_overpass(client, build_overpass_query(samples, budget), budget)
+        ways = collect_way_roads(raw)
+        if not ways:
+            raise RuntimeError("Overpass returned no named road geometry")
+    except Exception as exc:
+        log.warning("OSM road geometry unavailable (%s); trying LandsD", type(exc).__name__)
+        ways = await fetch_official_road_ways(client, [line.path for line in lines])
+        source = "landsd"
 
-    roads_by_line = [roads_for_line(line.path, ways) for line in lines]
+    # Geometry association can be expensive; keep it off the dashboard event loop.
+    roads_by_line = await asyncio.to_thread(
+        lambda: [roads_for_line(line.path, ways) for line in lines]
+    )
     failures = sum(1 for roads in roads_by_line if not roads)
     if failures == len(lines):
-        raise RuntimeError("no route line matched any named OSM road")
+        raise RuntimeError("no route line matched any named road")
     if failures:
         log.warning(
-            "tracked roads: %d/%d directions matched no OSM road; using partial union",
+            "tracked roads: %d/%d directions matched no named road; using partial union",
             failures,
             len(lines),
         )
     roads = build_tracked_roads(lines, roads_by_line, ways)
-    roads = replace_fetched_at(roads, time.time())
+    roads = replace(roads, fetched_at=time.time(), source=source)
     _save_disk_cache(roads, cache_dir)
     return roads
 
 
 def replace_fetched_at(roads: TrackedRoads, fetched_at: float) -> TrackedRoads:
     """Return a copy stamped with ``fetched_at`` (the table is frozen)."""
-    return TrackedRoads(
-        display_names=roads.display_names,
-        aliases=roads.aliases,
-        road_routes=roads.road_routes,
-        paths=roads.paths,
-        source=roads.source,
-        fetched_at=fetched_at,
-    )
+    return replace(roads, fetched_at=fetched_at)
 
 
 def _finish_refresh(task: asyncio.Task[TrackedRoads], cache_dir: str) -> None:
@@ -831,7 +858,7 @@ def _finish_refresh(task: asyncio.Task[TrackedRoads], cache_dir: str) -> None:
         log.warning("tracked-roads refresh failed: %s", type(exc).__name__)
 
 
-async def fetch_tracked_roads(
+async def _fetch_route_roads(
     client: HttpClient, cache_dir: str = ".cache", *, wait_for_refresh: bool = True
 ) -> TrackedRoads:
     """Return fresh/last-good tracked roads, refreshing expired data in background.
@@ -885,3 +912,29 @@ async def shutdown_background_refreshes() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
     _refresh_tasks.clear()
     _refresh_retry_after.clear()
+    await road_names.shutdown_background_refreshes()
+
+
+def with_official_names(
+    roads: TrackedRoads, dictionary: dict[str, tuple[str, ...]]
+) -> TrackedRoads:
+    """Join complete road names; never infer translations from substrings."""
+    variants = dict(roads.name_aliases)
+    for key, display in roads.display_names.items():
+        names = set(variants.get(key, ()))
+        for alias in (display, roads.aliases.get(key, key), *tuple(names)):
+            names.update(dictionary.get(road_names.normalize_name(alias), ()))
+        if names:
+            variants[key] = tuple(sorted(names))
+    return replace(roads, name_aliases=variants)
+
+
+async def fetch_tracked_roads(
+    client: HttpClient, cache_dir: str = ".cache", *, wait_for_refresh: bool = True
+) -> TrackedRoads:
+    """Return route-derived roads with independently refreshed bilingual names."""
+    names = await road_names.fetch_road_names(
+        client, cache_dir=cache_dir, wait_for_refresh=wait_for_refresh
+    )
+    roads = await _fetch_route_roads(client, cache_dir, wait_for_refresh=wait_for_refresh)
+    return with_official_names(roads, names)

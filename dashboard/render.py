@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 from datetime import UTC, datetime
 from functools import lru_cache
 
@@ -36,6 +37,7 @@ FIELDS_PER_EMBED_MAX = 25
 CHARS_PER_EMBED_MAX = 6000
 EMBEDS_PER_MESSAGE_MAX = 10
 TD_TRAFFIC_NEWS_URL = "https://www.td.gov.hk/en/special_news/spnews.htm"
+RTHK_TRAFFIC_NEWS_URL = "https://programme.rthk.hk/channel/radio/trafficnews/index.php"
 
 _OPERATOR_ICON = {
     Operator.KMB: "🟥",
@@ -281,11 +283,21 @@ def _build_traffic_map_embed(
     webp: bytes,
     source_time: datetime | None = None,
     filename: str | None = None,
+    stale: bool = False,
+    markers_time: datetime | None = None,
 ) -> discord.Embed | None:
     """Render the Google Maps base screenshot as an image pane."""
     if not webp:
         return None
-    description = "[Open territory-wide view in HKeMobility](https://www.hkemobility.gov.hk/)"
+    description = "🔗 [HKeMobility](https://www.hkemobility.gov.hk/)"
+    if source_time is not None:
+        description += f"\nMap captured {_fmt_timestamp(source_time, 'T')}"
+    else:
+        description += "\nMap capture time unavailable"
+    if markers_time is not None:
+        description += f" · Markers refreshed {_fmt_timestamp(markers_time, 'T')}"
+    if stale:
+        description += "\n⚠️ Cached map: live capture failed or is delayed."
     embed = discord.Embed(
         title="🗺️ Traffic map",
         color=0x2563EB,
@@ -354,13 +366,26 @@ def _affected_routes_for_keys_line(keys: list[str], roads: object | None) -> str
     return f"  ↳ affects: {', '.join(routes)}"
 
 
-def _road_names_for_keys(keys: list[str], roads: object | None) -> list[str]:
+def _road_names_for_keys(
+    keys: list[str], roads: object | None, *, chinese_text: str = ""
+) -> list[str]:
     """Display names for already-resolved traffic-news roads."""
     if roads is None:
         return []
     names: list[str] = []
     for key in keys:
         name = roads.display_name(key)
+        if chinese_text:
+            chinese_aliases = [
+                alias for alias in getattr(roads, "name_aliases", {}).get(key, ())
+                if re.search(r"[\u3400-\u9fff]", alias)
+                and not re.search(r"[a-zA-Z]", alias)
+                and alias in chinese_text
+            ]
+            if chinese_aliases:
+                chinese = max(chinese_aliases, key=len)
+                english = name.title() if name.isupper() else name
+                name = f"{chinese} ({english})"
         if name not in names:
             names.append(name)
     return names
@@ -383,52 +408,94 @@ def _build_traffic_summary_embed(
     """
     lines: list[str] = []
     evidence_times: list[str] = []
-    displayed_source_times: list[datetime] = []
     td_times = traffic_source_times or {}
-    if incidents:
-        evidence_times.append("TD traffic news")
-        news_time = td_times.get("traffic_news") or td_source_time
-        if news_time is not None:
-            displayed_source_times.append(news_time)
+    checked_at = td_times.get("traffic_news_checked") or td_times.get("traffic_news")
+    rthk_checked_at = td_times.get("rthk_news_checked")
     if roadworks:
         roadworks_time = td_times.get("roadworks")
         evidence_times.append(f"TD roadworks {_fmt_timestamp(roadworks_time, 't')}")
-        if roadworks_time is not None:
-            displayed_source_times.append(roadworks_time)
     if evidence_times:
         lines.append(" · ".join(evidence_times))
-    lines.append(f"🔗 [TD traffic news]({TD_TRAFFIC_NEWS_URL})")
-    if stale_sources:
-        lines.append("⚠️ Stale source cache: " + ", ".join(_esc(name) for name in stale_sources))
+    td_link = f"[TD traffic news]({TD_TRAFFIC_NEWS_URL})"
+    rthk_link = f"[RTHK traffic news (Chinese)]({RTHK_TRAFFIC_NEWS_URL})"
+    lines.append(f"🔗 {td_link} · {rthk_link}")
+    unavailable_sources = [name for name in stale_sources or [] if name.endswith(" unavailable")]
+    fallback_sources = [name for name in stale_sources or [] if name.endswith(" fallback")]
+    cached_sources = [
+        name for name in stale_sources or []
+        if name not in unavailable_sources and name not in fallback_sources
+    ]
+    if unavailable_sources:
+        lines.append("⚠️ " + ", ".join(_esc(name) for name in unavailable_sources))
+    if cached_sources:
+        lines.append("⚠️ Stale source cache: " + ", ".join(_esc(name) for name in cached_sources))
+    if fallback_sources:
+        lines.append("⚠️ Partial news feed: " + ", ".join(_esc(name) for name in fallback_sources))
     notices = list(incidents or [])
     if notices:
-        lines.append("\n**Active traffic notices**")
+        lines.append("\n**Traffic reports**")
         for incident in notices:
+            reports = (incident, *incident.related_reports)
+            if incident.related_reports:
+                lines.append("**Same incident · TD / RTHK**")
+            for report in reports:
+                label = f"**{_esc(report.source)}**"
+                if report.announcement_time is not None:
+                    label += f" · {_fmt_timestamp(report.announcement_time, 't')}"
+                elif report.page_updated_at is not None:
+                    label += f" · page updated {_fmt_timestamp(report.page_updated_at, 't')}"
+                if report.is_cleared:
+                    label += " · Cleared / 重開"
+                lines.append(label)
+                # Each source keeps its wording and its own kind of timestamp.
+                parts = (
+                    (report.description,)
+                    if report.source == "RTHK" and report.description
+                    else (report.title, report.description, report.location, report.road)
+                )
+                bare_roads = {
+                    name.casefold().strip() for name in _road_names_for_keys(
+                        resolve_incident_road_keys(report, roads), roads,
+                    )
+                }
+                notice_parts: list[str] = []
+                for part in parts:
+                    cleaned = part.strip()
+                    if cleaned.casefold() in bare_roads:
+                        continue
+                    if cleaned and cleaned.casefold() not in {
+                        existing.casefold() for existing in notice_parts
+                    }:
+                        notice_parts.append(cleaned)
+                lines.extend(f"> {_esc(part)}" for part in notice_parts)
             road_keys = resolve_incident_road_keys(incident, roads)
-            road_names = _road_names_for_keys(road_keys, roads)
-            matched_roads = {name.casefold().strip() for name in road_names}
-            # Preserve the notice wording itself as a quote and avoid
-            # repeating title/location fragments from TD's feed. A bare road
-            # field is rendered by the normalized road annotation below, so
-            # omit that duplicate from the quotation while retaining titles,
-            # descriptions, and descriptive location wording.
-            notice_parts: list[str] = []
-            for part in (incident.title, incident.description, incident.location, incident.road):
-                cleaned = part.strip()
-                if cleaned.casefold() in matched_roads:
-                    continue
-                if cleaned and cleaned.casefold() not in {
-                    existing.casefold() for existing in notice_parts
-                }:
-                    notice_parts.append(cleaned)
-            for part in notice_parts:
-                lines.append(f"> {_esc(part)}")
+            chinese_text = " ".join(
+                report.description for report in reports if report.source == "RTHK"
+            )
+            road_names = _road_names_for_keys(
+                road_keys, roads, chinese_text=chinese_text,
+            )
             if road_names:
                 lines.append(f"  ↳ road: {', '.join(_esc(name) for name in road_names)}")
-            affected = _affected_routes_for_keys_line(road_keys, roads)
-            if affected:
-                lines.append(_esc(affected))
+            if incident.affected_routes:
+                label = (
+                    "likely affected (location unspecified)" if incident.location_resolution == "road_coverage"
+                    else "buses through section" if incident.is_cleared else "affects"
+                )
+                lines.append(f"  ↳ {label}: {', '.join(_esc(route) for route in incident.affected_routes)}")
     works = list(roadworks or [])
+    if not notices and not works:
+        if cached_sources:
+            lines.append("No matching notices in the retained data; current conditions are unconfirmed.")
+        elif checked_at is not None or rthk_checked_at is not None:
+            sources = "/".join(
+                name for name, checked in (("TD", checked_at), ("RTHK", rthk_checked_at))
+                if checked is not None
+            )
+            lines.append(f"No current {sources} notices match the tracked HKUST approaches.")
+        else:
+            lines.append("TD traffic notices have not been checked successfully yet.")
+        lines.append("Traffic notices do not cover every traffic jam; check the Google traffic map.")
     if works:
         lines.append("\n**Relevant roadworks**")
         for work in works:
@@ -437,26 +504,22 @@ def _build_traffic_summary_embed(
             road_names = _matched_road_names(text, roads)
             if road_names:
                 lines.append(f"  ↳ road: {', '.join(_esc(name) for name in road_names)}")
-            affected = _affected_routes_line(text, roads)
-            if affected:
-                lines.append(_esc(affected))
 
     description = "\n".join(lines)
     if len(description) > DESC_MAX:
         description = description[: DESC_MAX - 1] + "…"
     embed = discord.Embed(
         title="🚦 Traffic news",
-        color=0xF59E0B if notices or works else 0x16A34A,
+        color=0xF59E0B if any(not item.is_cleared for item in notices) or works or stale_sources else 0x64748B,
         description=description,
     )
-    normalized_times = [
-        time.replace(tzinfo=UTC) if time.tzinfo is None else time.astimezone(UTC)
-        for time in displayed_source_times
-    ]
-    footer_time = max(normalized_times, default=None)
-    return _set_source_timestamp(
-        embed, "Transport Department · traffic notices", footer_time
+    source_label = (
+        "TD · RTHK traffic reports"
+        if rthk_checked_at is not None or any(item.source == "RTHK" for item in notices)
+        else "Transport Department · traffic notices"
     )
+    embed.set_footer(text=source_label)
+    return embed
 
 
 def _embed(name: str, value: str, inline: bool = False) -> discord.Embed:
@@ -501,6 +564,8 @@ def build_payload(
     roads: object | None = None,
     now: datetime | None = None,
     traffic_map_initializing: bool = False,
+    traffic_map_stale: bool = False,
+    map_markers_time: datetime | None = None,
 ) -> DashboardPayload:
     """Compose the dashboard payload, enforcing every Discord limit.
 
@@ -518,8 +583,10 @@ def build_payload(
         map_filename = traffic_map_filename(traffic_map_webp)
         map_embed = _build_traffic_map_embed(
             traffic_map_webp,
-            map_source_time or checked_at,
+            map_source_time,
             map_filename,
+            stale=traffic_map_stale,
+            markers_time=map_markers_time,
         )
         if map_embed is not None:
             payload.embeds.append(map_embed)

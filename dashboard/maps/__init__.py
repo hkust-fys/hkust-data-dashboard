@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
+from dashboard.destinations import short_destination as _shorthand
 from dashboard.maps.marker_audit import (
     _verified_gate_index,
     audit_gmb_marker_pairs,
@@ -18,9 +20,9 @@ from dashboard.maps.renderer import (
     project,
     render_map,
 )
-from dashboard.maps.tiles import capture_gmaps_base, shutdown_gmaps_browser
+from dashboard.maps.tiles import MapCapture, capture_gmaps_base, shutdown_gmaps_browser
 from dashboard.maps.tracker import MarkerTracker
-from dashboard.models import EtaKind, RouteEtaGroup
+from dashboard.models import EtaKind, RouteEtaGroup, TrafficMapResult
 from dashboard.providers.route_geometry import (
     ProbeStop,
     Stop,
@@ -44,34 +46,6 @@ def _first_marker_issue(key: tuple[object, ...]) -> bool:
         del _logged_marker_issue_keys[next(iter(_logged_marker_issue_keys))]
     return True
 
-
-# Compact display wording for marker labels: shorter than official termini
-# and matching the ETA embed's shorthand.
-_DESTINATION_SHORTHAND: dict[str, str] = {
-    "tseung kwan o station": "TKO",
-    "tseung kwan o": "TKO",
-    "choi hung station": "Choi Hung",
-    "choi hung station (lung cheung road)": "Choi Hung",
-    "diamond hill station bus terminus": "Diamond Hill",
-    "diamond hill station": "Diamond Hill",
-    "clear water bay bus terminus": "Clear Water Bay",
-    "hang hau village": "Hang Hau",
-    "hang hau station public transport interchange": "Hang Hau",
-    "po lam bus terminus": "Po Lam",
-    "h.k.u.s.t. (north)": "HKUST",
-    "ngau chi wan bbi - choi hung station": "Choi Hung",
-    "mong kok station": "Mong Kok",
-    "sai kung": "Sai Kung",
-    "kwun tong (circular)": "Kwun Tong",
-    "kwun tong(circular)": "Kwun Tong",
-}
-
-
-def _shorthand(destination: str) -> str:
-    """Compact display wording for a destination string."""
-    return _DESTINATION_SHORTHAND.get(
-        destination.strip().lower(), destination.strip()
-    )
 
 
 def _destination_map(
@@ -186,7 +160,7 @@ async def fetch_traffic_map(
     affected_road_paths: list[list[tuple[float, float]]] | None = None,
     tracker: MarkerTracker | None = None,
     important_road_paths: list[list[tuple[float, float]]] | None = None,
-) -> tuple[bytes | None, list[object]]:
+) -> TrafficMapResult:
     """Capture the Google base map and render estimated bus/stop markers.
 
     ``affected_road_paths`` contains only matched OSM road polylines from
@@ -208,6 +182,7 @@ async def fetch_traffic_map(
         fetch_route_geometry(client, cache_dir=cache_dir, wait_for_refresh=False)
     )
     base_image: object | None = None
+    capture_metadata = MapCapture(None, None, stale=True)
     probe_task: asyncio.Task[object] | None = None
     try:
         # A warm geometry task can feed this frame, but a cold refresh must not
@@ -295,7 +270,13 @@ async def fetch_traffic_map(
         if isinstance(capture_result, BaseException):
             log.warning("Google traffic map capture failed: %s", type(capture_result).__name__)
         else:
-            base_image = capture_result
+            if isinstance(capture_result, MapCapture):
+                capture_metadata = capture_result
+                base_image = capture_result.image
+            else:
+                # Keep lightweight injected renderers usable without
+                # inventing a capture timestamp for their untracked images.
+                base_image = capture_result
 
         estimates: list[BusEstimate] = []
         audit_estimates: list[BusEstimate] = []
@@ -354,7 +335,7 @@ async def fetch_traffic_map(
             )
             marker_pairs = audit.get("gmb_marker_pairs", ())
             log.info(
-                "marker audit frame=%d checks=%d inconclusive=%d issues=%d "
+                "marker candidate audit frame=%d checks=%d inconclusive=%d issues=%d "
                 "marker_pairs=%d markers=%d observed_checkpoints=%d "
                 "audited_checkpoints=%d uncovered_checkpoints=%d "
                 "observed_rows=%d audited_rows=%d uncovered_rows=%d status=%s",
@@ -384,7 +365,7 @@ async def fetch_traffic_map(
                 if not _first_marker_issue(issue_key):
                     continue
                 log.warning(
-                    "marker audit mismatch frame=%d route=%s kind=%s "
+                    "marker candidate audit mismatch frame=%d route=%s kind=%s "
                     "checkpoint=%s unmatched_source=%s source_tokens=%s "
                     "unmatched_marker=%s marker_id=%s position=%s "
                     "marker_sources=%s reason=%s",
@@ -401,7 +382,7 @@ async def fetch_traffic_map(
                     detail.get("reason", "one-to-one mismatch"),
                 )
                 log.warning(
-                    "marker audit context frame=%d route=%s gate_rows=%s "
+                    "marker candidate audit context frame=%d route=%s gate_rows=%s "
                     "checkpoint_rows=%s route_markers=%s association_rows=%s",
                     frame_id,
                     "/".join(issue["key"]),
@@ -433,7 +414,7 @@ async def fetch_traffic_map(
                     common[:2],
                 )
         except Exception as exc:  # audit must never prevent rendering
-            log.warning("marker audit unavailable frame=%d: %s", frame_id, type(exc).__name__)
+            log.warning("marker candidate audit unavailable frame=%d: %s", frame_id, type(exc).__name__)
         log.info(
             "map markers: %d probe ETAs -> %d bus estimates",
             len(probe_etas),
@@ -454,7 +435,7 @@ async def fetch_traffic_map(
         ]
 
     if base_image is None:
-        return None, []
+        return TrafficMapResult(None, None, stale=True)
     try:
         webp = await asyncio.to_thread(
             render_map,
@@ -466,7 +447,10 @@ async def fetch_traffic_map(
             affected_road_paths or [],
             important_road_paths or [],
         )
-        return webp, []
+        return TrafficMapResult(
+            webp, capture_metadata.captured_at, capture_metadata.stale,
+            capture_metadata.base_updated_at, datetime.now(UTC),
+        )
     except Exception as exc:  # noqa: BLE001
         import traceback
 
@@ -475,7 +459,7 @@ async def fetch_traffic_map(
             type(exc).__name__,
             traceback.format_exc(limit=6),
         )
-        return None, []
+        return TrafficMapResult(None, None, stale=True)
 
 
 __all__ = [

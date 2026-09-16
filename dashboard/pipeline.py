@@ -10,16 +10,23 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import TypeAlias
 
 from dashboard import maps, road_policy
 from dashboard.config import Settings
 from dashboard.http import HttpClient
-from dashboard.models import DashboardPayload, WeatherConditions
+from dashboard.models import (
+    MAP_CAPTURE_MAX_AGE_SECONDS,
+    MAP_CAPTURE_STALE_AFTER_SECONDS,
+    DashboardPayload,
+    TrafficMapResult,
+    WeatherConditions,
+)
 from dashboard.providers import route_geometry as route_geometry_provider
 from dashboard.providers import tracked_roads as tracked_roads_provider
 from dashboard.providers import traffic as traffic_provider
-from dashboard.providers import transit
+from dashboard.providers import traffic_location, transit
 from dashboard.providers import weather as weather_provider
 from dashboard.render import build_payload
 
@@ -42,6 +49,17 @@ def map_road_paths_from_results(traffic_result: object, roads: object) -> MapPat
     paths = []
     seen_paths: set[tuple[tuple[float, float], ...]] = set()
     for incident in traffic_result[1] or []:
+        if getattr(incident, "is_cleared", False):
+            continue
+        if getattr(incident, "location_resolution", ""):
+            # Resolved paths describe the reported section; an ambiguous
+            # landmark/road-only estimate must never become a whole-road rail.
+            for path in getattr(incident, "affected_paths", ()):
+                normalized = tuple((float(lat), float(lon)) for lat, lon in path)
+                if len(normalized) >= 2 and normalized not in seen_paths:
+                    seen_paths.add(normalized)
+                    paths.append(list(path))
+            continue
         latitude = getattr(incident, "latitude", None)
         longitude = getattr(incident, "longitude", None)
         keys = traffic_provider.resolve_incident_road_keys(incident, roads)
@@ -52,17 +70,9 @@ def map_road_paths_from_results(traffic_result: object, roads: object) -> MapPat
             and 113.5 <= longitude <= 114.7
         )
         if not valid:
-            if latitude is not None or longitude is not None:
-                continue
-            near = str(getattr(incident, "near_landmark", "") or "").strip()
-            between = str(getattr(incident, "between_landmark", "") or "").strip()
-            if near or between:
-                keys = traffic_provider.resolve_incident_road_keys(
-                    incident, roads, prefer_refinement=True
-                )
-                if not keys:
-                    continue
-            latitude = longitude = None
+            # Keep unlocated reports in the news, including when enrichment
+            # failed. A road-name match alone cannot define an incident rail.
+            continue
         if not keys:
             continue
         for path in segments_near(keys, latitude, longitude) or ():
@@ -129,7 +139,19 @@ async def collect_all(
             )
         except Exception:
             roads = tracked_roads_provider.fallback_roads()
-        return await traffic_provider.fetch_traffic_data(client, roads)
+        result = await traffic_provider.fetch_traffic_data(client, roads)
+        if result[1]:
+            try:
+                geometry = await route_geometry_provider.fetch_route_geometry(
+                    client, cache_dir=settings.cache_dir, wait_for_refresh=False,
+                )
+                enriched = await traffic_location.enrich_incident_locations(
+                    client, result[1], roads, geometry.routes, settings.cache_dir,
+                )
+                result = (result[0], enriched, *result[2:])
+            except Exception as exc:
+                log.info("traffic section enrichment unavailable: %s", type(exc).__name__)
+        return result
 
     async def traffic_map() -> object:
         try:
@@ -231,7 +253,24 @@ def to_payload(results: ProviderResults) -> DashboardPayload:
         statuses, incidents, roadworks, capture, stale = [], [], [], None, []
     present = "traffic_map" in results
     mr = results.get("traffic_map")
-    map_webp = mr[0] if isinstance(mr, tuple) and len(mr) >= 2 else None
+    map_time = None
+    map_base_time = None
+    map_markers_time = None
+    map_stale = False
+    if isinstance(mr, TrafficMapResult):
+        map_webp, map_time, map_stale = mr.webp, mr.captured_at, mr.stale
+        map_base_time = mr.base_updated_at
+        map_markers_time = mr.markers_refreshed_at
+        if map_time is not None:
+            age = (datetime.now(UTC) - map_time).total_seconds()
+            map_stale = map_stale or age > MAP_CAPTURE_STALE_AFTER_SECONDS
+        expiry_time = map_base_time or map_time
+        if expiry_time is not None and (
+            datetime.now(UTC) - expiry_time
+        ).total_seconds() > MAP_CAPTURE_MAX_AGE_SECONDS:
+            map_webp = None
+    else:
+        map_webp = mr[0] if isinstance(mr, tuple) and len(mr) >= 2 else None
     if isinstance(mr, Exception):
         map_webp = None
     if map_webp is None and present:
@@ -248,7 +287,9 @@ def to_payload(results: ProviderResults) -> DashboardPayload:
         traffic_map_webp=map_webp,
         traffic_map_initializing=not present,
         transit_source_time=transit_time,
-        map_source_time=None,
+        map_source_time=map_time,
+        traffic_map_stale=map_stale,
+        map_markers_time=map_markers_time,
         roadworks=roadworks,
         traffic_stale_sources=stale,
         traffic_source_times=source_times,

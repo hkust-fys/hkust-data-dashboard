@@ -55,7 +55,7 @@ async def test_capture_and_probe_run_at_the_same_time(monkeypatch):
     await asyncio.wait_for(probe_started.wait(), timeout=1)
     assert not capture_done.is_set()
     release.set()
-    assert await operation == (b"rendered", [])
+    assert (await operation).webp == b"rendered"
 
 
 @pytest.mark.asyncio
@@ -118,7 +118,7 @@ async def test_geometry_failure_keeps_google_base_fallback(monkeypatch):
     monkeypatch.setattr(maps, "fetch_route_geometry", geometry)
     monkeypatch.setattr(maps, "render_map", render)
 
-    assert await maps.fetch_traffic_map(object()) == (b"rendered", [])
+    assert (await maps.fetch_traffic_map(object())).webp == b"rendered"
     assert captured["base"] == b"google-base"
     assert len(captured["stops"]) == 2
 
@@ -147,7 +147,7 @@ async def test_probe_failure_does_not_cancel_or_hide_google_base(monkeypatch):
     monkeypatch.setattr(maps, "fetch_probe_snapshot", probes)
     monkeypatch.setattr(maps, "render_map", render)
 
-    assert await maps.fetch_traffic_map(object()) == (b"rendered", [])
+    assert (await maps.fetch_traffic_map(object())).webp == b"rendered"
     assert captured["base"] == b"google-base"
 
 
@@ -180,6 +180,6 @@ async def test_estimator_failure_does_not_cancel_or_hide_google_base(monkeypatch
     monkeypatch.setattr(maps, "estimate_bus_positions", failed_estimate)
     monkeypatch.setattr(maps, "render_map", render)
 
-    assert await maps.fetch_traffic_map(object()) == (b"rendered", [])
+    assert (await maps.fetch_traffic_map(object())).webp == b"rendered"
     assert captured["base"] == b"google-base"
     assert captured["estimates"] == []

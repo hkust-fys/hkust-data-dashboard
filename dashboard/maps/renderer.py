@@ -49,6 +49,12 @@ GOOGLE_TRAFFIC_COLORS = (
     (247, 74, 85),
     (169, 39, 39),
 )
+# Google Maps' live-traffic Fast/Slow legend uses these solid swatches.
+# Canvas strokes differ slightly from the DOM legend, so recognize both.
+GOOGLE_TRAFFIC_LEGEND_COLORS = (
+    (17, 214, 143), (255, 207, 67), (242, 78, 66), (169, 39, 39),
+)
+TRAFFIC_COLOR_TOLERANCE = 24
 SHUTTLE_STOP_COLOR = (37, 99, 235)
 PUBLIC_STOP_COLOR = (139, 92, 246)
 GATE_PIN_COLOR = (37, 99, 235)
@@ -332,23 +338,26 @@ class TrafficOccupancy:
 def _traffic_occupancy(
     pristine_base: Image.Image, metrics: RenderMetrics = DEFAULT_METRICS
 ) -> TrafficOccupancy:
-    """Identify Google traffic strokes without classifying pale map greenery.
+    """Recognize the known traffic palette, allowing small rendering shifts.
 
-    Google traffic roads are strongly saturated red, amber/yellow, or green.
-    Requiring both saturation and value excludes the low-saturation mint land
-    fill while retaining compressed/anti-aliased traffic cores. A one-logical-
-    pixel dilation keeps thin strokes meaningful in lower-resolution retries.
+    A bounded per-channel tolerance retains anti-aliased/resized stroke cores
+    without classifying every saturated green/red map feature as traffic.
+    Dilation then protects the edges of the thin strokes for label placement.
     """
     rgb = pristine_base.convert("RGB")
-    hue, saturation, value = rgb.convert("HSV").split()
-    hue_mask = hue.point(
-        [255 if item <= 48 or item >= 245 or 50 <= item <= 112 else 0 for item in range(256)]
-    )
-    saturation_mask = saturation.point([255 if item >= 105 else 0 for item in range(256)])
-    value_mask = value.point([255 if item >= 85 else 0 for item in range(256)])
-    route_mask = ImageChops.multiply(
-        ImageChops.multiply(hue_mask, saturation_mask), value_mask
-    )
+    channels = rgb.split()
+    route_mask = Image.new("L", rgb.size, 0)
+    palette = dict.fromkeys((*GOOGLE_TRAFFIC_COLORS, *GOOGLE_TRAFFIC_LEGEND_COLORS))
+    for color in palette:
+        matching = [
+            channel.point([
+                255 if abs(value - component) <= TRAFFIC_COLOR_TOLERANCE else 0
+                for value in range(256)
+            ])
+            for channel, component in zip(channels, color, strict=True)
+        ]
+        swatch_mask = ImageChops.multiply(ImageChops.multiply(matching[0], matching[1]), matching[2])
+        route_mask = ImageChops.lighter(route_mask, swatch_mask)
     mask = route_mask
     dilation = metrics.integer(1)
     if dilation:
@@ -1312,6 +1321,8 @@ def _draw_legend(
             fill=(45, 45, 45, 255), font=row_label_font,
         )
         for anchor_x, operator in zip(columns, operators, strict=True):
+            if unreliable and operator is Operator.CITYBUS:
+                continue
             label = operator.value
             text_box = draw.textbbox((0, 0), label, font=sample_font)
             label_width = text_box[2] - text_box[0]
@@ -1645,7 +1656,7 @@ def _render_map_once(
     metrics = _render_metrics(size)
     zoom = BASE_MAP_ZOOM + math.log2(metrics.scale)
     # This is keyed from the pristine final-size base, before any dashboard
-    # overlays, so a ten-second redraw can skip HSV/palette analysis when
+    # overlays, so a ten-second redraw can skip palette analysis when
     # Google has not produced a new frame.
     traffic = _cached_traffic_occupancy(canvas, metrics)
     important_roads = _cached_important_road_occupancy(

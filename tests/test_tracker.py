@@ -1403,7 +1403,7 @@ async def test_estimator_terminal_singleton_lifecycle_is_interior_and_retires():
     )
     assert len(estimates) == 3
     terminal = next(item for item in estimates if ("probe", 9) in item.source_observations)
-    assert terminal.position == pytest.approx(22.637, abs=1e-9)
+    assert terminal.position == pytest.approx(28 - rows[9].minutes / 2, abs=1e-9)
     assert terminal.position != 28.0
     assert terminal.position_authoritative is not True
     assert (28, rows[9].arrival_at.timestamp(), 648) in terminal.checkpoint_evidence
@@ -1420,7 +1420,7 @@ async def test_estimator_terminal_singleton_lifecycle_is_interior_and_retires():
     )
     assert len(born) == 1
     track_id = born[0].track_id
-    assert born[0].position == pytest.approx(22.637, abs=1e-9)
+    assert born[0].position == pytest.approx(28 - rows[9].minutes / 2, abs=1e-9)
     retained = await tracker.update(
         ProbeEtaSnapshot((ProbeRouteGeneration(
             key, tuple(rows), 685, collected + timedelta(seconds=10),
@@ -4051,7 +4051,7 @@ async def test_all_positive_cold_fragment_union_holds_and_conserves_current_meta
     split = estimate_bus_positions(
         current_rows, [line], observed_checkpoint_indices={route_key: {4, 8, 9}},
     )
-    assert [candidate.position for candidate in split] == pytest.approx([3.9, 8.6])
+    assert [candidate.position for candidate in split] == pytest.approx([3.9, 7.65])
     assert all(candidate.position_authoritative is False for candidate in split)
     sources = Counter(source for candidate in split for source in candidate.source_observations)
     checkpoints = Counter(row for candidate in split for row in candidate.checkpoint_evidence)
@@ -4201,7 +4201,7 @@ async def test_all_positive_fragment_union_moves_to_first_present_boundary():
         [line],
         observed_checkpoint_indices={route_key: {0, 4, 8, 9}},
     )
-    assert [candidate.position for candidate in split] == pytest.approx([3.9, 8.6])
+    assert [candidate.position for candidate in split] == pytest.approx([3.9, 7.65])
 
     current = await tracker.update(
         _snapshot(2, current_rows, collected_at=collected_at),

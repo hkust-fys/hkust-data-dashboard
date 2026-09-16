@@ -186,7 +186,7 @@ def test_traffic_map_embed_is_image_onlyish_and_timestamped():
     desc = embed.description
     assert "min" not in desc
     assert "delay" not in desc
-    assert "HKeMobility" in desc
+    assert "🔗 [HKeMobility](https://www.hkemobility.gov.hk/)" in desc
     assert not embed.fields
     assert embed.image.url == f"attachment://{traffic_map_filename(webp)}"
     assert embed.timestamp == s.utc()
@@ -299,10 +299,13 @@ def test_traffic_summary_includes_relevant_roadworks():
     assert "Relevant roadworks" in embed.description
     assert "Lane closure" in embed.description
     assert "TD roadworks" in embed.description
-    assert embed.timestamp == s.utc()
+    assert embed.timestamp is None
+    assert f"TD roadworks <t:{int(s.utc().timestamp())}:t>" in embed.description
 
 
-def test_traffic_summary_lists_affected_routes_for_news_and_roadworks():
+def test_traffic_summary_lists_only_spatially_resolved_affected_routes():
+    from dataclasses import replace
+
     from dashboard.models import Roadwork, TrafficIncident
     from dashboard.providers.route_geometry import RouteLine
     from dashboard.providers.tracked_roads import build_tracked_roads
@@ -321,6 +324,8 @@ def test_traffic_summary_lists_affected_routes_for_news_and_roadworks():
         location="Hang Hau",
         direction="",
         status="active",
+        affected_routes=("91M",),
+        location_resolution="section",
     )
     embed = _build_traffic_summary_embed(
         [],
@@ -329,13 +334,14 @@ def test_traffic_summary_lists_affected_routes_for_news_and_roadworks():
         roadworks=[Roadwork("rw", "Resurfacing on Hang Hau Road", "Hang Hau Road")],
         roads=roads,
     )
-    assert "affects: 91M, 792M" in embed.description
-    assert embed.description.count("affects:") == 2
+    assert "affects: 91M" in embed.description
+    assert "792M" not in embed.description
+    assert embed.description.count("affects:") == 1
     assert "> Lane closure on Hang Hau Road" in embed.description
     assert "> One lane closed" in embed.description
 
-    # without a road table, no suffix renders
-    plain = _build_traffic_summary_embed([], [incident], None)
+    # Road-name membership alone cannot invent affected buses.
+    plain = _build_traffic_summary_embed([], [replace(incident, affected_routes=())], None, roads=roads)
     assert "affects:" not in plain.description
 
 
@@ -448,6 +454,73 @@ def test_traffic_summary_links_to_official_td_traffic_news():
     assert embed.footer.text == "Transport Department · traffic notices"
 
 
+def test_news_links_share_one_row_without_repeated_source_times():
+    from dashboard.render import _build_traffic_summary_embed
+
+    now = s.utc()
+    embed = _build_traffic_summary_embed([], [], None, traffic_source_times={
+        "traffic_news_checked": now, "rthk_news_checked": now,
+    })
+    link_row = embed.description.splitlines()[0]
+    assert "[TD traffic news]" in link_row
+    assert "[RTHK traffic news (Chinese)]" in link_row
+    assert "<t:" not in link_row
+    assert "notices checked" not in embed.description
+    assert "reports checked" not in embed.description
+
+
+def test_news_links_do_not_assign_source_times_to_individual_reports():
+    from dashboard.render import _build_traffic_summary_embed
+
+    fetched = s.utc()
+    td_updated = fetched - timedelta(minutes=12)
+    rthk_published = fetched - timedelta(minutes=8)
+    embed = _build_traffic_summary_embed([], [], None, traffic_source_times={
+        "traffic_news_checked": fetched, "traffic_news_updated": td_updated,
+        "rthk_news_checked": fetched, "rthk_news": rthk_published,
+    })
+    row = embed.description.splitlines()[0]
+    assert "<t:" not in row
+    assert str(int(fetched.timestamp())) not in row
+
+
+def test_reconciled_reports_keep_both_wordings_and_different_timestamp_kinds():
+    from dashboard.models import TrafficIncident
+    from dashboard.providers.tracked_roads import fallback_roads
+    from dashboard.render import _build_traffic_summary_embed
+
+    td_time = s.utc()
+    report_time = td_time - timedelta(minutes=5)
+    rthk = TrafficIncident(
+        "r", "Traffic report", "清水灣道交通繁忙", "Clear Water Bay Road", "", "", "NEW",
+        source="RTHK", announcement_time=report_time,
+    )
+    td = TrafficIncident(
+        "t", "Traffic report", "Traffic is busy on Clear Water Bay Road.",
+        "Clear Water Bay Road", "", "", "NEW",
+        page_updated_at=td_time, related_reports=(rthk,),
+    )
+    embed = _build_traffic_summary_embed([], [td], None, roads=fallback_roads())
+    assert "Same incident" in embed.description
+    assert f"**TD** · page updated <t:{int(td_time.timestamp())}:t>" in embed.description
+    assert f"**RTHK** · <t:{int(report_time.timestamp())}:t>" in embed.description
+    assert td.description in embed.description and rthk.description in embed.description
+    assert "清水灣道 (Clear Water Bay Road)" in embed.description
+    assert embed.timestamp is None
+
+
+def test_road_coverage_estimate_is_labelled_likely():
+    from dashboard.models import TrafficIncident
+    from dashboard.render import _build_traffic_summary_embed
+
+    report = TrafficIncident(
+        "t", "Traffic report", "Traffic is busy", "Lung Cheung Road", "", "", "NEW",
+        affected_routes=("291P",), location_resolution="road_coverage",
+    )
+    embed = _build_traffic_summary_embed([], [report], None)
+    assert "likely affected (location unspecified): 291P" in embed.description
+
+
 def test_traffic_summary_keeps_each_displayed_source_time_separate():
     from dashboard.models import Roadwork
     from dashboard.render import _build_traffic_summary_embed
@@ -471,12 +544,12 @@ def test_traffic_summary_keeps_each_displayed_source_time_separate():
 
     assert "TD detectors" not in embed.description
     assert "TD monitored slow points" not in embed.description
-    # The news timestamp lives only in the footer now (no duplicated line).
+    # Each item owns its time; there is no ambiguous combined clock.
     assert "TD traffic news updated" not in embed.description
     assert (
         f"TD roadworks <t:{int(roadworks_time.timestamp())}:t>" in embed.description
     )
-    assert embed.timestamp == roadworks_time
+    assert embed.timestamp is None
     assert embed.footer.text == "Transport Department · traffic notices"
 
 
@@ -492,7 +565,8 @@ def test_traffic_summary_ignores_detector_statuses_and_color():
     assert "Traffic route estimate unavailable" not in embed.description
     assert "TD detectors" not in embed.description
     assert "TD monitored slow points" not in embed.description
-    assert embed.color.value == 0x16A34A
+    assert embed.color.value == 0x64748B
+    assert "not been checked successfully" in embed.description
     assert embed.timestamp is None
     assert embed.footer.text == "Transport Department · traffic notices"
 
@@ -723,7 +797,8 @@ def test_build_payload_respects_embed_caps():
             assert len(field.value) <= FIELD_VALUE_MAX
         assert len(embed.description or "") <= DESC_MAX
         assert len(embed) <= CHARS_PER_EMBED_MAX
-        assert embed.timestamp is not None
+        if "Traffic news" not in (embed.title or ""):
+            assert embed.timestamp is not None
         assert embed.footer.text
         assert "source time" not in embed.footer.text
 

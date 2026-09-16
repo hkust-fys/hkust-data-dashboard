@@ -16,6 +16,7 @@ dependencies = [
     "Pillow>=10.0",
     "imageio-ffmpeg>=0.5",
     "playwright>=1.40",
+    "pyproj>=3.6",
 ]
 
 [project.optional-dependencies]

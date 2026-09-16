@@ -2353,11 +2353,12 @@ def test_negative_gate_probe_cannot_make_filtered_rows_position_evidence():
     assert estimates[0].source_observations == {("probe", 3)}
 
 
-def test_verified_gate_probe_track_obeys_future_origin_suppression():
+@pytest.mark.parametrize("origin_minutes", [5, 0.25, 0.01])
+def test_verified_gate_probe_track_obeys_future_origin_suppression(origin_minutes):
     line = _line("GMB", "11S", "seq-1", stop_count=19)
     key = ("GMB", "11S", "seq-1")
     rows = [
-        Probe(*key, 0, 5, cache_age_seconds=4, refresh_generation=1),
+        Probe(*key, 0, origin_minutes, cache_age_seconds=4, refresh_generation=1),
         Probe(*key, 7, 12, cache_age_seconds=4, refresh_generation=2),
         Probe(*key, 9, 16, cache_age_seconds=4, refresh_generation=3),
     ]
@@ -2450,7 +2451,7 @@ def test_long_upstream_hop_rejects_impossible_gate_match():
     assert pairs == [(1, 0)]
 
 
-def test_impossible_upstream_probe_does_not_move_gate_markers():
+def test_future_origin_suppresses_only_its_matched_gate_marker():
     line = _line("GMB", "11", "seq-1", stop_count=20)
     probes = [
         Probe("GMB", "11", "seq-1", 0, 10.1128),
@@ -2461,8 +2462,11 @@ def test_impossible_upstream_probe_does_not_move_gate_markers():
         AuthoritativeProbe("GMB", "11", "seq-1", 6, 7),
     ]
     estimates = estimate_bus_positions(probes, [line], authoritative_etas=gates)
-    assert [round(estimate.position, 3) for estimate in estimates] == [1.0, 2.5]
-    assert any(("probe", 1) in estimate.source_observations for estimate in estimates)
+    # The near-zero future origin belongs to the ten-minute gate cohort.
+    # It remains hidden until due, while the unrelated seven-minute bus stays.
+    assert [round(estimate.position, 3) for estimate in estimates] == [2.5]
+    assert estimates[0].source_observations == frozenset({("gate", 1)})
+    assert not any(("probe", 1) in estimate.source_observations for estimate in estimates)
     assert not any(("probe", 0) in estimate.source_observations for estimate in estimates)
 
 
@@ -2604,6 +2608,40 @@ def test_undeparted_terminus_bus_does_not_render():
     line = _line()
     assert estimate_bus_positions([Probe("KMB", "X", "outbound", 0, 3)], [line]) == []
     assert estimate_bus_positions([Probe("KMB", "X", "outbound", 0, 1)], [line]) == []
+
+
+@pytest.mark.parametrize("origin_minutes", [3, 0.25, 0.01])
+def test_future_terminus_vetoes_same_cohort_downstream_projection(origin_minutes):
+    """A downstream positive rung cannot publish a predeparture bus."""
+    line = _line(stop_count=6)
+    rows = [
+        Probe("KMB", "X", "outbound", 0, origin_minutes),
+        Probe("KMB", "X", "outbound", 2, 5),
+        # The old maximum-ladder anchor was +0.5 despite the future origin.
+        Probe("KMB", "X", "outbound", 4, 7),
+    ]
+
+    assert estimate_bus_positions(rows, [line]) == []
+
+
+@pytest.mark.parametrize("origin_minutes", [3, 0.25, 0.01])
+def test_source_rebuild_cannot_resurrect_future_terminus_cohort(origin_minutes):
+    line = _line(stop_count=6)
+    observed = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [
+        Probe("KMB", "X", "outbound", index, minutes,
+              cache_age_seconds=0, refresh_generation=1,
+              arrival_at=observed + timedelta(minutes=minutes))
+        for index, minutes in ((0, origin_minutes), (2, 5), (4, 7))
+    ]
+    template = BusEstimate(
+        "X destination", 22.3, 114.2, Operator.KMB, 0.0,
+        route="X", bound="outbound", operator_code="KMB", position=0.5,
+    )
+
+    assert rebuild_estimate_from_probe_sources(
+        template, (0, 1, 2), rows, [line],
+    ) is None
 
 
 def test_separate_buses_offset_by_headway_stay_separate():
@@ -2911,7 +2949,7 @@ def test_frame60_trace_keeps_kmb91m_terminal_singleton_at_eta_position():
     )
     assert len(estimates) == 3
     terminal = next(estimate for estimate in estimates if ("probe", 9) in estimate.source_observations)
-    assert terminal.position == pytest.approx(22.637, abs=1e-9)
+    assert terminal.position == pytest.approx(28 - rows[9].minutes / 2, abs=1e-9)
     assert terminal.position != 28.0
     assert terminal.position_authoritative is not True
     assert terminal.source_observations == frozenset({("probe", 9)})
@@ -3199,18 +3237,19 @@ def test_undeparted_gate_row_absorbs_later_scheduled_ladder():
     assert estimates == []
 
 
-def test_future_origin_vetoes_nonnegative_coarse_gate_position():
+@pytest.mark.parametrize("origin_minutes", [5, 0.25, 0.01])
+def test_future_origin_vetoes_nonnegative_coarse_gate_position(origin_minutes):
     """A downstream projection cannot launch a journey before stop-zero ETA."""
     line = _line("GMB", "11", "seq-1", stop_count=20)
     estimates = estimate_bus_positions(
         [
-            Probe("GMB", "11", "seq-1", 0, 5, EtaKind.SCHEDULED),
+            Probe("GMB", "11", "seq-1", 0, origin_minutes, EtaKind.SCHEDULED),
             Probe("GMB", "11", "seq-1", 1, 7, EtaKind.SCHEDULED),
         ],
         [line],
         authoritative_etas=[
             # 6 - 11/2 = 0.5: the old coarse gate rule called this departed,
-            # despite the same ETA instance still being five minutes from its
+            # despite the same ETA instance still being in advance of its
             # route-origin departure.
             AuthoritativeProbe(
                 "GMB", "11", "seq-1", 6, 11, EtaKind.SCHEDULED
@@ -4018,6 +4057,178 @@ def test_atomic_kmb_91m_sparse_terminal_ladder_remains_one_marker():
     )
     assert estimates[0].bracket == (17.0, 18.0)
     assert 17.0 < estimates[0].position < 18.0
+
+
+def test_kmb_91_gate_does_not_cross_backward_arrival_into_passed_cohort():
+    """Captured 91 rows must keep the gate bus ahead of three bunched buses."""
+    line = _line("KMB", "91", "outbound", stop_count=31)
+    rows = [
+        Probe(
+            "KMB", "91", "outbound", index, minutes,
+            cache_age_seconds=0.125,
+            signed_minutes=minutes,
+            refresh_generation=1,
+            arrival_at=datetime.fromisoformat(arrival_at),
+        )
+        for index, minutes, arrival_at in (
+            (19, 9.214818566666667, "2026-09-16T17:06:03+08:00"),
+            (20, 10.414818566666666, "2026-09-16T17:07:15+08:00"),
+            (21, 0.0, "2026-09-16T16:55:28+08:00"),
+            (21, 0.0, "2026-09-16T16:55:33+08:00"),
+            (21, 11.4481519, "2026-09-16T17:08:17+08:00"),
+            (22, 0.0, "2026-09-16T16:55:57+08:00"),
+            (22, 0.0, "2026-09-16T16:56:07+08:00"),
+            (22, 0.0, "2026-09-16T16:56:15+08:00"),
+            (23, 0.0, "2026-09-16T16:56:33+08:00"),
+            (23, 0.0, "2026-09-16T16:56:43+08:00"),
+            (23, 0.0, "2026-09-16T16:56:50+08:00"),
+            (24, 2.3648185666666666, "2026-09-16T16:59:12+08:00"),
+            (24, 2.5314852333333335, "2026-09-16T16:59:22+08:00"),
+            (24, 2.664818566666667, "2026-09-16T16:59:30+08:00"),
+            (25, 4.414818566666667, "2026-09-16T17:01:15+08:00"),
+            (25, 4.581485233333334, "2026-09-16T17:01:25+08:00"),
+            (25, 4.781485233333333, "2026-09-16T17:01:37+08:00"),
+            (26, 7.031485233333333, "2026-09-16T17:04:32+08:00"),
+            (26, 7.214818566666667, "2026-09-16T17:04:43+08:00"),
+            (26, 7.5481519, "2026-09-16T17:05:03+08:00"),
+            (27, 10.781485233333333, "2026-09-16T17:08:17+08:00"),
+            (27, 10.9481519, "2026-09-16T17:08:27+08:00"),
+            (27, 11.298151899999999, "2026-09-16T17:08:48+08:00"),
+            (28, 11.564818566666666, "2026-09-16T17:09:04+08:00"),
+            (28, 11.7481519, "2026-09-16T17:09:15+08:00"),
+            (28, 12.081485233333332, "2026-09-16T17:09:35+08:00"),
+        )
+    ]
+    gate = AuthoritativeProbe(
+        "KMB", "91", "outbound", 15, 0, EtaKind.REALTIME
+    )
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        authoritative_etas=[gate],
+        observed_checkpoint_indices={
+            ("KMB", "91", "outbound"): range(31),
+        },
+    )
+
+    gate_estimate = next(
+        estimate for estimate in estimates
+        if ("gate", 0) in estimate.source_observations
+    )
+    downstream = [estimate for estimate in estimates if estimate.position > 15]
+    assert len(estimates) == 4
+    assert gate_estimate.position == 15
+    gate_arrivals = [item[1] for item in gate_estimate.checkpoint_evidence]
+    assert all(
+        earlier < later
+        for earlier, later in zip(gate_arrivals, gate_arrivals[1:], strict=False)
+    )
+    # The three exact stop-24 rows are a census of three genuinely bunched
+    # buses.  Each stays owned by one separate downstream marker.
+    stop_24_inputs = {11, 12, 13}
+    assert {
+        next(
+            input_index for source, input_index in estimate.source_observations
+            if source == "probe" and input_index in stop_24_inputs
+        )
+        for estimate in downstream
+    } == stop_24_inputs
+    assert all(("gate", 0) not in estimate.source_observations for estimate in downstream)
+
+
+def test_kmb_91m_close_same_stop_arrivals_remain_separate():
+    line = _line("KMB", "91M", "inbound", stop_count=28)
+    rows = [
+        Probe(
+            "KMB", "91M", "inbound", 20, minutes,
+            cache_age_seconds=0.2,
+            signed_minutes=minutes,
+            refresh_generation=8,
+            arrival_at=datetime.fromisoformat(arrival_at),
+        )
+        for minutes, arrival_at in (
+            (2.0, "2026-09-16T17:00:00+08:00"),
+            (2.1666666667, "2026-09-16T17:00:10+08:00"),
+            (2.3333333333, "2026-09-16T17:00:20+08:00"),
+        )
+    ]
+
+    estimates = estimate_bus_positions(rows, [line])
+
+    assert len(estimates) == 3
+    assert {next(iter(estimate.source_observations)) for estimate in estimates} == {
+        ("probe", 0),
+        ("probe", 1),
+        ("probe", 2),
+    }
+
+
+def test_kmb_91m_future_terminal_cohorts_keep_count_and_local_eta_bounds():
+    """Captured Diamond Hill rows keep three buses without a terminus jump."""
+    line = _line("KMB", "91M", "outbound", stop_count=29)
+    rows = [
+        Probe(
+            "KMB", "91M", "outbound", index, minutes,
+            cache_age_seconds=0.125,
+            signed_minutes=signed_minutes,
+            refresh_generation=1,
+            arrival_at=datetime.fromisoformat(arrival_at),
+        )
+        for index, minutes, signed_minutes, arrival_at in (
+            (22, 0.0, -0.9596931, "2026-09-16T17:26:20+08:00"),
+            (23, 2.1236402333333335, 2.1236402333333335,
+             "2026-09-16T17:29:25+08:00"),
+            (24, 6.123640233333333, 6.123640233333333,
+             "2026-09-16T17:33:25+08:00"),
+            (25, 6.956973566666666, 6.956973566666666,
+             "2026-09-16T17:34:15+08:00"),
+            (26, 10.056973566666667, 10.056973566666667,
+             "2026-09-16T17:37:21+08:00"),
+            (27, 0.9736402333333333, 0.9736402333333333,
+             "2026-09-16T17:28:16+08:00"),
+            (27, 15.323640233333332, 15.323640233333332,
+             "2026-09-16T17:42:37+08:00"),
+            (28, 0.3236402333333333, 0.3236402333333333,
+             "2026-09-16T17:27:37+08:00"),
+            (28, 4.173640233333334, 4.173640233333334,
+             "2026-09-16T17:31:28+08:00"),
+            (28, 18.756973566666666, 18.756973566666666,
+             "2026-09-16T17:46:03+08:00"),
+        )
+    ]
+
+    estimates = estimate_bus_positions(
+        rows,
+        [line],
+        observed_checkpoint_indices={
+            ("KMB", "91M", "outbound"): range(29),
+        },
+    )
+
+    earliest_terminal = next(
+        estimate for estimate in estimates
+        if ("probe", 7) in estimate.source_observations
+    )
+    second_terminal = next(
+        estimate for estimate in estimates
+        if ("probe", 8) in estimate.source_observations
+    )
+    trailing = next(
+        estimate for estimate in estimates
+        if ("probe", 9) in estimate.source_observations
+    )
+    assert len(estimates) == 3
+    assert earliest_terminal.position == pytest.approx(
+        28 - rows[7].minutes / 2.0
+    )
+    assert second_terminal.position == pytest.approx(
+        27 - rows[5].minutes / 2.0
+    )
+    assert second_terminal.position < 27
+    assert earliest_terminal.position < 28
+    assert earliest_terminal.position_authoritative is False
+    assert ("probe", 9) in trailing.source_observations
 
 
 def test_atomic_kmb_temporal_heal_requires_one_route_response_revision():

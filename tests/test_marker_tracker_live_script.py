@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -5,12 +6,14 @@ import pytest
 
 from scripts.verify_marker_tracker_live import (
     _json_safe_record,
+    _source_audit_generation_context,
     check_minute_baselines,
     compare_adjacent,
     evaluate_run,
     frame_record,
     fresh_routes,
     minute_checks,
+    source_audit_result,
 )
 
 KEY = ("KMB", "A", "in")
@@ -18,7 +21,8 @@ KEY = ("KMB", "A", "in")
 
 def item(position, track_id=None):
     return SimpleNamespace(
-        operator="KMB", route="A", bound="in", position=position, track_id=track_id
+        operator="KMB", route="A", bound="in", position=position,
+        track_id=track_id, position_authoritative=True,
     )
 
 
@@ -78,7 +82,8 @@ def provenance_frame(candidate_positions, track_positions, *, generation=1,
         return SimpleNamespace(operator="KMB", route="A", bound="in",
                                position=position, bracket=bracket,
                                eta_minutes=eta, eta_arrival_at=None,
-                               boundary_age_seconds=1.0, source_indices=sources)
+                               boundary_age_seconds=1.0, source_indices=sources,
+                               position_authoritative=True)
 
     candidates = [evidence(position, provenance[index])
                   for index, position in enumerate(candidate_positions)]
@@ -181,6 +186,65 @@ def test_matching_provenance_still_reports_real_spacing_error():
     assert checks == 1
 
 
+def test_partial_frame_keeps_duplicate_display_identity_and_ownership_hard():
+    duplicate_identity = frame(
+        1, ((1, 2.0), (1, 3.0)), (2.0, 3.0)
+    )
+    assert any(
+        issue["kind"] == "duplicate_track_identity"
+        for issue in compare_adjacent(duplicate_identity, duplicate_identity)[0]
+    )
+
+    duplicate_source = provenance_frame((1.0, 5.0), (1.0, 5.0))
+    duplicate_source["track_evidence"][KEY][1]["source_observations"] = [
+        ("probe", 10), ("probe", 11),
+    ]
+    duplicate_source["track_evidence"][KEY][2]["source_observations"] = [
+        ("probe", 11), ("probe", 12),
+    ]
+    issues, _checks = compare_adjacent(duplicate_source, duplicate_source)
+    shared = next(
+        issue for issue in issues
+        if issue["kind"] == "duplicate_track_observation"
+    )
+    assert shared["source_observation"] == ("probe", 11)
+
+
+def test_gmb11_held_non_authoritative_spacing_is_explicitly_inconclusive():
+    provenance = (
+        (None, None, tuple(range(8, 17))),
+        (None, None, tuple(range(18, 27))),
+        (None, None, (27, 28, 29)),
+    )
+    record = provenance_frame(
+        (7.825275, 7.825275, 17.0),
+        (10.143, 10.152, 16.605),
+        generation=95,
+        provenance=provenance,
+    )
+    for evidence in record["candidate_evidence"][KEY]:
+        evidence["position_authoritative"] = False
+    for evidence in record["track_evidence"][KEY].values():
+        evidence["position_authoritative"] = False
+    audit_record, audit_issues = source_audit_result({
+        "ok": True,
+        "checks": [{"key": KEY, "kind": "checkpoint", "inconclusive": False}],
+        "issues": [],
+        "stats": {"matched": 21, "excluded_undeparted": 2},
+    })
+    state = {}
+
+    issues, checks = compare_adjacent(record, record, state)
+
+    assert audit_record["ok"] and audit_issues == []
+    assert not any(issue["kind"] == "spacing_mismatch" for issue in issues)
+    assert checks == 0
+    assert state["gap_inconclusive"][KEY] == 1
+    assert state["gap_inconclusive_reasons"][KEY] == {
+        "non_authoritative_position": 1,
+    }
+
+
 def test_spacing_provenance_accepts_json_style_observation_lists():
     old = provenance_frame((1.0, 5.0), (1.0, 5.0))
     replayed = provenance_frame((1.0, 5.0), (1.0, 5.0))
@@ -249,10 +313,16 @@ def evidence_frame(pos=(3.5, 7.5), *, age=1.0, eta=(1, 1), brackets=((3, 4), (7,
                                    tuple(int(x) for x in brackets[i])
                                    if eta_offsets[i] is not None
                                    else (int(brackets[i][1]),)
-                               ))
+                               ), position_authoritative=True)
               for i, p in enumerate(pos)]
     candidates = [SimpleNamespace(operator="KMB", route="A", bound="in", position=p,
-                                  bracket=brackets[i], eta_minutes=eta[i], boundary_age_seconds=age)
+                                  bracket=brackets[i], eta_minutes=eta[i],
+                                  boundary_age_seconds=age,
+                                  source_indices=(
+                                      tuple(int(x) for x in brackets[i])
+                                      if eta_offsets[i] is not None
+                                      else (int(brackets[i][1]),)
+                                  ), position_authoritative=True)
                  for i, p in enumerate(pos)]
     return frame_record(SimpleNamespace(
         complete_routes=(SimpleNamespace(
@@ -408,6 +478,226 @@ def test_evaluate_run_requires_freshness_and_actual_evidence():
     assert evaluate_run({KEY}, {KEY}, True, 1, 1, 0, bracket_count=1) == 0
     assert evaluate_run({KEY}, {KEY}, True, 1, 1, 1) == 1
     assert evaluate_run({KEY}, {KEY}, True, 1, 1, 0, {"transit"}) == 2
+    assert evaluate_run(
+        {KEY}, {KEY}, True, 1, 1, 0,
+        bracket_count=1, source_audit_inconclusive=1,
+    ) == 2
+
+
+def test_source_audit_failures_are_hard_violations_with_exact_detail():
+    audit = {
+        "ok": False,
+        "checks": [
+            {
+                "key": KEY,
+                "kind": "checkpoint",
+                "checkpoint": 6,
+                "ok": False,
+                "inconclusive": False,
+            }
+        ],
+        "issues": [
+            {
+                "key": KEY,
+                "kind": "checkpoint",
+                "detail": {
+                    "checkpoint": 6,
+                    "unmatched_source_observations": [("probe", 4)],
+                    "route_markers": [(1, 4.0, [("probe", 8)])],
+                },
+            }
+        ],
+        "stats": {"matched": 2, "excluded_undeparted": 1},
+    }
+
+    record, issues = source_audit_result(audit)
+
+    assert not record["ok"]
+    assert record["check_count"] == 1
+    assert record["inconclusive_count"] == 0
+    assert record["issues"] == audit["issues"]
+    assert issues == [{
+        "kind": "source_audit_failure",
+        "route": KEY,
+        "audit_kind": "checkpoint",
+        "detail": audit["issues"][0]["detail"],
+    }]
+
+
+def test_source_audit_inconclusive_checks_are_recorded_without_becoming_failures():
+    audit = {
+        "ok": True,
+        "checks": [{
+            "key": KEY,
+            "kind": "authoritative",
+            "ok": True,
+            "inconclusive": True,
+            "reason": "no authoritative HKUST rows",
+        }],
+        "issues": [],
+        "stats": {"matched": 0, "inconclusive": 1},
+    }
+
+    record, issues = source_audit_result(audit)
+
+    assert issues == []
+    assert record["ok"]
+    assert record["inconclusive_count"] == 1
+    assert record["inconclusive_checks"] == [{
+        "key": KEY,
+        "kind": "authoritative",
+        "reason": "no authoritative HKUST rows",
+    }]
+
+
+def test_source_audit_mismatch_without_new_complete_generation_is_deferred():
+    raw_issue = {
+        "key": KEY,
+        "kind": "checkpoint",
+        "detail": {
+            "checkpoint": 6,
+            "match": {
+                "unmatched_source_observations": [("probe", 4)],
+                "duplicate_sources": [],
+            },
+        },
+    }
+    audit = {
+        "ok": False,
+        "checks": [{
+            "key": KEY, "kind": "checkpoint", "checkpoint": 6,
+            "ok": False, "inconclusive": False,
+        }],
+        "issues": [raw_issue],
+        "stats": {},
+    }
+    reason = (
+        "complete generation unchanged; displayed population may be held "
+        "against newer partial source rows"
+    )
+
+    record, issues = source_audit_result(
+        audit, strict_routes=set(), route_reasons={KEY: reason}
+    )
+
+    assert issues == []
+    assert record["ok"]
+    assert record["check_count"] == 1
+    assert record["inconclusive_count"] == 1
+    assert record["issues"] == []
+    assert record["deferred_issues"] == [raw_issue]
+    assert record["inconclusive_checks"] == [{
+        "key": KEY,
+        "kind": "checkpoint",
+        "checkpoint": 6,
+        "reason": reason,
+        "deferred_issue": True,
+    }]
+
+
+def test_source_audit_duplicate_ownership_stays_hard_without_complete_generation():
+    raw_issue = {
+        "key": KEY,
+        "kind": "checkpoint",
+        "detail": {
+            "checkpoint": 6,
+            "match": {"duplicate_sources": [0]},
+        },
+    }
+    audit = {
+        "ok": False,
+        "checks": [{
+            "key": KEY, "kind": "checkpoint", "checkpoint": 6,
+            "ok": False, "inconclusive": False,
+        }],
+        "issues": [raw_issue],
+        "stats": {},
+    }
+
+    record, issues = source_audit_result(
+        audit, strict_routes=set(), route_reasons={KEY: "no complete generation"}
+    )
+
+    assert not record["ok"]
+    assert record["inconclusive_count"] == 1
+    assert record["deferred_issues"] == []
+    assert issues[0]["kind"] == "source_audit_failure"
+
+
+def test_unchanged_generation_is_explicitly_inconclusive_even_when_rows_match():
+    audit = {
+        "ok": True,
+        "checks": [{
+            "key": KEY, "kind": "checkpoint", "checkpoint": 6,
+            "ok": True, "inconclusive": False,
+        }],
+        "issues": [],
+        "stats": {"matched": 1},
+    }
+
+    record, issues = source_audit_result(
+        audit,
+        strict_routes=set(),
+        route_reasons={KEY: "complete generation unchanged"},
+    )
+
+    assert issues == []
+    assert record["ok"]
+    assert record["check_count"] == 2
+    assert record["inconclusive_count"] == 1
+    assert record["inconclusive_checks"] == [{
+        "key": KEY,
+        "kind": "generation-context",
+        "reason": "complete generation unchanged",
+    }]
+
+
+def test_source_audit_generation_context_requires_a_new_complete_revision():
+    previous = {}
+    cold = SimpleNamespace(complete_routes=())
+    strict, reasons = _source_audit_generation_context(cold, {KEY}, previous)
+    assert strict == set()
+    assert reasons[KEY].startswith("no complete generation available")
+
+    generation_one = SimpleNamespace(complete_routes=(SimpleNamespace(
+        route_key=KEY, generation=1,
+    ),))
+    strict, reasons = _source_audit_generation_context(
+        generation_one, {KEY}, previous
+    )
+    assert strict == {KEY} and reasons == {}
+
+    strict, reasons = _source_audit_generation_context(
+        generation_one, {KEY}, previous
+    )
+    assert strict == set()
+    assert reasons[KEY].startswith("complete generation unchanged")
+
+    generation_two = SimpleNamespace(complete_routes=(SimpleNamespace(
+        route_key=KEY, generation=2,
+    ),))
+    strict, reasons = _source_audit_generation_context(
+        generation_two, {KEY}, previous
+    )
+    assert strict == {KEY} and reasons == {}
+
+
+def test_frame_record_keeps_source_audit_against_displayed_tracks():
+    source_audit = {
+        "ok": True,
+        "check_count": 2,
+        "inconclusive_count": 0,
+        "stats": {"markers": 1, "matched": 1},
+        "issues": [],
+    }
+    record = frame_record(
+        SimpleNamespace(complete_routes=()),
+        [item(2.0)],
+        [item(2.0, 1)],
+        source_audit=source_audit,
+    )
+    assert record["source_audit"] == source_audit
+    assert record["tracks"][KEY] == [(1, 2.0)]
 
 
 def test_omission_preserves_generation_identity_state():
@@ -448,14 +738,29 @@ def test_json_safe_counters_and_global_pass_threshold():
     assert evaluate_run({KEY, ("KMB", "B", "in")}, {KEY}, True, {KEY: 1}, {KEY: 1}, 0) == 2
 
 
+def test_json_round_trip_preserves_track_evidence_for_replay():
+    replayed = json.loads(json.dumps(_json_safe_record(evidence_frame())))
+    state = {}
+
+    issues, checks = compare_adjacent(replayed, replayed, state)
+
+    assert issues == []
+    assert checks == 1
+    assert state["gap_checks"]["KMB/A/in"] == 1
+    assert state["bracket_checks"]["KMB/A/in"] == 1
+
+
 def test_frame_evidence_records_scheduled_marker_reliability():
     scheduled = item(2.0, 1)
     scheduled.unreliable = True
+    scheduled.position_authoritative = False
     record = frame_record(
         SimpleNamespace(complete_routes=()), [scheduled], [scheduled], {KEY: 20.0}
     )
     assert record["candidate_evidence"][KEY][0]["unreliable"] is True
     assert record["track_evidence"][KEY][1]["unreliable"] is True
+    assert record["candidate_evidence"][KEY][0]["position_authoritative"] is False
+    assert record["track_evidence"][KEY][1]["position_authoritative"] is False
 
 
 def test_frame_records_requested_priorities_and_checkpoint_cache_ages():
@@ -477,6 +782,37 @@ def test_frame_records_requested_priorities_and_checkpoint_cache_ages():
     )
     assert record["priority_checkpoints"][KEY] == [2, 3]
     assert record["checkpoint_ages"][KEY] == {2: 3.5, 3: 7.0}
+
+
+def test_frame_records_raw_source_census_and_checkpoint_evidence_for_diagnosis():
+    arrival = datetime.fromisoformat("2026-01-01T00:02:00+00:00")
+    row = SimpleNamespace(
+        operator="KMB", route="A", bound="in", index=2, minutes=1.5,
+        kind=SimpleNamespace(value="realtime"), arrival_at=arrival,
+        cache_age_seconds=3.0, refresh_generation=9,
+    )
+    candidate = item(1.25)
+    candidate.checkpoint_evidence = ((2, arrival.timestamp(), 9),)
+    tracked = item(1.25, 7)
+    tracked.checkpoint_evidence = candidate.checkpoint_evidence
+
+    record = frame_record(
+        SimpleNamespace(complete_routes=(), positioning_rows=(row,)),
+        [candidate], [tracked], {KEY: 20.0},
+    )
+
+    assert record["source_rows"][KEY] == [{
+        "observation": ("probe", 0),
+        "index": 2,
+        "minutes": 1.5,
+        "kind": "realtime",
+        "arrival_at": arrival.isoformat(),
+        "cache_age_seconds": 3.0,
+        "refresh_generation": 9,
+    }]
+    expected = [(2, arrival.timestamp(), 9)]
+    assert record["candidate_evidence"][KEY][0]["checkpoint_evidence"] == expected
+    assert record["track_evidence"][KEY][7]["checkpoint_evidence"] == expected
 
 
 def test_each_requested_route_needs_active_track_and_direct_evidence():

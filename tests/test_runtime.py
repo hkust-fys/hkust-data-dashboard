@@ -16,6 +16,7 @@ from bot import (
     DASHBOARD_MESSAGE_MARKER,
     DashboardUpdater,
     _bounded_discord,
+    _diagnose_alert_ping_capability,
     _find_dashboard_message,
     _payload_fingerprint,
     _resolve_dashboard_message,
@@ -226,8 +227,9 @@ class _FailOnceThread(_FakeThread):
 
 
 class _ThreadedMessage(_FakeMessage):
-    def __init__(self, thread):
-        super().__init__(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+    def __init__(self, thread, *, id=1):
+        super().__init__(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=id)
+        thread.id = id
         self.thread = None
         self._fetched_thread = thread
         self.created_threads = 0
@@ -243,8 +245,9 @@ class _ThreadedMessage(_FakeMessage):
 class _LegacyThreadedMessage(_FakeMessage):
     """discord.py 2.3-shaped message without Message.fetch_thread."""
 
-    def __init__(self, thread):
-        super().__init__(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+    def __init__(self, thread, *, id=1):
+        super().__init__(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=id)
+        thread.id = id
         self.thread = None
         self.created_threads = 0
         self.fetched_ids = []
@@ -258,6 +261,19 @@ class _LegacyThreadedMessage(_FakeMessage):
     async def create_thread(self, **_kwargs):
         self.created_threads += 1
         raise AssertionError("must not recreate an existing archived thread")
+
+
+class _CreatableThreadMessage(_FakeMessage):
+    def __init__(self, *, id):
+        super().__init__(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=id)
+        self.thread = None
+        self.created_threads = 0
+
+    async def create_thread(self, **_kwargs):
+        self.created_threads += 1
+        self.thread = _FakeThread()
+        self.thread.id = self.id
+        return self.thread
 
 
 @pytest.mark.asyncio
@@ -400,7 +416,7 @@ def test_to_payload_uses_news_and_roadwork_times_without_detector_legend():
     # The news timestamp lives only in the footer now (no duplicated line).
     assert "TD traffic news updated" not in summary.description
     assert f"TD roadworks <t:{int(roadworks_time.timestamp())}:t>" in summary.description
-    assert summary.timestamp == roadworks_time
+    assert summary.timestamp is None
 
 
 @pytest.mark.asyncio
@@ -470,7 +486,7 @@ async def test_updater_rolls_old_dashboard_before_discord_edit_cap(monkeypatch):
     assert old.deleted
     assert old.edits == 0
     assert updater._message is channel.sent[0]  # noqa: SLF001
-    assert updater._thread is old_thread  # noqa: SLF001
+    assert updater._thread is None  # noqa: SLF001
     assert channel.send_kwargs[0]["content"] == DASHBOARD_MESSAGE_MARKER
     assert len(channel.send_kwargs[0]["files"]) == 1
     assert updater._last_payload_fingerprint == _payload_fingerprint(payload)  # noqa: SLF001
@@ -2015,6 +2031,70 @@ async def test_expired_nonce_known_canonical_allows_edit_only_and_deduplicates(
 
 
 @pytest.mark.asyncio
+async def test_expired_nonce_recovers_proven_successor_and_creates_attached_thread(
+    tmp_path,
+):
+    import time
+
+    import bot as bot_module
+
+    class MissingMessage(Exception):
+        status = 404
+
+    started_at = time.time() - 10 * 60
+    predecessor_id = 111
+    message = _CreatableThreadMessage(id=321)
+    message.created_at = datetime.fromtimestamp(started_at + 2, UTC)
+
+    class ProvenSuccessorChannel(_FakeChannel):
+        def __init__(self):
+            super().__init__([message])
+            self.fetched_ids = []
+
+        async def fetch_message(self, message_id):
+            self.fetched_ids.append(message_id)
+            if message_id == message.id:
+                return message
+            raise MissingMessage()
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    bot_module._store_dashboard_runtime_state(  # noqa: SLF001
+        settings,
+        {
+            "announce_channel_id": settings.announce_channel_id,
+            "dashboard_message_id": message.id,
+            "dashboard_send_nonce": 123,
+            "dashboard_send_predecessor_id": predecessor_id,
+            "rollover_uncertain_since": started_at,
+        },
+    )
+    updater = DashboardUpdater(settings)
+    updater._running = True  # noqa: SLF001
+    updater._set_dashboard_message(message)  # noqa: SLF001
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    updater._snapshot_payload = lambda: DashboardPayload(
+        files=[ImageAsset("map.png", b"current")]
+    )
+    channel = ProvenSuccessorChannel()
+
+    await updater._tick(channel)  # noqa: SLF001
+
+    assert predecessor_id in channel.fetched_ids
+    assert not channel.sent
+    assert updater._dashboard_send_nonce is None  # noqa: SLF001
+    assert updater._rollover_uncertain_since is None  # noqa: SLF001
+    assert updater._dashboard_messages_reconciled  # noqa: SLF001
+    assert updater._thread is message.thread  # noqa: SLF001
+    assert updater._status_thread_id == message.id  # noqa: SLF001
+    assert message.created_threads == 1
+    persisted = bot_module._load_dashboard_runtime_state(settings)  # noqa: SLF001
+    assert persisted["dashboard_message_id"] == message.id
+    assert persisted["status_thread_id"] == message.id
+    assert "dashboard_send_nonce" not in persisted
+    assert "rollover_uncertain_since" not in persisted
+
+
+@pytest.mark.asyncio
 async def test_expired_nonce_failed_history_edits_known_fallback_only(tmp_path):
     import bot as bot_module
 
@@ -2111,15 +2191,23 @@ async def test_expired_nonce_edit_failure_cannot_rollover_or_send(tmp_path, fail
 
 
 @pytest.mark.asyncio
-async def test_first_rollover_captures_existing_status_thread(monkeypatch, tmp_path):
+async def test_first_rollover_creates_thread_attached_to_replacement(monkeypatch, tmp_path):
     import bot as bot_module
 
     thread = _FakeThread()
     thread.id = 100
-    old = _ThreadedMessage(thread)
-    old.id = 100
+    old = _ThreadedMessage(thread, id=100)
     old.created_at = datetime.now(UTC) - timedelta(minutes=56)
-    channel = _FakeChannel([old])
+
+    class ThreadedRolloverChannel(_FakeChannel):
+        async def send(self, **kwargs):
+            message = _CreatableThreadMessage(id=999)
+            message.nonce = kwargs.get("nonce")
+            self.sent.append(message)
+            self.send_kwargs.append(kwargs)
+            return message
+
+    channel = ThreadedRolloverChannel([old])
     payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
     settings = replace(_fake_settings(), cache_dir=str(tmp_path))
     updater = DashboardUpdater(settings)
@@ -2133,8 +2221,10 @@ async def test_first_rollover_captures_existing_status_thread(monkeypatch, tmp_p
 
     assert old.deleted
     assert updater._message is channel.sent[0]  # noqa: SLF001
-    assert updater._thread is thread  # noqa: SLF001
-    assert updater._status_thread_id == thread.id  # noqa: SLF001
+    assert updater._thread is channel.sent[0].thread  # noqa: SLF001
+    assert updater._thread is not thread  # noqa: SLF001
+    assert updater._status_thread_id == channel.sent[0].id  # noqa: SLF001
+    assert channel.sent[0].created_threads == 1
 
 
 @pytest.mark.asyncio
@@ -2387,6 +2477,100 @@ async def test_apply_payload_retains_unchanged_content_addressed_attachment():
     assert isinstance(attachments[0], discord.File)
     assert attachments[0].filename == "traffic-map-new.webp"
     attachments[0].close()
+
+
+@pytest.mark.asyncio
+async def test_apply_payload_reuses_live_warning_thumbnail_when_attachments_omitted():
+    import time
+
+    from bot import _apply_payload
+
+    filename = "hko-warnings-0123456789ab.png"
+    expires = f"{int(time.time()) + 600:x}"
+    live_url = (
+        f"https://cdn.discordapp.com/attachments/123/456/{filename}"
+        f"?ex={expires}&is=0&hm=test"
+    )
+    current = discord.Embed()
+    current.set_thumbnail(url=live_url)
+    desired = discord.Embed()
+    desired.set_thumbnail(url=f"attachment://{filename}")
+
+    class Message:
+        channel = SimpleNamespace(id=123)
+        attachments = []
+        embeds = [current]
+
+        async def edit(self, **kwargs):
+            self.kwargs = kwargs
+            return self
+
+    message = Message()
+    payload = DashboardPayload(
+        embeds=[desired], files=[ImageAsset(filename, b"same-warning-strip")]
+    )
+
+    await _apply_payload(message, payload)
+
+    assert message.kwargs["attachments"] == []
+    assert message.kwargs["embeds"][0].thumbnail.url == live_url
+    assert payload.embeds[0].thumbnail.url == f"attachment://{filename}"
+
+
+@pytest.mark.asyncio
+async def test_apply_payload_reuploads_warning_for_expired_cdn_thumbnail():
+    from bot import _apply_payload
+
+    filename = "hko-warnings-0123456789ab.png"
+    expired_url = (
+        f"https://cdn.discordapp.com/attachments/123/456/{filename}"
+        "?ex=1&is=0&hm=test"
+    )
+    current = discord.Embed()
+    current.set_thumbnail(url=expired_url)
+    desired = discord.Embed()
+    desired.set_thumbnail(url=f"attachment://{filename}")
+
+    class Message:
+        channel = SimpleNamespace(id=123)
+        attachments = []
+        embeds = [current]
+
+        async def edit(self, **kwargs):
+            self.kwargs = kwargs
+            return self
+
+    message = Message()
+    await _apply_payload(
+        message,
+        DashboardPayload(
+            embeds=[desired], files=[ImageAsset(filename, b"warning-strip")]
+        ),
+    )
+
+    uploaded = message.kwargs["attachments"]
+    assert len(uploaded) == 1
+    assert isinstance(uploaded[0], discord.File)
+    uploaded[0].close()
+
+
+def test_warning_thumbnail_reuse_rejects_other_channel_and_non_discord_hosts():
+    import time
+
+    from bot import _trusted_live_discord_attachment_url
+
+    filename = "hko-warnings-0123456789ab.png"
+    expires = f"{int(time.time()) + 600:x}"
+    assert not _trusted_live_discord_attachment_url(
+        f"https://cdn.discordapp.com/attachments/999/456/{filename}?ex={expires}",
+        filename=filename,
+        channel_id=123,
+    )
+    assert not _trusted_live_discord_attachment_url(
+        f"https://example.com/attachments/123/456/{filename}?ex={expires}",
+        filename=filename,
+        channel_id=123,
+    )
 
 
 def test_dry_run_recognizes_content_addressed_traffic_map_filename():
@@ -3075,7 +3259,7 @@ async def test_collect_all_reuses_tracked_roads_after_timeout_for_important_path
     [
         (22.335, 114.26, "", "", (22.335, 114.26)),
         (None, None, "HKUST North Gate", "", "skip"),
-        (None, None, "", "", (None, None)),
+        (None, None, "", "", "skip"),
         (22.335, None, "", "", "skip"),
         (25.0, 114.26, "", "", "skip"),
     ],
@@ -3088,9 +3272,12 @@ async def test_collect_all_passes_only_anchored_affected_road_segments(
     between_landmark,
     expected_anchor,
 ):
-    """Traffic overlays use coordinates, or the provider's guarded fallback."""
+    """Traffic overlays consume resolved sections and never re-expand ambiguous news."""
+    from dataclasses import replace
+
     import bot as bot_module
     from dashboard.models import TrafficIncident
+    from dashboard.providers import traffic_location
 
     incident = TrafficIncident(
         "notice-1", "Road closure", "works", "Clear Water Bay Road", "HKUST",
@@ -3132,14 +3319,20 @@ async def test_collect_all_passes_only_anchored_affected_road_segments(
     monkeypatch.setattr(bot_module.traffic_provider, "fetch_traffic_data", traffic)
     monkeypatch.setattr(bot_module.maps, "fetch_traffic_map", traffic_map)
 
+    async def enriched(_client, items, _roads, _lines, _cache):
+        assert items == [incident]
+        paths = () if expected_anchor == "skip" else (((22.335, 114.26), (22.336, 114.261)),)
+        return [replace(incident, affected_paths=paths, location_resolution="section" if paths else "unresolved")]
+
+    monkeypatch.setattr(traffic_location, "enrich_incident_locations", enriched)
     await bot_module.collect_all(object(), _fake_settings())
 
     assert captured["important_road_paths"] == []
+    assert calls == []
     if expected_anchor == "skip":
         assert calls == []
         assert captured["affected_road_paths"] == []
     else:
-        assert calls == [(["clear water bay road"], *expected_anchor)]
         assert captured["affected_road_paths"] == [[(22.335, 114.26), (22.336, 114.261)]]
 
 
@@ -3206,8 +3399,8 @@ async def test_collect_all_does_not_map_direction_only_tracked_road(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_collect_all_allows_explicit_short_subroad_for_landmark_notice(monkeypatch):
-    """A landmark-only notice may select a named short sub-road, not its parent road."""
+async def test_collect_all_unresolved_landmark_does_not_guess_short_subroad(monkeypatch):
+    """An unresolved landmark never expands to an entire guessed sub-road."""
     import bot as bot_module
     from dashboard.models import TrafficIncident
 
@@ -3258,8 +3451,8 @@ async def test_collect_all_allows_explicit_short_subroad_for_landmark_notice(mon
 
     await bot_module.collect_all(object(), _fake_settings())
 
-    assert calls == [(["lung cheung road flyover"], None, None)]
-    assert captured["affected_road_paths"] == [[(22.34, 114.20), (22.341, 114.201)]]
+    assert calls == []
+    assert captured["affected_road_paths"] == []
 
 
 @pytest.mark.asyncio
@@ -3288,6 +3481,84 @@ async def test_updater_posts_new_and_cleared_roadworks_to_dashboard_thread():
     assert len(messages) == 2
     assert "Lane closure near HKUST" in messages[0]
     assert "TD roadworks cleared" in messages[1]
+
+
+@pytest.mark.asyncio
+async def test_weather_thread_updates_disable_all_mentions():
+    from dashboard.models import WeatherWarning
+
+    updater = DashboardUpdater(replace(_fake_settings(), alert_role_id=123456))
+    updater._thread = _FakeThread()  # noqa: SLF001
+    baseline = {"weather": (None, [], None), "traffic": ([], [], [], None)}
+    warning = WeatherWarning(code="WRAINB", name="Black Rainstorm @everyone")
+    active = {
+        "weather": (None, [warning], s.utc()),
+        "traffic": ([], [], [], None),
+    }
+
+    await updater._post_alert_events(baseline)  # noqa: SLF001
+    await updater._post_alert_events(active)  # noqa: SLF001
+
+    sent = updater._thread.sent  # noqa: SLF001
+    assert len(sent) == 1
+    assert "<@&123456>" not in sent[0]["content"]
+    allowed = sent[0]["allowed_mentions"]
+    assert allowed.everyone is False
+    assert allowed.users is False
+    assert allowed.roles is False
+    assert allowed.replied_user is False
+
+
+@pytest.mark.asyncio
+async def test_traffic_thread_allows_only_intended_configured_role():
+    from dashboard.models import TrafficIncident
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    role_id = 123456
+    updater = DashboardUpdater(replace(_fake_settings(), alert_role_id=role_id))
+    updater._thread = _FakeThread()  # noqa: SLF001
+    baseline = {
+        "weather": (None, [], None),
+        "traffic": ([], [], [], None),
+        "tracked_roads": fallback_roads(),
+    }
+    important = TrafficIncident(
+        "cwb-alert",
+        "CWB incident",
+        "source markup @everyone <@999> <@&888>",
+        "Clear Water Bay Road",
+        "",
+        "Sai Kung bound",
+        "ACTIVE",
+    )
+    ordinary = TrafficIncident(
+        "lung-cheung-update",
+        "Lung Cheung incident",
+        "another @everyone <@999> <@&888>",
+        "Lung Cheung Road",
+        "",
+        "eastbound",
+        "ACTIVE",
+    )
+    active = {
+        **baseline,
+        "traffic": ([], [important, ordinary], [], None),
+    }
+
+    await updater._post_alert_events(baseline)  # noqa: SLF001
+    await updater._post_alert_events(active)  # noqa: SLF001
+
+    sent = updater._thread.sent  # noqa: SLF001
+    assert len(sent) == 2
+    important_send, ordinary_send = sent
+    assert f"<@&{role_id}>" in important_send["content"]
+    important_allowed = important_send["allowed_mentions"]
+    assert important_allowed.everyone is False
+    assert important_allowed.users is False
+    assert [role.id for role in important_allowed.roles] == [role_id]
+    assert ordinary_send["allowed_mentions"].roles is False
+    assert ordinary_send["allowed_mentions"].everyone is False
+    assert ordinary_send["allowed_mentions"].users is False
 
 
 @pytest.mark.asyncio
@@ -3333,12 +3604,12 @@ async def test_updater_fetches_archived_thread_with_discord_py_23_shape():
 
 
 @pytest.mark.asyncio
-async def test_updater_recovers_persisted_status_thread_after_rollover(tmp_path):
+async def test_updater_rejects_persisted_sibling_thread_after_rollover(tmp_path):
     settings = replace(_fake_settings(), cache_dir=str(tmp_path))
     thread = _FakeThread()
     thread.id = 321
     first = DashboardUpdater(settings)
-    first._message = _ThreadedMessage(thread)  # noqa: SLF001
+    first._message = _ThreadedMessage(thread, id=321)  # noqa: SLF001
 
     await first._ensure_thread()  # noqa: SLF001
 
@@ -3348,19 +3619,45 @@ async def test_updater_recovers_persisted_status_thread_after_rollover(tmp_path)
         fetched_ids.append(channel_id)
         return thread
 
-    replacement = _FakeMessage(
-        _FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=999
-    )
+    replacement = _CreatableThreadMessage(id=999)
     replacement.guild = SimpleNamespace(fetch_channel=fetch_channel)
     restarted = DashboardUpdater(settings)
     restarted._message = replacement  # noqa: SLF001
 
     await restarted._ensure_thread()  # noqa: SLF001
 
-    assert fetched_ids == [thread.id]
-    assert restarted._thread is thread  # noqa: SLF001
-    assert restarted._status_thread_id == thread.id  # noqa: SLF001
-    assert replacement.id != thread.id
+    assert fetched_ids == [replacement.id]
+    assert restarted._thread is replacement.thread  # noqa: SLF001
+    assert restarted._thread is not thread  # noqa: SLF001
+    assert restarted._status_thread_id == replacement.id  # noqa: SLF001
+    assert replacement.created_threads == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_alert_retry_moves_to_replacement_dashboard_thread():
+    updater = DashboardUpdater(_fake_settings())
+    old_message = _CreatableThreadMessage(id=100)
+    old_thread = _FailOnceThread()
+    old_thread.id = old_message.id
+    old_message.thread = old_thread
+    updater._set_dashboard_message(old_message)  # noqa: SLF001
+    updater._thread = old_thread  # noqa: SLF001
+    updater._status_thread_id = old_thread.id  # noqa: SLF001
+    updater._pending_alert_messages.append(("queued status", False))  # noqa: SLF001
+
+    await updater._flush_alert_messages()  # noqa: SLF001
+
+    assert updater._thread is None  # noqa: SLF001
+    assert len(updater._pending_alert_messages) == 1  # noqa: SLF001
+
+    replacement = _CreatableThreadMessage(id=200)
+    updater._set_dashboard_message(replacement)  # noqa: SLF001
+    await updater._ensure_thread()  # noqa: SLF001
+    await updater._flush_alert_messages()  # noqa: SLF001
+
+    assert updater._thread is replacement.thread  # noqa: SLF001
+    assert replacement.thread.sent[0]["content"] == "queued status"
+    assert not updater._pending_alert_messages  # noqa: SLF001
 
 
 def test_updater_ignores_non_object_runtime_state(tmp_path):
@@ -3399,6 +3696,27 @@ def test_failed_thread_state_write_is_retried(monkeypatch, tmp_path):
 
     assert len(writes) == 2
     assert updater._persisted_status_thread_id == thread.id  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_restart_keeps_persisted_thread_for_same_dashboard(tmp_path):
+    import bot as bot_module
+
+    settings = replace(_fake_settings(), cache_dir=str(tmp_path))
+    thread = _FakeThread()
+    message = _ThreadedMessage(thread, id=321)
+    bot_module._store_dashboard_runtime_state(settings, {  # noqa: SLF001
+        "announce_channel_id": settings.announce_channel_id,
+        "dashboard_message_id": message.id, "status_thread_id": message.id,
+    })
+    updater = DashboardUpdater(settings)
+    updater._set_dashboard_message(message)  # noqa: SLF001
+    await updater._reconcile_dashboard_messages(_FakeChannel([message]))  # noqa: SLF001
+    await updater._ensure_thread()  # noqa: SLF001
+    stored = bot_module._load_dashboard_runtime_state(settings)  # noqa: SLF001
+    assert stored["status_thread_id"] == message.id
+    assert updater._thread is thread  # noqa: SLF001
+    assert message.created_threads == 0
 
 
 @pytest.mark.asyncio
@@ -3694,7 +4012,102 @@ async def test_failed_alert_send_is_retained_and_retried_without_duplication():
 
     assert len(replacement.sent) == 1
     assert "Lane closure" in replacement.sent[0]["content"]
+    assert replacement.sent[0]["allowed_mentions"].roles is False
     assert not updater._pending_alert_messages  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_failed_ping_send_retains_role_permission_for_retry():
+    from dashboard.models import TrafficIncident
+    from dashboard.providers.tracked_roads import fallback_roads
+
+    role_id = 654321
+    updater = DashboardUpdater(replace(_fake_settings(), alert_role_id=role_id))
+    updater._thread = _FailOnceThread()  # noqa: SLF001
+    baseline = {
+        "weather": (None, [], None),
+        "traffic": ([], [], [], None),
+        "tracked_roads": fallback_roads(),
+    }
+    incident = TrafficIncident(
+        "cwb-retry",
+        "CWB incident",
+        "lane closed",
+        "Clear Water Bay Road",
+        "",
+        "Sai Kung bound",
+        "ACTIVE",
+    )
+    active = {**baseline, "traffic": ([], [incident], [], None)}
+
+    await updater._post_alert_events(baseline)  # noqa: SLF001
+    await updater._post_alert_events(active)  # noqa: SLF001
+    assert updater._thread is None  # noqa: SLF001
+    assert len(updater._pending_alert_messages) == 1  # noqa: SLF001
+
+    replacement = _FakeThread()
+    updater._thread = replacement  # noqa: SLF001
+    await updater._flush_alert_messages()  # noqa: SLF001
+    await updater._post_alert_events(active)  # noqa: SLF001
+
+    assert len(replacement.sent) == 1
+    sent = replacement.sent[0]
+    assert f"<@&{role_id}>" in sent["content"]
+    assert [role.id for role in sent["allowed_mentions"].roles] == [role_id]
+    assert not updater._pending_alert_messages  # noqa: SLF001
+
+
+def test_alert_ping_diagnostic_warns_without_stopping_service(caplog):
+    role_id = 654321
+    role = SimpleNamespace(mentionable=False)
+    member = object()
+    guild = SimpleNamespace(
+        me=member,
+        get_role=lambda requested: role if requested == role_id else None,
+    )
+
+    class Channel:
+        def __init__(self):
+            self.guild = guild
+
+        def permissions_for(self, requested_member):
+            assert requested_member is member
+            return SimpleNamespace(mention_everyone=False)
+
+    settings = replace(_fake_settings(), alert_role_id=role_id)
+
+    assert not _diagnose_alert_ping_capability(Channel(), settings)
+    assert "traffic role pings will not notify" in caplog.text
+    assert "server administrator" in caplog.text
+    assert str(role_id) not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("mentionable", "mention_everyone"),
+    [(True, False), (False, True)],
+)
+def test_alert_ping_diagnostic_accepts_either_discord_permission(
+    mentionable, mention_everyone
+):
+    role_id = 654321
+    member = object()
+    guild = SimpleNamespace(
+        me=member,
+        get_role=lambda requested: (
+            SimpleNamespace(mentionable=mentionable) if requested == role_id else None
+        ),
+    )
+    channel = SimpleNamespace(
+        guild=guild,
+        permissions_for=lambda requested: (
+            SimpleNamespace(mention_everyone=mention_everyone)
+            if requested is member
+            else None
+        ),
+    )
+    settings = replace(_fake_settings(), alert_role_id=role_id)
+
+    assert _diagnose_alert_ping_capability(channel, settings)
 
 
 def _fake_settings():
@@ -3787,5 +4200,5 @@ async def test_map_starts_google_capture_and_geometry_together(monkeypatch):
         asyncio.gather(capture_started.wait(), geometry_started.wait()), timeout=0.2
     )
     release.set()
-    png, _ = await operation
+    png = (await operation).webp
     assert png == b"map"

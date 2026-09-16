@@ -10,7 +10,7 @@ import pytest
 
 from dashboard.maps.positions import BusEstimate  # noqa: F401  (import sanity)
 from dashboard.providers import tracked_roads
-from dashboard.providers.route_geometry import RouteLine, Stop
+from dashboard.providers.route_geometry import RouteGeometry, RouteLine, Stop
 from dashboard.providers.tracked_roads import (
     FALLBACK_ROADS,
     TrackedRoads,
@@ -120,6 +120,35 @@ def test_match_is_case_insensitive_and_apostrophe_tolerant():
     assert roads.match("Accident on CLEAR WATER BAY ROAD") == ["clear water bay road"]
     assert roads.match("Hiram\u2019s Highway closure") == ["hiram's highway"]
     assert roads.match("Nathan Road works") == []
+
+
+def test_official_bilingual_names_match_whole_names_and_preserve_new_road():
+    roads = tracked_roads.with_official_names(fallback_roads(), {
+        "clear water bay road": ("清水灣道",),
+        "new clear water bay road": ("新清水灣道",),
+        "lung cheung road": ("龍翔道",),
+        "hiram's highway": ("西貢公路",),
+        "untracked road": ("不相關道路",),
+    })
+    assert roads.match("新清水灣道交通擠塞") == ["new clear water bay road"]
+    assert roads.match("龍翔道往清水灣道擠塞") == ["lung cheung road", "clear water bay road"]
+    assert roads.match("西貢公路擠塞") == ["hiram's highway"]
+    assert roads.match("不相關道路") == []
+
+
+def test_osm_chinese_names_survive_cache_and_timestamp_roundtrip(tmp_path):
+    ways = collect_way_roads({"elements": [{
+        "type": "way", "tags": {
+            "highway": "primary", "name:en": "Lung Cheung Road", "name:zh": "龍翔道",
+        }, "geometry": [{"lat": 22.33, "lon": 114.2}, {"lat": 22.33, "lon": 114.21}],
+    }]})
+    roads = replace_fetched_at(build_tracked_roads(
+        [_line("91", ["Lung Cheung Road"])], [["Lung Cheung Road"]], ways,
+    ), 1234)
+    tracked_roads._save_disk_cache(roads, str(tmp_path))
+    loaded = tracked_roads._load_disk_cache(str(tmp_path))
+    assert loaded.match("龍翔道") == ["lung cheung road"]
+    assert loaded.routes_for_text("龍翔道") == ["91"]
 
 
 def test_routes_for_text_unions_matched_roads():
@@ -503,3 +532,26 @@ async def test_shutdown_background_refreshes_drains_registry():
     assert task.cancelled()
     assert tracked_roads._refresh_tasks == {}
     assert tracked_roads._refresh_retry_after == {}
+
+
+@pytest.mark.asyncio
+async def test_official_geometry_recovers_when_overpass_fails(monkeypatch, tmp_path):
+    path = [(22.333, 114.26), (22.333, 114.27)]
+
+    async def geometry(*_args, **_kwargs):
+        return RouteGeometry(routes=[RouteLine("91", "KMB", "outbound", path=path)])
+
+    async def overpass(*_args, **_kwargs):
+        raise TimeoutError("source unavailable")
+
+    async def official(_client, paths):
+        assert paths == [path]
+        return [{"name_en": "CLEAR WATER BAY ROAD", "name_zh": "清水灣道", "points": path}]
+
+    monkeypatch.setattr(tracked_roads, "fetch_route_geometry", geometry)
+    monkeypatch.setattr(tracked_roads, "_fetch_overpass", overpass)
+    monkeypatch.setattr(tracked_roads, "fetch_official_road_ways", official)
+    result = await tracked_roads._refresh_roads(object(), str(tmp_path))
+    assert result.source == "landsd"
+    assert result.routes_for_text("清水灣道") == ["91"]
+    assert tracked_roads._load_disk_cache(str(tmp_path)).source == "landsd"

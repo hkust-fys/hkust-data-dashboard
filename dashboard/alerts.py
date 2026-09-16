@@ -57,6 +57,9 @@ class AlertState:
     warning_codes: frozenset[str] = frozenset()
     warning_names: dict[str, str] = field(default_factory=dict)
     traffic_incidents: frozenset[str] = frozenset()
+    traffic_incident_sources: dict[str, str] = field(default_factory=dict)
+    traffic_incident_report_ids: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
+    active_incident_road_episodes: set[tuple[str, str]] = field(default_factory=set)
     roadworks: frozenset[str] = frozenset()
     roadwork_labels: dict[str, str] = field(default_factory=dict)
     red_streaks: dict[str, int] = field(default_factory=dict)
@@ -76,6 +79,7 @@ class AlertEvent:
     critical: bool = False
     ping: bool = False
     source_text: str = ""
+    source_label: str = "TD"
 
 
 @dataclass
@@ -85,6 +89,27 @@ class AlertMonitor:
     state: AlertState = field(default_factory=AlertState)
     roads: object | None = None  # TrackedRoads table for names/affected routes
     _initialized: bool = False
+
+    @staticmethod
+    def _incident_key(incident: TrafficIncident) -> str:
+        if incident.reconciliation_key:
+            return f"{incident.reconciliation_key}:{'cleared' if incident.is_cleared else 'active'}"
+        return incident.identifier or incident.title
+
+    @staticmethod
+    def _report_stamp(incident: TrafficIncident, now: datetime) -> str:
+        if incident.announcement_time:
+            return f"<t:{int(incident.announcement_time.timestamp())}:t>"
+        if incident.page_updated_at:
+            return f"page updated <t:{int(incident.page_updated_at.timestamp())}:t>"
+        return f"observed <t:{int(now.timestamp())}:t>"
+
+    @staticmethod
+    def _report_ids(incident: TrafficIncident) -> frozenset[tuple[str, str]]:
+        return frozenset(
+            (report.source, report.identifier or report.description or report.title)
+            for report in (incident, *incident.related_reports)
+        )
 
     def _claim_road_alert(self, road_keys: set[str]) -> bool:
         """Claim one shared one-hour role-alert window for the matched roads."""
@@ -143,28 +168,69 @@ class AlertMonitor:
     def _incident_events(
         self, incidents: list[TrafficIncident], now: datetime
     ) -> list[AlertEvent]:
-        current = frozenset(incident.identifier or incident.title for incident in incidents)
+        current = frozenset(self._incident_key(incident) for incident in incidents)
         events: list[AlertEvent] = []
+        active_episodes: set[tuple[str, str]] = set()
+        closed_episodes: set[tuple[str, str]] = set()
         for incident in incidents:
-            key = incident.identifier or incident.title
-            if key not in self.state.traffic_incidents:
+            key = self._incident_key(incident)
+            road_keys = self._incident_road_keys(incident)
+            # A second publisher corroborating an ongoing jam is not a new
+            # congestion start, even after the one-hour delivery cooldown.
+            episode_keys = {("news", road_key) for road_key in road_keys}
+            if incident.is_cleared:
+                closed_episodes.update(episode_keys)
+            else:
+                active_episodes.update(episode_keys)
+            if key not in self.state.traffic_incidents or self._report_ids(incident) - self.state.traffic_incident_report_ids.get(key, frozenset()):
                 road = incident.road or incident.location
                 suffix = f" — {road}" if road else ""
+                if incident.affected_routes:
+                    scope = (
+                        "likely affected (location unspecified)"
+                        if incident.location_resolution == "road_coverage"
+                        else "buses through section"
+                    )
+                    suffix += f"\n{scope}: {', '.join(incident.affected_routes)}"
+                source_label = " / ".join(report.source for report in (incident, *incident.related_reports))
+                source_text = incident.description
+                if incident.related_reports:
+                    source_text = "\n\n".join(
+                        f"**{report.source} · {self._report_stamp(report, now)}**\n{report.description}"
+                        for report in (incident, *incident.related_reports)
+                    )
+                starting_roads = {
+                    road_key
+                    for source, road_key in episode_keys
+                    if (source, road_key)
+                    not in self.state.active_incident_road_episodes
+                }
                 events.append(
                     AlertEvent(
-                        text=f"📢 **{incident.title}**{suffix} "
-                        f"(<t:{int(now.timestamp())}:t>)",
-                        ping=self._claim_road_alert(self._incident_road_keys(incident)),
-                        source_text=incident.description,
+                        text=f"📢 **{source_label}: {incident.title}**{suffix} "
+                             f"({self._report_stamp(incident, now)})",
+                        ping=(not incident.is_cleared)
+                        and bool(starting_roads)
+                        and self._claim_road_alert(starting_roads),
+                        source_text=source_text,
+                        source_label=source_label,
                     )
                 )
         for key in sorted(self.state.traffic_incidents - current):
+            source = self.state.traffic_incident_sources.get(key, "TD")
             events.append(
                 AlertEvent(
-                    text=f"✅ TD traffic notice cleared: **{key}** "
+                    text=f"ℹ️ {source} traffic notice no longer listed: **{key}** "
                     f"(<t:{int(now.timestamp())}:t>)"
                 )
             )
+        # Missing source rows are not evidence that congestion ended. Keep an
+        # episode active until an explicit cleared item arrives; an active
+        # sibling on the same road wins over a cleared sibling/source conflict.
+        self.state.active_incident_road_episodes.update(active_episodes)
+        self.state.active_incident_road_episodes.difference_update(
+            closed_episodes - active_episodes
+        )
         return events
 
     def _incident_road_keys(self, incident: TrafficIncident) -> set[str]:
@@ -222,9 +288,13 @@ class AlertMonitor:
         events: list[AlertEvent] = []
         state = self.state
         current_reds: dict[str, object] = {}
+        observed_non_reds: set[str] = set()
         for status in statuses:
             bands = [o.band for o in status.observations if o.band is not None]
-            if not bands or any(band.value != "red" for band in bands):
+            if not bands:
+                continue
+            if any(band.value != "red" for band in bands):
+                observed_non_reds.add(status.name)
                 continue
             current_reds[status.name] = status
 
@@ -249,7 +319,7 @@ class AlertMonitor:
                 )
             )
 
-        for name in sorted(set(state.active_reds) - set(current_reds)):
+        for name in sorted(set(state.active_reds).intersection(observed_non_reds)):
             state.active_reds.discard(name)
             events.append(self._congestion_event(name, None, now, cleared=True))
         # A red reading that does not persist must not bank progress toward
@@ -264,10 +334,6 @@ class AlertMonitor:
     ) -> AlertEvent:
         roads = self.roads
         display = roads.display_name(name) if roads is not None else name
-        routes: list[str] = []
-        if roads is not None:
-            routes = roads.routes_for_keys([name])
-        suffix = f" — affects: {', '.join(routes)}" if routes else ""
         stamp = f" (<t:{int(now.timestamp())}:t>)"
         if cleared:
             return AlertEvent(text=f"✅ Congestion easing on **{display}**{stamp}")
@@ -279,7 +345,7 @@ class AlertMonitor:
         if speeds:
             speed_text = f" ({min(speeds):.0f} km/h)"
         return AlertEvent(
-            text=f"🚗 Heavy congestion on **{display}**{speed_text}{suffix}{stamp}",
+            text=f"🚗 Heavy congestion on **{display}**{speed_text}{stamp}",
             ping=ping,
         )
 
@@ -313,8 +379,14 @@ class AlertMonitor:
         self.state.warning_codes = frozenset(w.code for w in warnings)
         self.state.warning_names = {w.code: w.name for w in warnings}
         self.state.traffic_incidents = frozenset(
-            incident.identifier or incident.title for incident in current_incidents
+            self._incident_key(incident) for incident in current_incidents
         )
+        self.state.traffic_incident_sources = {
+            self._incident_key(incident): incident.source for incident in current_incidents
+        }
+        self.state.traffic_incident_report_ids = {
+            self._incident_key(incident): self._report_ids(incident) for incident in current_incidents
+        }
         self.state.roadworks = frozenset(
             self._roadwork_key(roadwork) for roadwork in current_roadworks
         )
@@ -337,7 +409,7 @@ class AlertMonitor:
         """Render bounded thread messages while retaining the complete TD notice."""
         text = self.ping_for(event, role_id)
         if event.source_text:
-            text = f"{text}\n\n**Full TD source text:**\n{event.source_text}"
+            text = f"{text}\n\n**Full {event.source_label} source text:**\n{event.source_text}"
         return [
             text[start : start + DISCORD_MESSAGE_CONTENT_LIMIT]
             for start in range(0, len(text), DISCORD_MESSAGE_CONTENT_LIMIT)

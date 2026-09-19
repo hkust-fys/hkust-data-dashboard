@@ -7,6 +7,7 @@ fails fast instead of crashing inside the update loop.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -39,7 +40,7 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
         value = float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
-    if value < minimum:
+    if not math.isfinite(value) or value < minimum:
         raise ConfigError(f"{name} must be >= {minimum}, got {value}")
     return value
 
@@ -57,6 +58,7 @@ class Settings:
     log_level: str = "INFO"
     cache_dir: str = field(default=".cache")
     alert_role_id: int | None = None  # pinged on heavy congestion only
+    rthk_news_max_age_hours: float = 3.0
     ffmpeg_executable: str | None = field(default=None, repr=False)
 
     @classmethod
@@ -100,4 +102,7 @@ class Settings:
             log_level=log_level,
             cache_dir=os.getenv("CACHE_DIR", ".cache").strip() or ".cache",
             alert_role_id=alert_role_id,
+            rthk_news_max_age_hours=_env_float(
+                "RTHK_NEWS_MAX_AGE_HOURS", 3.0, minimum=0.01
+            ),
         )

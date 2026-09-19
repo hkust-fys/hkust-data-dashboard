@@ -17,7 +17,7 @@ from urllib.parse import urljoin, urlparse
 
 from PIL import Image, UnidentifiedImageError
 
-from dashboard.http import CachedFetch, FetchError, HttpClient, as_datetime
+from dashboard.http import CachedFetch, FetchError, HttpClient, as_datetime, safe_endpoint
 from dashboard.models import WeatherSnapshot, WeatherWarning
 
 log = logging.getLogger(__name__)
@@ -369,6 +369,7 @@ def parse_warnings(
     warning_info: dict[str, Any] | None = None,
     icon_map: dict[str, str] | None = None,
     warning_metadata: dict[str, tuple[str, str]] | None = None,
+    warning_catalog: dict[str, str] | None = None,
 ) -> list[WeatherWarning]:
     """Normalize warnsum + warningInfo into ordered WeatherWarning objects."""
     info_map = _warning_info_map(warning_info)
@@ -386,6 +387,12 @@ def parse_warnings(
             code,
         )
         name = live_name if payload.get("type") or payload.get("name") else metadata_name or code
+        # warnsum also carries official names. An unavailable wxwarntoday
+        # response must not disable icons present in the validated catalog.
+        if not source_icon and warning_catalog:
+            source_icon = warning_catalog.get(_normalize_warning_label(name), "")
+            if not _is_static_warning_png_url(source_icon):
+                source_icon = ""
         info = info_map.get(code) or info_map.get(str(family), {})
         summary = info.get("summary") or ""
         action = info.get("action") or ""
@@ -433,6 +440,9 @@ async def _fetch_warning_icons(
         if (
             not _is_static_warning_png_url(warning.icon_url)
         ):
+            log.warning(
+                "HKO warning icon unavailable code=%s reason=no_static_png_metadata", warning.code,
+            )
             return
         cached = _warning_icon_cache.get(warning.icon_url)
         if cached is not None:
@@ -441,18 +451,31 @@ async def _fetch_warning_icons(
         try:
             data = await client.fetch_bytes(warning.icon_url, max_bytes=_WARNING_ICON_MAX_BYTES)
         except Exception as exc:  # noqa: BLE001
-            log.warning("HKO warning icon fetch failed for %s: %s", warning.code, exc)
+            log.warning(
+                "HKO warning icon fetch failed code=%s endpoint=%s error=%s: %s",
+                warning.code, safe_endpoint(warning.icon_url), type(exc).__name__, exc,
+            )
             return
         try:
             normalized = _normalize_warning_icon(data)
-        except (OSError, UnidentifiedImageError, Image.DecompressionBombError):
-            log.warning("HKO warning icon response was not a valid image for %s", warning.code)
+        except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+            log.warning(
+                "HKO warning icon rejected code=%s endpoint=%s bytes=%d error=%s",
+                warning.code, safe_endpoint(warning.icon_url), len(data), type(exc).__name__,
+            )
             return
         if normalized is None:
-            log.warning("HKO warning icon response had no usable frame for %s", warning.code)
+            log.warning(
+                "HKO warning icon rejected code=%s endpoint=%s bytes=%d reason=no_usable_static_png",
+                warning.code, safe_endpoint(warning.icon_url), len(data),
+            )
             return
         _warning_icon_cache[warning.icon_url] = normalized
         warning.icon_data = normalized
+        log.info(
+            "HKO warning icon cached code=%s endpoint=%s bytes=%d",
+            warning.code, safe_endpoint(warning.icon_url), len(normalized),
+        )
 
     await asyncio.gather(*(load(warning) for warning in warnings))
 
@@ -535,7 +558,7 @@ async def fetch_weather_conditions(
     )
     warntoday_raw: dict[str, Any] = {}
     if isinstance(metadata_result, Exception):
-        log.warning("HKO wxwarntoday fetch failed (icons fall back to text): %s", metadata_result)
+        log.warning("HKO wxwarntoday fetch failed (using warnsum names for icons): %s", metadata_result)
     else:
         _, warntoday_raw, _ = metadata_result
     catalog: dict[str, str] = {}
@@ -547,7 +570,9 @@ async def fetch_weather_conditions(
     warning_metadata = _warning_metadata_from_warntoday(warntoday_raw, catalog)
 
     if warn_raw:
-        warnings = parse_warnings(warn_raw, info_raw, warning_metadata=warning_metadata)
+        warnings = parse_warnings(
+            warn_raw, info_raw, warning_metadata=warning_metadata, warning_catalog=catalog
+        )
         await _fetch_warning_icons(client, warnings)
 
     return snapshot, warnings, warn_time

@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field, replace
 
@@ -168,7 +169,8 @@ class TrackedRoads:
         return _sorted_routes(matched)
 
     def display_name(self, key: str) -> str:
-        return self.display_names.get(key, key.replace("-", " ").title())
+        name = self.display_names.get(key, key.replace("-", " ").title())
+        return re.sub(r"(?<=[a-z])(['’])S\b", r"\1s", name)
 
     def segments_near(
         self,

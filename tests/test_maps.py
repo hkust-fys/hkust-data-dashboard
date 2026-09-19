@@ -775,6 +775,185 @@ async def test_capture_page_settles_through_placeholders_before_valid_export(mon
 
 
 @pytest.mark.asyncio
+async def test_stability_failure_retains_last_invalid_canvas_cause(monkeypatch):
+    class Page:
+        async def wait_for_selector(self, *_args, **_kwargs):
+            pass
+
+    async def invalid_export(_page, _viewport):
+        raise ValueError("map canvas export was a low-information loading placeholder")
+
+    monkeypatch.setattr(tiles, "_export_page_canvas", invalid_export)
+    monkeypatch.setattr(tiles, "PAGE_PREPARATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(tiles, "CANVAS_STABILITY_INTERVAL_SECONDS", 0.0)
+    with pytest.raises(ValueError, match="last invalid canvas") as failure:
+        await tiles._wait_for_stable_capture_page(
+            Page(), ("https://example.test/maps", (40, 20))
+        )
+    assert "low-information loading placeholder" in str(failure.value)
+    assert isinstance(failure.value.__cause__, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_prepare_logs_last_invalid_canvas_before_outer_timeout(monkeypatch, caplog):
+    class Page:
+        async def goto(self, *_args, **_kwargs):
+            pass
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            pass
+
+        async def evaluate(self, _script):
+            return {"canvasCount": 1, "title": "Google Maps", "bodyText": ""}
+
+        async def close(self):
+            pass
+
+    class Context:
+        async def new_page(self):
+            return Page()
+
+        async def close(self):
+            pass
+
+    class Browser:
+        async def new_context(self, **_kwargs):
+            return Context()
+
+    async def invalid_export(_page, _viewport):
+        raise ValueError("map canvas export was a low-information loading placeholder")
+
+    monkeypatch.setattr(tiles, "_get_shared_browser", lambda: _resolved(Browser()))
+    monkeypatch.setattr(tiles, "_export_page_canvas", invalid_export)
+    monkeypatch.setattr(tiles, "PAGE_PREPARATION_TIMEOUT_SECONDS", 0.03)
+    monkeypatch.setattr(tiles, "CANVAS_STABILITY_INTERVAL_SECONDS", 0.0)
+    with pytest.raises(TimeoutError):
+        await tiles._prepare_capture_page(("https://example.test/maps", (40, 20)))
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "phase=stability" in messages
+    assert "type=TimeoutError" in messages
+    assert (
+        "last_invalid_canvas=map canvas export was a low-information loading placeholder"
+        in messages
+    )
+
+
+def test_error_detail_redacts_complete_authorization_and_cookie_values():
+    detail = tiles._safe_error_detail(RuntimeError(
+        "request failed\n"
+        "Authorization: Bearer bearer-secret-with-spaces\n"
+        "Cookie: session=cookie-secret; other=value\n"
+        "token=plain-secret"
+    ))
+    assert "Authorization: <redacted>" in detail
+    assert "Cookie: <redacted>" in detail
+    assert "token=<redacted>" in detail
+    assert "bearer-secret" not in detail
+    assert "cookie-secret" not in detail
+    assert "plain-secret" not in detail
+
+
+@pytest.mark.asyncio
+async def test_navigation_status_diagnostic_is_bounded_and_query_free(monkeypatch, caplog):
+    class Response:
+        status = 429
+        url = "https://example.test/maps?token=do-not-log"
+
+    class Page:
+        async def goto(self, *_args, **_kwargs):
+            return Response()
+
+        async def evaluate(self, _script):
+            return {
+                "canvasCount": 0,
+                "title": "Automated queries",
+                "bodyText": "Unusual traffic from your computer network",
+            }
+
+        async def close(self):
+            pass
+
+    class Context:
+        async def new_page(self):
+            return Page()
+
+        async def close(self):
+            pass
+
+    class Browser:
+        async def new_context(self, **_kwargs):
+            return Context()
+
+    monkeypatch.setattr(tiles, "_get_shared_browser", lambda: _resolved(Browser()))
+    with pytest.raises(RuntimeError, match="HTTP 429"):
+        await tiles._prepare_capture_page(
+            ("https://example.test/maps?key=also-secret", (40, 20))
+        )
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "phase=navigation" in messages
+    assert "endpoint=https://example.test/maps" in messages
+    assert "type=RuntimeError" in messages and "HTTP 429" in messages
+    assert "canvas_count=0 block_hint=unusual-traffic" in messages
+    assert "do-not-log" not in messages and "also-secret" not in messages
+
+
+@pytest.mark.asyncio
+async def test_page_failure_diagnostic_records_tile_429_without_query(monkeypatch, caplog):
+    handlers = {}
+
+    class Page:
+        url = "https://consent.google.com/m?continue=final-secret"
+
+        def on(self, event, callback):
+            handlers[event] = callback
+
+        async def goto(self, *_args, **_kwargs):
+            handlers["response"](SimpleNamespace(
+                status=429,
+                url="https://tiles.example.test/map/tile?token=tile-secret",
+                request=SimpleNamespace(resource_type="image"),
+            ))
+            handlers["requestfailed"](SimpleNamespace(
+                failure="net::ERR_ABORTED",
+                url="https://tiles.example.test/map/old?token=aborted-secret",
+                resource_type="xhr",
+            ))
+            return SimpleNamespace(status=200, url=tiles.GMAPS_BASE_URL)
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            raise TimeoutError()
+
+        async def evaluate(self, _script):
+            return {"canvasCount": 0, "title": "Consent", "bodyText": ""}
+
+        async def close(self):
+            pass
+
+    class Context:
+        async def new_page(self):
+            return Page()
+
+        async def close(self):
+            pass
+
+    class Browser:
+        async def new_context(self, **_kwargs):
+            return Context()
+
+    monkeypatch.setattr(tiles, "_get_shared_browser", lambda: _resolved(Browser()))
+    with pytest.raises(TimeoutError):
+        await tiles._prepare_capture_page((tiles.GMAPS_BASE_URL, (40, 20)))
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "final_endpoint=https://consent.google.com/m" in messages
+    assert "http_status=429 resource_type=image" in messages
+    assert "endpoint=https://tiles.example.test/map/tile" in messages
+    assert "tile-secret" not in messages
+    assert "final-secret" not in messages
+    assert "aborted-secret" not in messages
+    assert "ERR_ABORTED" not in messages
+
+
+@pytest.mark.asyncio
 async def test_recycle_cancellation_finishes_page_and_context_cleanup():
     page_started = asyncio.Event()
     page_release = asyncio.Event()

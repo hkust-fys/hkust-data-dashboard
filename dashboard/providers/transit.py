@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from dashboard.http import FetchError, HttpClient, RequestNotStarted
+from dashboard.http import FetchError, HttpClient, RequestNotStarted, safe_endpoint
 from dashboard.models import EtaKind, EtaRow, Operator, RouteEtaGroup
 
 log = logging.getLogger(__name__)
@@ -328,11 +328,11 @@ async def _fetch_gmb(client: HttpClient, now: datetime) -> list[EtaRow]:
                 _record_gmb_403()
                 return _gmb_gate_cache.get()
             failures.append(exc)
-            log.warning("GMB ETA request failed for %s: %s", url, exc)
+            log.warning("GMB ETA request failed for %s: %s", safe_endpoint(url), exc)
             continue
         except Exception as exc:  # noqa: BLE001
             failures.append(exc)
-            log.warning("GMB ETA request failed for %s: %s", url, exc)
+            log.warning("GMB ETA request failed for %s: %s", safe_endpoint(url), exc)
             continue
         if isinstance(result, dict):
             responses[url] = result

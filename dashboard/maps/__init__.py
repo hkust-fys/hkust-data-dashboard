@@ -20,7 +20,13 @@ from dashboard.maps.renderer import (
     project,
     render_map,
 )
-from dashboard.maps.tiles import MapCapture, capture_gmaps_base, shutdown_gmaps_browser
+from dashboard.maps.tiles import (
+    GMAPS_BASE_URL,
+    MapCapture,
+    _safe_error_detail,
+    capture_gmaps_base,
+    shutdown_gmaps_browser,
+)
 from dashboard.maps.tracker import MarkerTracker
 from dashboard.models import EtaKind, RouteEtaGroup, TrafficMapResult
 from dashboard.providers.route_geometry import (
@@ -268,7 +274,10 @@ async def fetch_traffic_map(
             return_exceptions=True,
         )
         if isinstance(capture_result, BaseException):
-            log.warning("Google traffic map capture failed: %s", type(capture_result).__name__)
+            log.warning(
+                "Google traffic map capture failed endpoint=%s type=%s detail=%s",
+                GMAPS_BASE_URL, type(capture_result).__name__, _safe_error_detail(capture_result),
+            )
         else:
             if isinstance(capture_result, MapCapture):
                 capture_metadata = capture_result

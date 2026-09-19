@@ -325,6 +325,17 @@ def _build_traffic_map_initializing_embed(
     return _set_source_timestamp(embed, "Google traffic", source_time)
 
 
+def _build_traffic_map_unavailable_embed(checked_at: datetime) -> discord.Embed:
+    """Keep map availability in the map's normal position."""
+    embed = discord.Embed(
+        title="Traffic map unavailable",
+        color=0xF59E0B,
+        description="The traffic map is temporarily unavailable.\n"
+        "🔗 [HKeMobility](https://www.hkemobility.gov.hk/)",
+    )
+    return _set_source_timestamp(embed, "Dashboard check", checked_at)
+
+
 def _delay_text(delay_min: float) -> str:
     if delay_min < 1:
         return "<1 min"
@@ -385,6 +396,7 @@ def _road_names_for_keys(
             if chinese_aliases:
                 chinese = max(chinese_aliases, key=len)
                 english = name.title() if name.isupper() else name
+                english = re.sub(r"(['’])S\b", r"\1s", english)
                 name = f"{chinese} ({english})"
         if name not in names:
             names.append(name)
@@ -575,10 +587,9 @@ def build_payload(
     """
     payload = DashboardPayload()
     checked_at = now or datetime.now(UTC)
+    source_errors = list(errors or [])
 
-    # 1. Image-first traffic map. During incremental startup, reserve this
-    # slot even before the map provider has returned; a present-but-failed
-    # result is handled as a genuine source error below instead.
+    # 1. Reserve the map's slot during both startup and source outages.
     if traffic_map_webp:
         map_filename = traffic_map_filename(traffic_map_webp)
         map_embed = _build_traffic_map_embed(
@@ -603,6 +614,9 @@ def build_payload(
         payload.embeds.append(
             _build_traffic_map_initializing_embed(map_source_time or checked_at)
         )
+    elif "traffic map unavailable" in source_errors:
+        payload.embeds.append(_build_traffic_map_unavailable_embed(checked_at))
+        source_errors = [error for error in source_errors if error != "traffic map unavailable"]
 
     # 3. Traffic text is a separate pane so the map remains legible.
     payload.embeds.append(
@@ -637,7 +651,7 @@ def build_payload(
         payload.embeds.append(weather_embed)
 
     # 5. Source errors — visible so an unavailable provider is never silent.
-    error_embed = _build_error_embed(errors or [], checked_at)
+    error_embed = _build_error_embed(source_errors, checked_at)
     if error_embed is not None:
         payload.embeds.append(error_embed)
 

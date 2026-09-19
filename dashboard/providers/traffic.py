@@ -27,7 +27,9 @@ from dashboard.models import (
     TrafficObservation,
 )
 from dashboard.providers.traffic_news import (
+    DEFAULT_RTHK_NEWS_MAX_AGE_HOURS,
     RTHK_TRAFFIC_NEWS_URL,
+    filter_expired_rthk_incidents,
     is_cleared_notice,
     parse_rthk_traffic_news,
     rthk_latest_report_time,
@@ -935,7 +937,11 @@ async def _collect_td_news(
 
 
 async def _collect_rthk_news(
-    client: HttpClient, roads: Any
+    client: HttpClient,
+    roads: Any,
+    *,
+    rthk_news_max_age_hours: float = DEFAULT_RTHK_NEWS_MAX_AGE_HOURS,
+    now: datetime | None = None,
 ) -> tuple[list[TrafficIncident], list[str], dict[str, datetime]]:
     markers: list[str] = []
     times: dict[str, datetime] = {}
@@ -946,7 +952,11 @@ async def _collect_rthk_news(
         )
         if stale:
             markers.append("RTHK traffic news")
-        incidents = filter_relevant_incidents(parse_rthk_traffic_news(page_text, roads), roads)
+        incidents = filter_expired_rthk_incidents(
+            filter_relevant_incidents(parse_rthk_traffic_news(page_text, roads), roads),
+            now=now or datetime.now(HKT),
+            max_age_hours=rthk_news_max_age_hours,
+        )
         times["rthk_news_checked"] = datetime.fromtimestamp(fetched_at, UTC)
         report_time = rthk_latest_report_time(page_text)
         if report_time is not None:
@@ -965,6 +975,9 @@ async def _collect_rthk_news(
 async def fetch_traffic_data(
     client: HttpClient,
     roads: Any = None,
+    *,
+    rthk_news_max_age_hours: float = DEFAULT_RTHK_NEWS_MAX_AGE_HOURS,
+    now: datetime | None = None,
 ) -> tuple[
     list[TrafficCorridorStatus],
     list[TrafficIncident],
@@ -1016,7 +1029,12 @@ async def fetch_traffic_data(
 
     td_news, rthk_news = await asyncio.gather(
         _collect_td_news(client, roads),
-        _collect_rthk_news(client, roads),
+        _collect_rthk_news(
+            client,
+            roads,
+            rthk_news_max_age_hours=rthk_news_max_age_hours,
+            now=now,
+        ),
     )
     incidents = reconcile_incident_reports(td_news[0] + rthk_news[0], roads)
     stale_sources.extend(td_news[1])

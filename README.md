@@ -73,6 +73,7 @@ Copy `.env.example` to `.env` and set the required values. Never commit `.env`.
 | `ALERT_ROLE_ID` | optional | Role pinged for new congestion on Clear Water Bay Road / New Clear Water Bay Road |
 | `UPDATE_INTERVAL_SECONDS` | optional | Dashboard edit interval; default/minimum 10 seconds |
 | `HTTP_TIMEOUT_SECONDS` | optional | Per-request timeout; default 10 seconds |
+| `RTHK_NEWS_MAX_AGE_HOURS` | optional | Rolling RTHK report window; default 3 hours |
 | `CACHE_DIR` | optional | Bounded cache directory; default `.cache` |
 | `LOG_LEVEL` | optional | Standard Python log level; default `INFO` |
 
@@ -105,14 +106,21 @@ placement. Other public sources retain their own cadences, and their source
 timestamps—not the dashboard edit time—are displayed.
 
 The browser canvas is exported every presentation cycle (normally 10 seconds).
-A replacement Google Maps page loads in the background before the active base
-reaches one minute old. It replaces the active page only after its canvas has
-finished loading and passed stability checks. Capture time and view-refresh
+A replacement Google Maps page begins loading in the background when the active
+base reaches 20 seconds old, leaving room before the one-minute expiry. It replaces
+the active page only after its canvas has finished loading and passed stability
+checks. Capture time and view-refresh
 time are tracked separately; exporting unchanged pixels cannot renew the base's
 age. Failures retry after 10 seconds. Any retained fallback is labelled, and a
 base older than one minute is withheld.
-TD and RTHK news pages are checked independently every 60 seconds. An empty
-news result never means the roads are clear, and unavailable sources are
+During startup or an outage, the map's status notice stays in the map's usual
+first position. A map failure is not repeated in the general source-status pane.
+TD and RTHK news pages are checked independently every 60 seconds. RTHK reports
+with publication timestamps older than `RTHK_NEWS_MAX_AGE_HOURS` (default 3) are
+hidden, including when a cached snapshot is presented. TD supplies a current
+notice list and a page-level clock rather than individual publication times,
+so TD notices remain while the page lists them. Aging out is not a clearance.
+An empty news result never means the roads are clear, and unavailable sources are
 distinguished from a successfully checked page with no matching reports.
 The incomplete special-traffic-news XML feed is excluded from runtime news
 collection; TD detector measurements continue to use their separate XML feed.
@@ -123,6 +131,12 @@ good copy for at most 90 days. OSM bilingual tags supplement it. Road membership
 is derived from official bus-route geometry, with LandsD centreline geometry
 available when Overpass fails.
 
+The dashboard retains its starter message regardless of age. Discord edit
+cooldowns delay the next edit using the server retry interval (60 seconds when
+none is supplied); they do not replace the message or its thread. Providers and
+thread delivery continue during an edit cooldown. Only a confirmed missing
+message starts rediscovery and, if necessary, creates one replacement.
+
 Weather warning changes and all relevant road reports go to the thread attached
 to the dashboard message. An existing attached thread is reused; otherwise the
 bot creates it from that message. RTHK matches show Chinese road names followed
@@ -130,6 +144,7 @@ by English names. Each TD report shows the page's update time, labelled as such;
 RTHK reports show their individual publication times. TD's synchronized Chinese
 page assists exact bilingual reconciliation. Unambiguous reports of the same
 road, direction, landmark, cause and state share one entry with both source texts.
+The known Tseng Lan Shue / 井欄樹 / 井欄村 name variants share one landmark identity.
 Conflicting or ambiguous reports remain separate, and a second source's
 corroboration posts silently. The traffic links share one row; the map link is
 labelled HKeMobility.
@@ -149,9 +164,34 @@ updates never ping. Google traffic colours alone are not proof of a reportable
 incident or the upstream data's age.
 
 HKO warning icons are static official PNGs stitched into one PNG strip. Icon
-bytes and the composed strip are cached; unchanged warnings reuse the uploaded
-image while its Discord attachment URL remains valid. Changed warnings or an
-expired attachment URL trigger a new upload.
+bytes and the composed strip are cached; unchanged warnings retain their actual
+Discord attachment on edits. If the attachment is missing, the strip is uploaded
+again rather than relying on a temporary CDN URL. Official warnsum names can
+also resolve icons from the HKO catalog when the optional metadata feed fails.
+
+Diagnostics go to stderr and `CACHE_DIR/logs/dashboard.log`, with three rotated
+backups of at most 5 MiB each (20 MiB including the current file). If the log
+directory is unwritable, console logging continues. Timestamps are UTC; every
+entry includes a process ID and run ID. Startup records a fingerprint of the
+actual Python source, dependency versions, and relevant non-secret settings,
+so logs can distinguish deployed builds and process restarts.
+
+HTTP failures include the sanitized endpoint, method, error type/status, attempt,
+request duration, timeout, retry delay and available `Retry-After` delay. Serving
+stale HTTP data records its cache age and TTL. Google Maps diagnostics distinguish
+expired or invalid caches, replacement loading, and page/tile HTTP or network
+failures. Dashboard logs identify message/thread IDs, discovery and deletion
+reasons, effective missing permissions, queued updates and delivery outcomes.
+Warning diagnostics identify missing metadata, rejected images and cached icons.
+
+At `INFO`, a dashboard health record reports map availability and capture/base
+ages, missing warning icons, thread identity and queued alerts on changes and
+every five minutes. `LOG_LEVEL=DEBUG` adds attachment upload/reuse details and
+repeated map fallback diagnostics. Discord's raw REST/gateway debug bodies stay
+disabled. Credentials, arbitrary URL queries, sensitive headers, exception
+locals and source snippets are excluded from the configured handlers.
+For a deployed failure, retain the startup entry and the entries around the
+failure from `dashboard.log` and its rotated backups.
 
 ## Test
 

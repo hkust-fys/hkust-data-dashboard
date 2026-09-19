@@ -6,6 +6,18 @@ alerts, live-view button interactions, durable state, and the updater-owned
 camera refresh task. It receives completed snapshots from dashboard.pipeline
 and edits one message in place.
 
+dashboard.diagnostics configures console and bounded rotating files explicitly
+at startup. UTC timestamps, process/run IDs and a Python-source fingerprint
+identify deployments without shelling out to Git. Formatters redact credentials,
+URL queries and sensitive headers; exception traces retain call sites and cause
+types without locals or source snippets. Discord wire-body debug logs remain
+disabled. Runtime logs record message/thread lifecycle operations and delivery
+outcomes, plus displayed availability transitions and five-minute health records.
+The shared HTTP layer records failed attempts, request durations, retry evidence
+and stale cache ages. Maps keeps only four recent sanitized page request failures
+and logs cache/expiry/warming reasons; repeated identical fallback warnings are
+demoted to debug. Logging does not change retries, source TTLs or freshness bounds.
+
 dashboard.pipeline coordinates isolated provider calls using the injected
 HttpClient. Transit, weather, traffic, and tracked-road results can publish
 retained or fresh data independently. Route geometry is refreshed and consumed
@@ -17,26 +29,33 @@ capture before adapting the result for dashboard.render.
 
 Map results carry separate canvas-export and verified-page timestamps through
 the renderer. The active page is exported each 10-second presentation cycle;
-a second page warms in the background and replaces it only after complete,
-stable canvas checks. The page/base has a hard one-minute lifetime, independent
+a second page begins warming at 20 seconds of active-page age and replaces it
+only after complete, stable canvas checks. The page/base has a hard one-minute lifetime, independent
 of repeated exports. Failed captures retry after 10 seconds; retained fallback
 is labelled, and exports older than 30 seconds are stale. Neither render time
 nor disk writes can extend the verified page's freshness.
 The separate "Markers refreshed" clock records overlay rendering and never
 extends the Google base's lifetime. The legend shows live ETA samples for all
 operators and scheduled samples for KMB and GMB only.
+The renderer preserves the map's first embed slot for initializing and unavailable
+states. A map outage is removed from the general source-status pane once shown
+there, while other provider failures remain visible.
 
 Traffic notices combine TD's full special-news page and RTHK's current Chinese
 traffic-news page, independently cached for 60 seconds. The incomplete special
 news XML feed is excluded from runtime collection; it cannot establish the
 current active list. Reports are attributed and
-matched by road aliases in their text. Clearance reports remain visible, but
+matched by road aliases in their text. Timestamped RTHK reports expire after a
+configurable three-hour window, rechecked during collection, presentation, map
+annotations and alert delivery. TD remains governed by current-page membership.
+Expiry does not establish clearance. Clearance reports remain visible, but
 do not produce affected-road rails or congestion role pings. Each TD report
 carries the page update clock, explicitly distinguished from RTHK's per-report
 publication time. The two TD locale pages are fetched concurrently: equal page
 clocks/counts and unique road/cause/state pairs permit official Chinese sidecars.
 Cross-source grouping additionally requires exact direction/landmark/state and
-a unique report pair within three hours. Grouping retains both attributed texts;
+a unique report pair within three hours. The finite Tseng Lan Shue Chinese name
+variants share one landmark identity. Grouping retains both attributed texts;
 ambiguous or conflicting reports stay separate. Source checks remain internal
 freshness metadata rather than a repeated timestamp on each link.
 
@@ -67,13 +86,19 @@ allow the configured traffic role; all user/everyone mentions remain disabled.
 Startup diagnoses whether Discord permissions permit that role to be mentioned.
 Thread identity follows the dashboard starter-message ID. Reuse its attached
 thread or create one through the message; an unrelated saved thread is never
-adopted. A replacement dashboard gets its own attached thread, while queued
+adopted. There is no age-based message replacement. Edit-limit responses defer
+edits of the same message using Discord retry metadata, with a 60-second fallback;
+thread updates continue. Thread creation handles an already-created race by
+fetching the starter ID and uses the channel default archive interval.
+Unarchiving retains discord.py's returned thread object. A replacement for a
+confirmed missing dashboard gets its own attached thread, while queued
 alerts retain their delivery policy.
 
 HKO warning assets accept static PNG data only. A bounded composition cache
 reuses the strip for unchanged icons. Discord edits retain matching attachment
-objects or a matching, unexpired warning-thumbnail URL from the current
-channel's Discord CDN; an expired URL or changed icon set requires an upload.
+objects. A missing attachment or changed icon set requires an upload: a CDN URL
+alone cannot retain a file omitted from an edit. The static catalog can resolve
+warnsum's official names even if wxwarntoday metadata is unavailable.
 
 The map renderer draws the required traffic screenshot as its base, then adds
 verified stop markers, estimated bus positions, route labels, and scoped

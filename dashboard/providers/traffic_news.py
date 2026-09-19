@@ -7,7 +7,9 @@ the current tracked-road table.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any
@@ -17,6 +19,7 @@ from dashboard.models import TrafficIncident
 
 HKT = timezone(timedelta(hours=8))
 RTHK_TRAFFIC_NEWS_URL = "https://programme.rthk.hk/channel/radio/trafficnews/index.php"
+DEFAULT_RTHK_NEWS_MAX_AGE_HOURS = 3.0
 
 _CLEARED = re.compile(
     r"(?:已清理|已清場|已拖走|交通回復正常|已解封|重新開放|"
@@ -115,6 +118,46 @@ def rthk_latest_report_time(html_text: str) -> datetime | None:
     )
 
 
+def filter_expired_rthk_incidents(
+    incidents: list[TrafficIncident],
+    *,
+    now: datetime,
+    max_age_hours: float = DEFAULT_RTHK_NEWS_MAX_AGE_HOURS,
+) -> list[TrafficIncident]:
+    """Drop known-old RTHK reports while retaining TD evidence unchanged.
+
+    The RTHK page is a rolling stream rather than TD's current active list.
+    Filtering occurs after the raw page is cached, so a retained stale page is
+    re-evaluated against ``now`` on every collection or presentation.  An
+    absent or malformed source timestamp is kept conservatively: it cannot
+    prove a report is old.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    if not math.isfinite(max_age_hours) or max_age_hours <= 0:
+        raise ValueError("max_age_hours must be positive")
+
+    cutoff = now - timedelta(hours=max_age_hours)
+
+    def keep(report: TrafficIncident) -> bool:
+        if report.source.casefold() != "rthk":
+            return True
+        published_at = report.announcement_time
+        if published_at is None or published_at.tzinfo is None or published_at.utcoffset() is None:
+            return True
+        return published_at >= cutoff
+
+    retained: list[TrafficIncident] = []
+    for incident in incidents:
+        if not keep(incident):
+            continue
+        related_reports = tuple(report for report in incident.related_reports if keep(report))
+        if related_reports != incident.related_reports:
+            incident = replace(incident, related_reports=related_reports)
+        retained.append(incident)
+    return retained
+
+
 def parse_rthk_traffic_news(html_text: str, roads: Any) -> list[TrafficIncident]:
     """Parse relevant reports from RTHK's current (unparameterized) page."""
     parser = _RthkPageParser()
@@ -156,7 +199,9 @@ def parse_rthk_traffic_news(html_text: str, roads: Any) -> list[TrafficIncident]
 
 
 __all__ = [
+    "DEFAULT_RTHK_NEWS_MAX_AGE_HOURS",
     "RTHK_TRAFFIC_NEWS_URL",
+    "filter_expired_rthk_incidents",
     "is_cleared_notice",
     "parse_rthk_traffic_news",
 ]

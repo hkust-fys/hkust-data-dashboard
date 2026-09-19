@@ -10,18 +10,115 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import aiohttp
 
 log = logging.getLogger(__name__)
 
 USER_AGENT = "hkust-data-dashboard/2.0 (+https://github.com/hkust-fys/hkust-data-dashboard)"
+
+_HKO_API_HOST = "data.weather.gov.hk"
+_HKO_API_PATH = "/weatherAPI/opendata/weather.php"
+_HKO_SAFE_QUERY_VALUES = {
+    "dataType": frozenset({"rhrread", "warnsum", "warningInfo"}),
+    "lang": frozenset({"en", "tc"}),
+}
+_SAFE_FETCH_ERROR_DETAILS = frozenset(
+    {
+        "HKO warning details contained no usable static PNG catalog",
+        "No route extent for official road lookup",
+        "Invalid route extent for official road lookup",
+        "Invalid official road geometry response",
+        "Invalid official road coordinates",
+        "Official road geometry was empty",
+        "Official road geometry exceeded pagination limit",
+        "Invalid complete road geometry",
+        "Invalid road coordinate",
+        "Incomplete road pagination",
+        "Invalid TD special news XML",
+        "Invalid TD special news HTML",
+        "Unrecognized TD special news item schema",
+        "Unrecognized TD special news page",
+        "Unrecognized TD Chinese special news page",
+        "Invalid RTHK traffic news HTML",
+        "Unrecognized RTHK traffic news page",
+    }
+)
+
+
+def safe_endpoint(url: str) -> str:
+    """Return a log-safe endpoint, retaining only allowlisted HKO selectors."""
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+    except (TypeError, ValueError):
+        return "<invalid endpoint>"
+    if not hostname:
+        return "<invalid endpoint>"
+
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    authority = (
+        f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    )
+    if port is not None:
+        authority = f"{authority}:{port}"
+
+    # Discord webhook tokens are path components, not query parameters. Hide
+    # both webhook path credentials so a failure cannot expose either value.
+    path_parts = parsed.path.split("/")
+    for index, part in enumerate(path_parts):
+        if part.casefold() == "webhooks":
+            for secret_index in (index + 1, index + 2):
+                if secret_index < len(path_parts):
+                    path_parts[secret_index] = "<redacted>"
+            break
+    path = "/".join(path_parts) or "/"
+
+    prefix = f"{parsed.scheme.lower()}://" if parsed.scheme else "//"
+    endpoint = f"{prefix}{authority}{path}"
+
+    if parsed.hostname.casefold() == _HKO_API_HOST and parsed.path == _HKO_API_PATH:
+        try:
+            query_parts = parse_qsl(
+                parsed.query, keep_blank_values=False, max_num_fields=12
+            )
+        except ValueError:
+            query_parts = []
+        safe_values: dict[str, str] = {}
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for key, value in query_parts:
+            allowed_values = _HKO_SAFE_QUERY_VALUES.get(key)
+            if allowed_values is None:
+                continue
+            if key in seen:
+                duplicates.add(key)
+                safe_values.pop(key, None)
+                continue
+            seen.add(key)
+            if value in allowed_values:
+                safe_values[key] = value
+        for key in duplicates:
+            safe_values.pop(key, None)
+        safe_query = [
+            (key, safe_values[key])
+            for key in ("dataType", "lang")
+            if key in safe_values
+        ]
+        if safe_query:
+            endpoint += f"?{urlencode(safe_query)}"
+    return endpoint
 
 
 def _with_user_agent(headers: dict[str, str] | None) -> dict[str, str]:
@@ -56,11 +153,132 @@ ORIGIN_REQUEST_INTERVAL_OVERRIDES_SECONDS = {
 
 
 class FetchError(RuntimeError):
-    """Raised when a fetch fails validation (status, size, content type)."""
+    """Raised when an HTTP request or response validation fails."""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        method: str | None = None,
+        endpoint: str | None = None,
+        error_type: str | None = None,
+        safe_detail: str | None = None,
+        retry_after_s: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.method = method
+        self.endpoint = endpoint
+        self.error_type = error_type
+        self.safe_detail = safe_detail
+        self.retry_after_s = retry_after_s
+
+
+def _http_failure(
+    method: str,
+    url: str,
+    error_type: str,
+    *,
+    status_code: int | None = None,
+    safe_detail: str | None = None,
+    retry_after_s: float | None = None,
+) -> FetchError:
+    """Build a failure from sanitized request context and diagnostic detail."""
+    method = method.upper()
+    endpoint = safe_endpoint(url)
+    message = f"{method} {endpoint} failed: {error_type}"
+    if status_code is not None:
+        message += f" (HTTP {status_code})"
+    if safe_detail:
+        message += f": {safe_detail}"
+    return FetchError(
+        message,
+        status_code=status_code,
+        method=method,
+        endpoint=endpoint,
+        error_type=error_type,
+        safe_detail=safe_detail,
+        retry_after_s=retry_after_s,
+    )
+
+
+def _with_http_context(method: str, url: str, error: Exception) -> FetchError:
+    """Attach safe request context to transport and typed-fetch failures."""
+    status_code = error.status_code if isinstance(error, FetchError) else None
+    error_type = error.error_type if isinstance(error, FetchError) else None
+    if status_code is not None:
+        error_type = "HTTPStatusError"
+    if not error_type:
+        error_type = type(error).__name__
+    safe_detail = None
+    if isinstance(error, FetchError):
+        if error.safe_detail in _SAFE_FETCH_ERROR_DETAILS:
+            safe_detail = error.safe_detail
+        elif str(error) in _SAFE_FETCH_ERROR_DETAILS:
+            safe_detail = str(error)
+    retry_after_s = error.retry_after_s if isinstance(error, FetchError) else None
+    return _http_failure(
+        method,
+        url,
+        error_type,
+        status_code=status_code,
+        safe_detail=safe_detail,
+        retry_after_s=retry_after_s,
+    )
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse Retry-After into a safe delay without retaining its raw value."""
+    if not value:
+        return None
+    if len(value) > 128:
+        return None
+    value = value.strip()
+    if value.isascii() and value.isdecimal():
+        try:
+            delay = float(int(value))
+        except (OverflowError, ValueError):
+            return None
+        return delay if math.isfinite(delay) else None
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        delay = (retry_at.astimezone(UTC) - datetime.now(UTC)).total_seconds()
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return max(0.0, delay) if math.isfinite(delay) else None
+
+
+def _log_http_failure(
+    method: str,
+    url: str,
+    failure: FetchError,
+    *,
+    attempt: int,
+    total_attempts: int,
+    started_at: float,
+    timeout_s: float,
+    retry_delay_s: float | None = None,
+) -> None:
+    """Log one failed attempt using only sanitized endpoint/error metadata."""
+    fields = [
+        f"method={method.upper()}",
+        f"endpoint={failure.endpoint or safe_endpoint(url)}",
+        f"error_type={failure.error_type or type(failure).__name__}",
+        f"status_code={failure.status_code if failure.status_code is not None else '-'}",
+        f"attempt={attempt}/{total_attempts}",
+        f"elapsed_s={max(0.0, time.monotonic() - started_at):.3f}",
+        f"timeout_s={timeout_s:.3f}",
+    ]
+    if failure.retry_after_s is not None:
+        fields.append(f"retry_after_s={failure.retry_after_s:.3f}")
+    if retry_delay_s is not None:
+        fields.append(f"retry_delay_s={retry_delay_s:.3f}")
+        fields.append("retrying=true")
+    log.warning("HTTP request failed %s", " ".join(fields))
 
 
 class RequestNotStarted(RuntimeError):
@@ -180,55 +398,80 @@ class HttpClient:
         max_bytes: int = MAX_BYTES_IMAGE,
     ) -> bytes:
         """GET with bounded size; raises FetchError on bad status/content-type."""
-        last_started_error: Exception | None = None
+        last_started_error: FetchError | None = None
         for attempt in range(1, self.retry_attempts + 1):
+            attempt_started: float | None = None
             try:
                 await self._pace_origin(url)
+                attempt_started = time.monotonic()
                 async with self.session.get(
                     url,
                     headers=_with_user_agent(headers),
                     timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
                 ) as resp:
                     if resp.status != 200:
-                        raise FetchError(
-                            f"HTTP {resp.status} for {url}", status_code=resp.status
+                        retry_after_s = (
+                            _retry_after_seconds(resp.headers.get("Retry-After"))
+                            if resp.status in {429, 503}
+                            else None
+                        )
+                        raise _http_failure(
+                            "GET",
+                            url,
+                            "HTTPStatusError",
+                            status_code=resp.status,
+                            retry_after_s=retry_after_s,
                         )
                     ct = resp.headers.get("Content-Type", "")
                     content_type = ct.lower()
                     is_html = content_type.startswith(("text/html", "application/xhtml+xml"))
                     if not ct or (allow_html and not is_html) or (is_html and not allow_html):
                         # Some providers send HTML error pages on failure; treat as error.
-                        raise FetchError(f"Unexpected content type {ct!r} for {url}")
+                        raise _http_failure("GET", url, "UnexpectedContentType")
                     # read() decompresses gzip and returns the full body;
                     # a bounded read() would truncate it.
                     data = await resp.read()
                     if len(data) > max_bytes:
-                        raise FetchError(f"Response too large for {url}")
+                        raise _http_failure("GET", url, "ResponseTooLarge")
                     return data
             except RequestNotStarted:
                 if last_started_error is not None:
                     raise last_started_error from None
                 raise
             except (TimeoutError, aiohttp.ClientError, FetchError) as exc:
+                failure = _with_http_context("GET", url, exc)
                 # Retrying a forbidden request immediately amplifies an origin
                 # rate limit. Other terminal client errors are equally unlikely
                 # to recover without changing the request.
-                if (
-                    isinstance(exc, FetchError)
-                    and exc.status_code is not None
-                    and 400 <= exc.status_code < 500
-                    and exc.status_code not in {408, 429}
-                ):
-                    raise
-                if attempt >= self.retry_attempts:
-                    raise
-                last_started_error = exc
-                delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
-                log.warning(
-                    "fetch %s failed (attempt %d): %s; retrying in %.1fs", url, attempt, exc, delay
+                terminal_status = (
+                    failure.status_code is not None
+                    and 400 <= failure.status_code < 500
+                    and failure.status_code not in {408, 429}
                 )
-                await asyncio.sleep(delay)
-        raise FetchError(f"Exhausted retries for {url}")
+                retry_delay_s = None
+                if not terminal_status and attempt < self.retry_attempts:
+                    retry_delay_s = min(
+                        RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY
+                    )
+                _log_http_failure(
+                    "GET",
+                    url,
+                    failure,
+                    attempt=attempt,
+                    total_attempts=self.retry_attempts,
+                    started_at=(
+                        attempt_started
+                        if attempt_started is not None
+                        else time.monotonic()
+                    ),
+                    timeout_s=self.timeout_seconds,
+                    retry_delay_s=retry_delay_s,
+                )
+                if retry_delay_s is None:
+                    raise failure from None
+                last_started_error = failure
+                await asyncio.sleep(retry_delay_s)
+        raise _http_failure("GET", url, "RetriesExhausted")
 
     # -- typed helpers ------------------------------------------------------
 
@@ -240,7 +483,7 @@ class HttpClient:
     ) -> bytes:
         data = await self._request_bytes(url, headers, max_bytes=max_bytes)
         if len(data) > max_bytes:
-            raise FetchError(f"Response too large for {url}")
+            raise _http_failure("GET", url, "ResponseTooLarge")
         return data
 
     async def fetch_text(
@@ -271,8 +514,8 @@ class HttpClient:
         text = await self.fetch_text(url, headers, max_bytes)
         try:
             return __import__("json").loads(text)
-        except ValueError as exc:
-            raise FetchError(f"Invalid JSON from {url}") from exc
+        except ValueError:
+            raise _http_failure("GET", url, "InvalidJSON") from None
 
     async def fetch_xml_text(
         self,
@@ -282,7 +525,7 @@ class HttpClient:
     ) -> str:
         text = await self.fetch_text(url, headers, max_bytes)
         if "<" not in text[:200]:
-            raise FetchError(f"Not XML from {url}")
+            raise _http_failure("GET", url, "InvalidXML")
         return text
 
     async def post_form_json(
@@ -295,15 +538,16 @@ class HttpClient:
         attempts: int | None = None,
     ) -> Any:
         """POST form-encoded data and parse the JSON response."""
-        total_timeout = aiohttp.ClientTimeout(
-            total=timeout_seconds or max(self.timeout_seconds, 30.0)
-        )
+        request_timeout_s = timeout_seconds or max(self.timeout_seconds, 30.0)
+        total_timeout = aiohttp.ClientTimeout(total=request_timeout_s)
         tries = attempts or self.retry_attempts
         body = b""
-        last_started_error: Exception | None = None
+        last_started_error: FetchError | None = None
         for attempt in range(1, tries + 1):
+            attempt_started: float | None = None
             try:
                 await self._pace_origin(url)
+                attempt_started = time.monotonic()
                 async with self.session.post(
                     url,
                     data=data,
@@ -311,43 +555,65 @@ class HttpClient:
                     timeout=total_timeout,
                 ) as resp:
                     if resp.status != 200:
-                        raise FetchError(
-                            f"HTTP {resp.status} for {url}", status_code=resp.status
+                        retry_after_s = (
+                            _retry_after_seconds(resp.headers.get("Retry-After"))
+                            if resp.status in {429, 503}
+                            else None
+                        )
+                        raise _http_failure(
+                            "POST",
+                            url,
+                            "HTTPStatusError",
+                            status_code=resp.status,
+                            retry_after_s=retry_after_s,
                         )
                     ct = resp.headers.get("Content-Type", "")
                     if "json" not in ct.lower():
-                        raise FetchError(f"Unexpected content type {ct!r} for {url}")
+                        raise _http_failure("POST", url, "UnexpectedContentType")
                     body = await resp.read()
                     if len(body) > max_bytes:
-                        raise FetchError(f"Response too large for {url}")
+                        raise _http_failure("POST", url, "ResponseTooLarge")
                     break
             except RequestNotStarted:
                 if last_started_error is not None:
                     raise last_started_error from None
                 raise
             except (TimeoutError, aiohttp.ClientError, FetchError) as exc:
-                if (
-                    isinstance(exc, FetchError)
-                    and exc.status_code is not None
-                    and 400 <= exc.status_code < 500
-                    and exc.status_code not in {408, 429}
-                ):
-                    raise
-                if attempt >= tries:
-                    raise
-                last_started_error = exc
-                delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
-                log.warning(
-                    "POST %s failed (attempt %d): %s; retrying in %.1fs",
-                    url, attempt, exc, delay,
+                failure = _with_http_context("POST", url, exc)
+                terminal_status = (
+                    failure.status_code is not None
+                    and 400 <= failure.status_code < 500
+                    and failure.status_code not in {408, 429}
                 )
-                await asyncio.sleep(delay)
+                retry_delay_s = None
+                if not terminal_status and attempt < tries:
+                    retry_delay_s = min(
+                        RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY
+                    )
+                _log_http_failure(
+                    "POST",
+                    url,
+                    failure,
+                    attempt=attempt,
+                    total_attempts=tries,
+                    started_at=(
+                        attempt_started
+                        if attempt_started is not None
+                        else time.monotonic()
+                    ),
+                    timeout_s=request_timeout_s,
+                    retry_delay_s=retry_delay_s,
+                )
+                if retry_delay_s is None:
+                    raise failure from None
+                last_started_error = failure
+                await asyncio.sleep(retry_delay_s)
         else:
-            raise FetchError(f"Exhausted retries for {url}")
+            raise _http_failure("POST", url, "RetriesExhausted")
         try:
             return json.loads(body.decode("utf-8", errors="replace"))
-        except ValueError as exc:
-            raise FetchError(f"Invalid JSON from {url}") from exc
+        except ValueError:
+            raise _http_failure("POST", url, "InvalidJSON") from None
 
     # -- cached fetch with stale-on-error ------------------------------------
 
@@ -359,17 +625,26 @@ class HttpClient:
     ) -> tuple[bool, Any, float]:
         """Cache any typed fetcher while retaining an expired value on error."""
         key = spec.key(**url_kwargs)
+        url = spec.url.format(**url_kwargs)
         hit, value = self.cache.get(key, spec.ttl)
         if hit:
             return False, value, self.cache._store[key].fetched_at  # noqa: SLF001
         try:
-            value = await fetcher(spec.url.format(**url_kwargs))
+            value = await fetcher(url)
         except (TimeoutError, aiohttp.ClientError, FetchError) as exc:
+            failure = _with_http_context("GET", url, exc)
             old_hit, old = self.cache.get(key, ttl=float("inf"))
             if old_hit:
-                log.warning("stale-on-error for %s: %s", key, exc)
-                return True, old, self.cache._store[key].fetched_at  # noqa: SLF001
-            raise
+                fetched_at = self.cache._store[key].fetched_at  # noqa: SLF001
+                cache_age_s = max(0.0, time.time() - fetched_at)
+                log.warning(
+                    "stale-on-error: %s cache_age_s=%.3f ttl_s=%.3f",
+                    failure,
+                    cache_age_s,
+                    spec.ttl,
+                )
+                return True, old, fetched_at
+            raise failure from None
         self.cache.set(key, value)
         return False, value, self.cache._store[key].fetched_at
 
@@ -411,7 +686,10 @@ class HttpClient:
     ) -> str:
         value = await self.fetch_html(url, headers, max_bytes)
         if validator is not None:
-            validator(value)
+            try:
+                validator(value)
+            except FetchError as exc:
+                raise _with_http_context("GET", url, exc) from None
         return value
 
     async def fetch_xml_text_cached(

@@ -240,7 +240,7 @@ def test_build_payload_shows_initializing_map_in_reserved_first_slot():
     assert not payload.files
 
 
-def test_build_payload_present_failed_map_keeps_source_error():
+def test_build_payload_present_failed_map_uses_reserved_slot():
     payload = build_payload(
         weather=None,
         groups=[],
@@ -250,8 +250,22 @@ def test_build_payload_present_failed_map_keeps_source_error():
         traffic_map_webp=None,
         errors=["traffic map unavailable"],
     )
-    assert payload.embeds[0].title == "🚦 Traffic news"
-    assert "traffic map unavailable" in payload.embeds[-1].fields[0].value
+    assert payload.embeds[0].title == "Traffic map unavailable"
+    assert payload.embeds[1].title == "🚦 Traffic news"
+    assert "HKeMobility" in payload.embeds[0].description
+    assert not payload.files
+    assert not any(embed.fields for embed in payload.embeds)
+
+
+def test_build_payload_map_error_keeps_other_source_errors_visible():
+    errors = ["traffic map unavailable", "weather unavailable"]
+    payload = build_payload(
+        weather=None, groups=[], statuses=[], incidents=[], capture_time=s.utc(),
+        traffic_map_webp=None, errors=errors,
+    )
+    assert payload.embeds[0].title == "Traffic map unavailable"
+    assert payload.embeds[-1].fields[0].value == "⚠️ weather unavailable"
+    assert errors == ["traffic map unavailable", "weather unavailable"]
 
 
 def test_payload_keeps_one_map_attachment_before_traffic_news():

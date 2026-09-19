@@ -125,6 +125,73 @@ def test_groups_real_lung_and_breakdown_synonym_but_not_landmark_conflict():
     assert incident_details(rthk_cwb, _roads()).landmark == "\u725b\u6c60\u7063\u8857\u5e02"
 
 
+def test_groups_known_tseng_lan_shue_landmark_variant_with_strict_signature():
+    english = """<html><body><p>2026/9/16 04:33:00 PM</p>
+    <h1>Special Traffic News</h1><ol><li>Due to traffic accident , the slow lane of
+    Clear Water Bay Road (Sai Kung bound) near Tseng Lan Shue is closed to all traffic.
+    Only remaining lane is available to motorists. Traffic is busy now.</li></ol></body></html>"""
+    chinese = """<html><body><p>2026\u5e749\u670816\u65e5 04:33:00 PM</p>
+    <h1>\u7279\u5225\u4ea4\u901a\u6d88\u606f</h1><ol><li>\u56e0\u4ea4\u901a\u610f\u5916\uff0c\u6e05\u6c34\u7063\u9053(\u5f80\u897f\u8ca2\u65b9\u5411)\u8fd1\u4e95\u6b04\u6a39\u7684\u6162\u7dda\u73fe\u5df2\u5c01\u9589\u3002
+    \u99d5\u99db\u4eba\u58eb\u53ea\u53ef\u4f7f\u7528\u9918\u4e0b\u884c\u8eca\u7dda\u884c\u8eca\u3002\u73fe\u6642\u4e0a\u5740\u4ea4\u901a\u7e41\u5fd9\u3002</li></ol></body></html>"""
+    parsed_td = parse_special_news_page(english)
+    sidecars = pair_td_bilingual_pages(english, chinese, parsed_td, _roads())
+    td = replace(
+        parsed_td[0],
+        page_updated_at=datetime.fromisoformat("2026-09-16T16:33:00+08:00"),
+        translated_description=sidecars[parsed_td[0].identifier],
+    )
+    rthk = TrafficIncident(
+        "rthk-tseng-lan-shue",
+        "RTHK traffic update",
+        "\u6e05\u6c34\u7063\u9053\u5f80\u897f\u8ca2\u65b9\u5411\uff0c\u8fd1\u4e95\u6b04\u6751\u6709\u4ea4\u901a\u610f\u5916\uff0c\u9f8d\u5c3e\uff1a\u5f69\u96f2\u90a8\u3002",
+        "",
+        "",
+        "",
+        "ACTIVE",
+        announcement_time=datetime.fromisoformat("2026-09-16T16:00:00+08:00"),
+        source="RTHK",
+    )
+
+    td_details = incident_details(td, _roads())
+    rthk_details = incident_details(rthk, _roads())
+    result = reconcile_incident_reports([td, rthk], _roads())
+
+    assert td.title == "Traffic accident"
+    assert td_details == rthk_details
+    assert td_details.landmark == "tseng lan shue"
+    assert td_details.direction == "\u897f\u8ca2"
+    assert td_details.cause == "traffic-accident"
+    assert len(result) == 1
+    assert result[0].identifier == td.identifier
+    assert result[0].related_reports == (replace(rthk, reconciliation_key=result[0].reconciliation_key),)
+    assert result[0].reconciliation_key
+
+    opposite_direction = replace(
+        rthk,
+        identifier="rthk-tseng-lan-shue-kowloon-bound",
+        description=(
+            "\u6e05\u6c34\u7063\u9053\u5f80\u4e5d\u9f8d\u65b9\u5411\uff0c\u8fd1\u4e95\u6b04\u6751\u6709\u4ea4\u901a\u610f\u5916\uff0c\u9f8d\u5c3e\uff1a\u5f69\u96f2\u90a8\u3002"
+        ),
+    )
+    opposite_state = replace(
+        rthk,
+        identifier="rthk-tseng-lan-shue-cleared",
+        description=(
+            "\u6e05\u6c34\u7063\u9053\u5f80\u897f\u8ca2\u65b9\u5411\uff0c\u8fd1\u4e95\u6b04\u6751\u7684\u4ea4\u901a\u610f\u5916\u5df2\u6e05\u7406\u3002"
+        ),
+        status="CLOSED",
+    )
+    for guarded in (opposite_direction, opposite_state):
+        guarded_result = reconcile_incident_reports([td, guarded], _roads())
+        assert len(guarded_result) == 2
+        assert all(not report.related_reports for report in guarded_result)
+
+    duplicate = replace(rthk, identifier="rthk-tseng-lan-shue-duplicate")
+    ambiguous = reconcile_incident_reports([td, rthk, duplicate], _roads())
+    assert len(ambiguous) == 3
+    assert all(not report.related_reports for report in ambiguous)
+
+
 def test_bilingual_pairing_fails_closed_across_page_transition():
     reports = parse_special_news_page(ENGLISH_PAGE)
     later = CHINESE_PAGE.replace("04:56:38", "04:57:38")

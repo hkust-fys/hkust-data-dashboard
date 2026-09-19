@@ -28,6 +28,52 @@ def test_parse_observations_sai_kung():
     assert snap.source_time is not None
 
 
+@pytest.mark.asyncio
+async def test_warning_strip_survives_missing_optional_warning_metadata(monkeypatch):
+    from dashboard.http import FetchError
+    from dashboard.models import WeatherConditions
+    from dashboard.providers import weather
+    from dashboard.render import build_payload
+
+    monkeypatch.setattr(weather, "_warning_icon_cache", {})
+    png = io.BytesIO()
+    Image.new("RGBA", (64, 64), "yellow").save(png, format="PNG")
+    catalog = (
+        '<img alt="Very Hot Weather Warning" src="/en/textonly/img/warn/images/hot.png">'
+        '<img alt="Yellow Fire Danger Warning" src="/en/textonly/img/warn/images/fireyellow.png">'
+    )
+
+    class Client:
+        async def fetch_json_cached(self, spec):
+            if spec.url == weather.WARNTODAY_URL:
+                raise FetchError("metadata unavailable")
+            if spec.url == weather.WARNSUM_URL:
+                return False, {
+                    "WHOT": {"code": "WHOT", "name": "Very Hot Weather Warning"},
+                    "WFIRE": {"code": "WFIREY", "name": "Fire Danger Warning", "type": "Yellow"},
+                }, 0
+            return False, {}, 0
+
+        async def fetch_html_cached(self, _spec, *, validator):
+            validator(catalog)
+            return False, catalog, 0
+
+        async def fetch_bytes(self, url, **_kwargs):
+            assert url.endswith(("/hot.png", "/fireyellow.png"))
+            return png.getvalue()
+
+    snapshot, warnings, warning_time = await weather.fetch_weather_conditions(Client())
+    assert len(warnings) == 2 and all(w.icon_data for w in warnings)
+    payload = build_payload(
+        WeatherConditions(warnings=warnings, snapshot=snapshot, warning_time=warning_time),
+        [], [], [], None, None,
+    )
+    strip = next(asset for asset in payload.files if asset.filename.startswith("hko-warnings-"))
+    assert any(embed.thumbnail.url == f"attachment://{strip.filename}" for embed in payload.embeds)
+    with Image.open(io.BytesIO(strip.data)) as image:
+        assert image.size == (128, 64)
+
+
 def test_parse_observations_tolerates_missing_sections():
     snap = parse_observations({})
     assert snap.temperature_c is None
@@ -287,7 +333,7 @@ async def test_warning_gif_is_rejected_without_fetching():
 
 
 @pytest.mark.asyncio
-async def test_invalid_warning_icon_is_not_cached_and_retries():
+async def test_invalid_warning_icon_is_not_cached_and_retries(caplog):
     class Client:
         calls = 0
 
@@ -317,6 +363,9 @@ async def test_invalid_warning_icon_is_not_cached_and_retries():
     assert first.icon_data == b""
     assert second.icon_data.startswith(b"\x89PNG")
     assert client.calls == 2
+    assert "code=WRAINA endpoint=https://www.hko.gov.hk/en/textonly/img/warn/images/rainamber.png" in caplog.text
+    assert "reason=no_usable_static_png" in caplog.text
+    assert "temporary upstream error" not in caplog.text
 
 
 @pytest.mark.asyncio

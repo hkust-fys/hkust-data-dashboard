@@ -1,6 +1,6 @@
 """Traffic provider tests: parsing, road matching, and source caching."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -36,6 +36,7 @@ from dashboard.providers.traffic import (
 )
 from dashboard.providers.traffic_news import (
     RTHK_TRAFFIC_NEWS_URL,
+    filter_expired_rthk_incidents,
     parse_rthk_traffic_news,
     rthk_latest_report_time,
 )
@@ -392,6 +393,51 @@ def test_parse_rthk_distinguishes_new_clear_water_bay_road():
     assert resolve_incident_road_keys(incident, fallback_roads()) == ["new clear water bay road"]
 
 
+def test_filter_expired_rthk_incidents_preserves_td_and_fresh_related_reports():
+    now = datetime.fromisoformat("2026-09-16T17:00:00+08:00")
+    expired = TrafficIncident(
+        "rthk-old", "RTHK traffic update", "old report", "Clear Water Bay Road", "", "", "ACTIVE",
+        source="RTHK", announcement_time=now - timedelta(hours=3, minutes=1),
+    )
+    fresh = TrafficIncident(
+        "rthk-fresh", "RTHK traffic update", "fresh report", "Clear Water Bay Road", "", "", "ACTIVE",
+        source="RTHK", announcement_time=now - timedelta(hours=3),
+    )
+    missing_time = TrafficIncident(
+        "rthk-unknown", "RTHK traffic update", "unknown time", "Clear Water Bay Road", "", "", "ACTIVE",
+        source="RTHK",
+    )
+    td = TrafficIncident(
+        "td-current", "Traffic accident", "TD active report", "Clear Water Bay Road", "", "", "ACTIVE",
+        source="TD", page_updated_at=now, related_reports=(expired, fresh, missing_time),
+        reconciliation_key="traffic-cwb",
+    )
+
+    retained = filter_expired_rthk_incidents([expired, td], now=now, max_age_hours=3)
+
+    assert [incident.identifier for incident in retained] == ["td-current"]
+    assert [report.identifier for report in retained[0].related_reports] == [
+        "rthk-fresh", "rthk-unknown",
+    ]
+    assert retained[0].reconciliation_key == "traffic-cwb"
+    assert retained[0].page_updated_at == now
+
+
+@pytest.mark.parametrize("max_age_hours", [0, float("nan"), float("inf"), float("-inf")])
+def test_filter_expired_rthk_incidents_rejects_invalid_max_age(max_age_hours):
+    incident = TrafficIncident(
+        "rthk", "RTHK traffic update", "report", "Clear Water Bay Road", "", "", "ACTIVE",
+        source="RTHK", announcement_time=datetime.fromisoformat("2026-09-16T16:00:00+08:00"),
+    )
+
+    with pytest.raises(ValueError):
+        filter_expired_rthk_incidents(
+            [incident],
+            now=datetime.fromisoformat("2026-09-16T17:00:00+08:00"),
+            max_age_hours=max_age_hours,
+        )
+
+
 def test_rthk_matches_other_bus_roads_and_retains_multiple_named_roads():
     roads = with_official_names(fallback_roads(), {"lung cheung road": ("龍翔道",)})
     html = """<div class="articles">交通消息<ul class="dec">
@@ -684,14 +730,53 @@ async def test_fetch_traffic_data_uses_stale_rthk_page_after_invalid_refresh(mon
         return await original_fetch_html(url, headers, max_bytes)
 
     monkeypatch.setattr(client, "fetch_html", fetch_html)
-    first = await fetch_traffic_data(client, fallback_roads())
+    now = datetime.fromisoformat("2026-09-16T16:00:00+08:00")
+    first = await fetch_traffic_data(client, fallback_roads(), now=now)
     state["invalid"] = True
     client.cache._store[RTHK_NEWS_SPEC.key()].fetched_at = 0  # noqa: SLF001
-    result = await fetch_traffic_data(client, fallback_roads())
+    result = await fetch_traffic_data(client, fallback_roads(), now=now)
 
     first_rthk = [item for item in first[1] if item.source == "RTHK"]
     result_rthk = [item for item in result[1] if item.source == "RTHK"]
     assert result_rthk == first_rthk
     assert "RTHK traffic news" in result[4]
     assert "RTHK traffic news unavailable" not in result[4]
+    assert result[5]["rthk_news_checked"] == datetime.fromtimestamp(0, UTC)
+
+
+@pytest.mark.asyncio
+async def test_fetch_traffic_data_expires_old_rthk_cached_reports(monkeypatch):
+    client, _, _ = _traffic_client(monkeypatch)
+    original_fetch_html = client.fetch_html
+    rthk_page = """<html><body><div class="articles"><h1>\u4ea4\u901a\u6d88\u606f</h1>
+    <ul class="dec"><li class="inner">\u6e05\u6c34\u7063\u9053\u5f80\u897f\u8ca2\u65b9\u5411\u8fd1\u725b\u6c60\u7063\u8857\u5e02\u6709\u4ea4\u901a\u610f\u5916\u3002
+    <div class="date">2026-09-16 HKT 14:00</div></li></ul>
+    </div></body></html>"""
+    state = {"invalid": False}
+
+    async def fetch_html(url, headers=None, max_bytes=None):
+        if url == RTHK_TRAFFIC_NEWS_URL:
+            return "<html>changed schema</html>" if state["invalid"] else rthk_page
+        return await original_fetch_html(url, headers, max_bytes)
+
+    monkeypatch.setattr(client, "fetch_html", fetch_html)
+    first = await fetch_traffic_data(
+        client,
+        fallback_roads(),
+        now=datetime.fromisoformat("2026-09-16T16:30:00+08:00"),
+    )
+    assert any(incident.source == "RTHK" for incident in first[1])
+
+    state["invalid"] = True
+    client.cache._store[RTHK_NEWS_SPEC.key()].fetched_at = 0  # noqa: SLF001
+    result = await fetch_traffic_data(
+        client,
+        fallback_roads(),
+        now=datetime.fromisoformat("2026-09-16T17:30:00+08:00"),
+    )
+
+    assert not any(incident.source == "RTHK" for incident in result[1])
+    assert any(incident.source == "TD" for incident in result[1])
+    assert "RTHK traffic news" in result[4]
+    assert result[5]["rthk_news"] == datetime.fromisoformat("2026-09-16T14:00:00+08:00")
     assert result[5]["rthk_news_checked"] == datetime.fromtimestamp(0, UTC)

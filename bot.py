@@ -1,8 +1,7 @@
 """HKUST Campus Dashboard bot entry point.
 
 Executable lifecycle: shared session + providers, concurrent fetches, one live
-dashboard message edited in place and safely rolled before Discord's old-message
-cap, dev-webhook and dry-run modes.
+dashboard message edited in place, dev-webhook and dry-run modes.
 
 Imports must have no filesystem/network/package-installation/bot-launch side
 effects; all side effects live under ``main()``.
@@ -20,6 +19,7 @@ import inspect
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -29,18 +29,22 @@ from collections import deque
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
 
 import discord
 from dotenv import load_dotenv
 
 from dashboard import maps, pipeline, road_policy  # noqa: F401
 from dashboard.config import ConfigError, Settings
+from dashboard.diagnostics import configure_logging, dependency_versions, source_fingerprint
 from dashboard.http import HttpClient
 from dashboard.models import (
+    MAP_CAPTURE_MAX_AGE_SECONDS,
+    MAP_CAPTURE_STALE_AFTER_SECONDS,
     CameraFrame,
     DashboardPayload,
     ImageAsset,
+    TrafficMapResult,
+    WeatherConditions,
 )
 
 # Historical provider names remain importable for diagnostics and monkeypatches.
@@ -52,12 +56,13 @@ from dashboard.providers import route_geometry as route_geometry_provider  # noq
 from dashboard.providers import tracked_roads as tracked_roads_provider  # noqa: F401
 from dashboard.providers import traffic as traffic_provider  # noqa: F401
 from dashboard.providers import weather as weather_provider  # noqa: F401
+from dashboard.providers.traffic_news import filter_expired_rthk_incidents
 from dashboard.render import traffic_map_filename
 from dashboard.runtime import startup_preflight
 
 log = logging.getLogger(__name__)
 DASHBOARD_MESSAGE_MARKER = "HKUST Campus Dashboard"
-DASHBOARD_MESSAGE_ROLLOVER_SECONDS = 55 * 60
+DASHBOARD_EDIT_BACKOFF_SECONDS = 60.0
 DASHBOARD_DISCORD_TIMEOUT_SECONDS = 4.0
 DASHBOARD_SEND_NONCE_RETRY_SECONDS = 2 * 60
 DISCORD_MAX_RATELIMIT_RETRY_SECONDS = 1.25
@@ -158,11 +163,10 @@ def _configure_discord_http_deadlines(http) -> None:
         )
 
 
-def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+def _setup_logging(
+    level: str, cache_dir: str = ".cache", *, secret_values: tuple[str, ...] = (),
+) -> None:
+    configure_logging(level, cache_dir, secret_values=secret_values)
 
 
 # --------------------------------------------------------------------------
@@ -554,7 +558,12 @@ async def _find_dashboard_messages(channel, expected_author=None) -> list[object
     try:
         return await _scan_dashboard_messages(channel, expected_author)
     except Exception as exc:  # noqa: BLE001
-        log.warning("history scan failed: %s", exc)
+        log.warning(
+            "GET /channels/%s/messages history scan failed error=%s status=%s code=%s: %s",
+            getattr(channel, "id", None), type(exc).__name__,
+            getattr(exc, "status", None), getattr(exc, "code", None), exc,
+            exc_info=True,
+        )
     return []
 
 
@@ -576,9 +585,10 @@ async def _resolve_dashboard_message(
             configured = await channel.fetch_message(configured_message_id)
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "configured message %s not found, scanning: %s",
-                configured_message_id,
-                exc,
+                "GET /channels/%s/messages/%s configured message lookup failed; scanning "
+                "error=%s status=%s code=%s: %s",
+                getattr(channel, "id", None), configured_message_id, type(exc).__name__,
+                getattr(exc, "status", None), getattr(exc, "code", None), exc,
             )
         else:
             if not _is_dashboard_message(configured, expected_author):
@@ -592,7 +602,18 @@ async def _resolve_dashboard_message(
         # A rollover can complete immediately before a restart.  History order
         # is authoritative here so a stale configured starter cannot win over
         # the newer, fully populated dashboard.
+        log.info(
+            "dashboard discovery channel_id=%s configured_message_id=%s selected_message_id=%s "
+            "candidates=%s source=history",
+            getattr(channel, "id", None), configured_message_id, messages[0].id,
+            [message.id for message in messages],
+        )
         return messages[0]
+    log.info(
+        "dashboard discovery channel_id=%s configured_message_id=%s selected_message_id=%s "
+        "source=configured_fallback",
+        getattr(channel, "id", None), configured_message_id, getattr(configured, "id", None),
+    )
     return configured
 
 
@@ -630,83 +651,6 @@ def discord_file(asset: ImageAsset) -> discord.File:
 def _is_traffic_map_filename(filename: str) -> bool:
     """Recognize renderer-generated traffic-map attachments for dry-run output."""
     return bool(re.fullmatch(r"traffic-map-[0-9a-f]{12}\.webp", filename))
-
-
-def _is_warning_icon_filename(filename: str) -> bool:
-    return bool(re.fullmatch(r"hko-warnings-[0-9a-f]{12}\.png", filename))
-
-
-def _trusted_live_discord_attachment_url(
-    url: str,
-    *,
-    filename: str,
-    channel_id: int,
-    now: float | None = None,
-) -> bool:
-    """Accept a still-live Discord CDN URL for this channel and filename."""
-    try:
-        parsed = urlparse(url)
-        parts = [unquote(part) for part in parsed.path.split("/") if part]
-        expires = parse_qs(parsed.query).get("ex", [""])[0]
-        expires_at = int(expires, 16)
-    except (TypeError, ValueError):
-        return False
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname in {"cdn.discordapp.com", "media.discordapp.net"}
-        and len(parts) == 4
-        and parts[0] == "attachments"
-        and parts[1] == str(channel_id)
-        and parts[3] == filename
-        and expires_at > (time.time() if now is None else now) + 60
-    )
-
-
-def _reuse_live_warning_thumbnails(message, embeds, assets: list[ImageAsset]):
-    """Replace attachment URLs with trusted live CDN URLs when REST omits files."""
-    channel_id = getattr(getattr(message, "channel", None), "id", None)
-    if not isinstance(channel_id, int):
-        return embeds, set()
-    retained_attachments = {
-        (getattr(item, "filename", None), getattr(item, "size", None))
-        for item in getattr(message, "attachments", ())
-        if getattr(item, "id", None) is not None
-    }
-    desired = {
-        asset.filename for asset in assets
-        if _is_warning_icon_filename(asset.filename)
-        and (asset.filename, len(asset.data)) not in retained_attachments
-    }
-    if not desired:
-        return embeds, set()
-
-    current_urls: dict[str, str] = {}
-    for current in getattr(message, "embeds", ()):
-        url = getattr(getattr(current, "thumbnail", None), "url", None)
-        if not isinstance(url, str):
-            continue
-        filename = unquote(urlparse(url).path.rsplit("/", 1)[-1])
-        if filename in desired and _trusted_live_discord_attachment_url(
-            url,
-            filename=filename,
-            channel_id=channel_id,
-        ):
-            current_urls[filename] = url
-
-    reused: set[str] = set()
-    rewritten = []
-    for embed in embeds:
-        url = getattr(getattr(embed, "thumbnail", None), "url", None)
-        filename = url.removeprefix("attachment://") if isinstance(url, str) else ""
-        live_url = current_urls.get(filename)
-        if live_url is None:
-            rewritten.append(embed)
-            continue
-        copied = embed.copy()
-        copied.set_thumbnail(url=live_url)
-        rewritten.append(copied)
-        reused.add(filename)
-    return rewritten, reused
 
 
 def _payload_fingerprint(payload: DashboardPayload) -> str:
@@ -755,7 +699,15 @@ def _load_dashboard_runtime_state(settings: Settings) -> dict[str, object]:
         if raw.get("announce_channel_id") != settings.announce_channel_id:
             return {}
         return raw
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except FileNotFoundError:
+        log.debug("dashboard runtime state absent channel_id=%s", settings.announce_channel_id)
+        return {}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        log.warning(
+            "dashboard runtime state unreadable path=%s channel_id=%s error=%s",
+            _dashboard_runtime_state_path(settings.cache_dir), settings.announce_channel_id,
+            type(exc).__name__, exc_info=True,
+        )
         return {}
 
 
@@ -790,20 +742,21 @@ async def _bounded_discord(operation):
 
 
 async def _apply_payload(message, payload: DashboardPayload, view=None):
-    """Edit atomically, retaining already-uploaded content-addressed images."""
+    """Edit atomically, retaining actual attachments or uploading missing images.
+
+    A CDN thumbnail URL is not an attachment to retain. Omitting its file from
+    the edit removes it even while the signed URL temporarily still resolves.
+    """
     embeds = [e for e in payload.embeds if e is not None]
     existing_by_filename = {
         attachment.filename: attachment
         for attachment in getattr(message, "attachments", ())
         if getattr(attachment, "filename", None)
     }
-    embeds, reused_warning_filenames = _reuse_live_warning_thumbnails(
-        message, embeds, payload.files
-    )
     attachments = []
+    retained = []
+    uploaded = []
     for asset in payload.files:
-        if asset.filename in reused_warning_filenames:
-            continue
         existing = existing_by_filename.get(asset.filename)
         existing_size = getattr(existing, "size", None)
         if (
@@ -812,8 +765,14 @@ async def _apply_payload(message, payload: DashboardPayload, view=None):
             and existing_size == len(asset.data)
         ):
             attachments.append(existing)
+            retained.append(f"{asset.filename}:{existing.id}:{existing_size}")
         else:
             attachments.append(discord_file(asset))
+            uploaded.append(f"{asset.filename}:{len(asset.data)}")
+    log.debug(
+        "dashboard attachments message_id=%s embed_count=%d retained=%s uploaded=%s",
+        getattr(message, "id", None), len(embeds), retained, uploaded,
+    )
     return await message.edit(
         content=DASHBOARD_MESSAGE_MARKER,
         embeds=embeds,
@@ -822,22 +781,27 @@ async def _apply_payload(message, payload: DashboardPayload, view=None):
     )
 
 
-def _dashboard_message_needs_rollover(message, now: float | None = None) -> bool:
-    """Return whether an edit risks Discord's quota for old messages."""
-    created_at = getattr(message, "created_at", None)
-    if created_at is None:
-        return False
-    try:
-        created_timestamp = float(created_at.timestamp())
-    except (AttributeError, TypeError, ValueError, OverflowError):
-        return False
-    current_timestamp = time.time() if now is None else float(now)
-    return current_timestamp - created_timestamp >= DASHBOARD_MESSAGE_ROLLOVER_SECONDS
-
-
-def _is_old_dashboard_edit_cap(exc: BaseException) -> bool:
-    """Recognize Discord's old-message edit quota response."""
-    return getattr(exc, "code", None) == 30046
+def _discord_edit_retry_delay(exc: BaseException) -> float | None:
+    """Respect Discord's edit cooldown without replacing the starter message."""
+    if not (
+        getattr(exc, "code", None) == 30046
+        or getattr(exc, "status", None) == 429
+        or isinstance(exc, discord.RateLimited)
+    ):
+        return None
+    headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+    for value in (
+        getattr(exc, "retry_after", None),
+        headers.get("Retry-After"),
+        headers.get("X-RateLimit-Reset-After"),
+    ):
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(delay) and delay > 0:
+            return delay
+    return DASHBOARD_EDIT_BACKOFF_SECONDS
 
 
 def _is_discord_not_found(exc: BaseException) -> bool:
@@ -897,6 +861,11 @@ async def _rollover_dashboard_message(
         )
     )
     stale_message = None
+    log.info(
+        "dashboard deletion requested channel_id=%s message_id=%s replacement_message_id=%s "
+        "reason=legacy_rollover_recovery",
+        getattr(channel, "id", None), message.id, replacement.id,
+    )
     try:
         await _bounded_discord(message.delete())
     except Exception as exc:  # noqa: BLE001
@@ -907,7 +876,10 @@ async def _rollover_dashboard_message(
             # creating another successor on the next tick.
             stale_message = message
             log.warning("old dashboard cleanup deferred: %s", exc)
-    log.info("rolled dashboard message before Discord old-message edit cap")
+    log.info(
+        "legacy dashboard rollover resolved previous_message_id=%s message_id=%s cleanup_pending=%s",
+        message.id, replacement.id, stale_message is not None,
+    )
     return replacement, stale_message
 
 
@@ -958,6 +930,9 @@ class DashboardUpdater:
         self._pending_alert_messages: deque[tuple[str, bool]] = deque()
         self._message = None
         self._thread = None
+        self._dashboard_edit_retry_at = 0.0
+        self._last_health_signature = None
+        self._last_health_log_at = float("-inf")
         runtime_state = _load_dashboard_runtime_state(settings)
         loaded_message_id = runtime_state.get("dashboard_message_id")
         self._persisted_dashboard_message_id = (
@@ -1011,6 +986,12 @@ class DashboardUpdater:
         # Any episode surviving a process boundary has an attempt whose
         # server-side outcome was not durably resolved.
         self._dashboard_send_had_ambiguous_attempt = self._dashboard_send_nonce is not None
+        log.info(
+            "dashboard recovery state channel_id=%s persisted_message_id=%s persisted_thread_id=%s "
+            "pending_cleanup_count=%d unresolved_send=%s",
+            settings.announce_channel_id, self._persisted_dashboard_message_id, loaded_thread_id,
+            len(self._pending_dashboard_delete_ids), self._dashboard_send_had_ambiguous_attempt,
+        )
         self._dashboard_send_retry_ready = False
         self._dashboard_messages_reconciled = False
         self._pending_dashboard_deletes: dict[int, object] = {}
@@ -1077,7 +1058,14 @@ class DashboardUpdater:
         message_id = self._dashboard_message_id(message)
         self._message = message
         if message_id != previous_id:
+            log.info(
+                "dashboard identity changed channel_id=%s previous_message_id=%s message_id=%s "
+                "previous_thread_id=%s",
+                self.settings.announce_channel_id, previous_id, message_id,
+                getattr(self._thread, "id", None),
+            )
             self._thread = None
+            self._dashboard_edit_retry_at = 0.0
             # On startup the resolved message may be the persisted starter.
             # Keep its valid thread ID; dropping it here writes an empty state
             # before _remember_status_thread sees the already-persisted ID.
@@ -1455,6 +1443,11 @@ class DashboardUpdater:
     async def _delete_stale_dashboard(self, key: int, message) -> int:
         if key == self._persisted_dashboard_message_id:
             return key
+        log.info(
+            "dashboard deletion requested channel_id=%s message_id=%s canonical_message_id=%s "
+            "reason=duplicate_recovery",
+            self.settings.announce_channel_id, key, self._persisted_dashboard_message_id,
+        )
         try:
             await _bounded_discord(message.delete())
         except Exception as exc:  # noqa: BLE001
@@ -1605,28 +1598,47 @@ class DashboardUpdater:
         ):
             self._persisted_status_thread_id = thread_id
 
-    async def _status_thread_ready_for_rollover(self) -> bool:
-        """A successor gets its own attached thread after it is adopted."""
-        return True
+    async def _fetch_attached_status_thread(self):
+        """Resolve by starter ID, including archived threads absent from cache."""
+        fetch_thread = getattr(self._message, "fetch_thread", None)
+        fetch_channel = getattr(getattr(self._message, "guild", None), "fetch_channel", None)
+        try:
+            if fetch_thread is not None:
+                thread = await _bounded_discord(fetch_thread())
+            elif fetch_channel is not None:
+                thread = await _bounded_discord(fetch_channel(self._message.id))
+            else:
+                return None
+        except Exception as exc:
+            if _is_discord_not_found(exc):
+                return None
+            raise
+        return thread if self._thread_belongs_to_dashboard(thread) else None
 
     async def _ensure_thread(self) -> None:
         """Create the updates thread under the dashboard message once."""
         if self._message is None:
             return
+        endpoint = f"GET /channels/{self._message.id}"
+        started = time.monotonic()
+        resolution = "updater_cache"
         try:
             # Public thread IDs equal their starter-message IDs.  Archived
             # threads are absent from ``channel.threads``, so resolve the
             # thread through its dashboard message before trying to create it.
-            thread = getattr(self._message, "thread", None)
+            thread = self._thread
             if not self._thread_belongs_to_dashboard(thread):
                 thread = None
             if thread is None:
-                thread = self._thread
+                resolution = "message_cache"
+                thread = getattr(self._message, "thread", None)
                 if not self._thread_belongs_to_dashboard(thread):
                     thread = None
             if thread is None:
+                resolution = "persisted_id"
                 thread = await self._stored_status_thread()
             if thread is None:
+                resolution = "channel_cache"
                 thread = next(
                     (
                         item
@@ -1638,43 +1650,60 @@ class DashboardUpdater:
                 if not self._thread_belongs_to_dashboard(thread):
                     thread = None
             if thread is None:
-                fetch_thread = getattr(self._message, "fetch_thread", None)
-                if fetch_thread is not None:
-                    try:
-                        thread = await _bounded_discord(fetch_thread())
-                    except discord.NotFound:
-                        thread = None
-                    if not self._thread_belongs_to_dashboard(thread):
-                        thread = None
-                else:
-                    # ``Message.fetch_thread`` was added in discord.py 2.4,
-                    # while this project still supports 2.3.  Public thread
-                    # IDs equal their starter-message IDs, so the guild fetch
-                    # is the equivalent compatibility path.
-                    fetch_channel = getattr(
-                        getattr(self._message, "guild", None), "fetch_channel", None
-                    )
-                    if fetch_channel is not None:
-                        try:
-                            thread = await _bounded_discord(fetch_channel(self._message.id))
-                        except discord.NotFound:
-                            thread = None
-                        if not self._thread_belongs_to_dashboard(thread):
-                            thread = None
+                resolution = "starter_id_fetch"
+                thread = await self._fetch_attached_status_thread()
             if thread is None:
-                thread = await _bounded_discord(
-                    self._message.create_thread(name="status updates", auto_archive_duration=10080)
+                resolution = "created"
+                endpoint = (
+                    f"POST /channels/{self.settings.announce_channel_id}"
+                    f"/messages/{self._message.id}/threads"
                 )
+                try:
+                    thread = await _bounded_discord(
+                        self._message.create_thread(name="status updates")
+                    )
+                except Exception as exc:
+                    if getattr(exc, "code", None) != 160004:
+                        raise
+                    # A previous creation may have committed after its request
+                    # timed out, or the gateway cache may lag behind REST.
+                    resolution = "already_created_fetch"
+                    endpoint = f"GET /channels/{self._message.id}"
+                    thread = await self._fetch_attached_status_thread()
                 if not self._thread_belongs_to_dashboard(thread):
-                    raise RuntimeError("created status thread is not attached to dashboard")
-                log.info("created status thread %s", thread.id)
-            if getattr(thread, "archived", False):
-                await _bounded_discord(thread.edit(archived=False))
+                    raise RuntimeError("status thread is not attached to dashboard")
+            was_archived = getattr(thread, "archived", False)
+            if was_archived:
+                endpoint = f"PATCH /channels/{thread.id}"
+                updated = await _bounded_discord(thread.edit(archived=False))
+                if updated is not None:
+                    thread = updated
+            if self._thread is not thread or was_archived:
+                log.info(
+                    "resolved status thread channel_id=%s message_id=%s thread_id=%s "
+                    "parent_id=%s via=%s unarchived=%s archived=%s locked=%s "
+                    "pending_alerts=%d elapsed_s=%.3f",
+                    self.settings.announce_channel_id, self._message.id, thread.id,
+                    getattr(thread, "parent_id", None), resolution, was_archived,
+                    getattr(thread, "archived", None), getattr(thread, "locked", None),
+                    len(self._pending_alert_messages), time.monotonic() - started,
+                )
             self._thread = thread
             self._remember_status_thread(thread)
         except Exception as exc:  # noqa: BLE001
             self._thread = None
-            log.warning("could not resolve status thread: %s", exc)
+            log.warning(
+                "%s could not resolve status thread channel_id=%s message_id=%s "
+                "persisted_thread_id=%s via=%s error=%s status=%s code=%s "
+                "elapsed_s=%.3f timeout_s=%.1f pending_alerts=%d: %s",
+                endpoint, self.settings.announce_channel_id, self._message.id,
+                self._persisted_status_thread_id, resolution, type(exc).__name__,
+                getattr(exc, "status", None), getattr(exc, "code", None),
+                time.monotonic() - started, DASHBOARD_DISCORD_TIMEOUT_SECONDS,
+                len(self._pending_alert_messages), exc, exc_info=True,
+            )
+            if getattr(exc, "status", None) == 403:
+                _diagnose_dashboard_permissions(getattr(self._message, "channel", None))
 
     async def _flush_alert_messages(self) -> None:
         """Deliver queued thread content in order, retaining failures for retry."""
@@ -1690,8 +1719,9 @@ class DashboardUpdater:
                 roles=allowed_roles,
                 replied_user=False,
             )
+            started = time.monotonic()
             try:
-                await _bounded_discord(
+                sent = await _bounded_discord(
                     self._thread.send(
                         content=text,
                         allowed_mentions=allowed_mentions,
@@ -1699,10 +1729,27 @@ class DashboardUpdater:
                 )
             except Exception as exc:  # noqa: BLE001
                 # Force a fresh resolve/unarchive on the next presentation tick.
+                thread_id = getattr(self._thread, "id", None)
                 self._thread = None
-                log.warning("alert post failed (retaining for retry): %s", exc)
+                log.warning(
+                    "POST /channels/%s/messages failed (retaining alert for retry) "
+                    "channel_id=%s message_id=%s error=%s status=%s code=%s "
+                    "pending_alerts=%d elapsed_s=%.3f timeout_s=%.1f: %s",
+                    thread_id, self.settings.announce_channel_id,
+                    self._dashboard_message_id(self._message), type(exc).__name__,
+                    getattr(exc, "status", None), getattr(exc, "code", None),
+                    len(self._pending_alert_messages), time.monotonic() - started,
+                    DASHBOARD_DISCORD_TIMEOUT_SECONDS, exc, exc_info=True,
+                )
                 return
             self._pending_alert_messages.popleft()
+            log.info(
+                "status update delivered channel_id=%s message_id=%s thread_id=%s "
+                "update_message_id=%s remaining_alerts=%d elapsed_s=%.3f",
+                self.settings.announce_channel_id, self._dashboard_message_id(self._message),
+                getattr(self._thread, "id", None), getattr(sent, "id", None),
+                len(self._pending_alert_messages), time.monotonic() - started,
+            )
 
     async def _post_alert_events(self, results: dict[str, object]) -> None:
         """Feed the alert monitor and post any thread messages."""
@@ -1721,6 +1768,10 @@ class DashboardUpdater:
                 incidents = traffic_result[1]
             if len(traffic_result) > 2:
                 roadworks = traffic_result[2]
+        incidents = filter_expired_rthk_incidents(
+            incidents, now=datetime.now(UTC),
+            max_age_hours=self.settings.rthk_news_max_age_hours,
+        )
         roads = results.get("tracked_roads")
         if roads is not None and not isinstance(roads, Exception):
             self.alerts.roads = roads
@@ -1770,7 +1821,13 @@ class DashboardUpdater:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                log.warning("update tick failed: %s", exc)
+                log.warning(
+                    "update tick failed channel_id=%s message_id=%s thread_id=%s "
+                    "collection_generation=%s error=%s: %s",
+                    self.settings.announce_channel_id, self._dashboard_message_id(self._message),
+                    getattr(self._thread, "id", None), self._collection_generation,
+                    type(exc).__name__, exc, exc_info=True,
+                )
             next_tick += self.settings.update_interval_seconds
             # A slow provider or Discord edit can miss several presentation
             # windows.  Skip those deadlines instead of replaying them as a
@@ -1844,7 +1901,10 @@ class DashboardUpdater:
         try:
             value = task.result()
         except Exception as exc:  # noqa: BLE001
-            log.warning("background map refresh failed: %s", type(exc).__name__)
+            log.warning(
+                "background map refresh failed collection_generation=%s error=%s: %s",
+                generation, type(exc).__name__, exc, exc_info=True,
+            )
             value = exc
         if generation is not None:
             # A map capture is an independent single-flight stream.  Its task
@@ -1863,7 +1923,10 @@ class DashboardUpdater:
         try:
             fresh = task.result()
         except Exception as exc:  # noqa: BLE001
-            log.warning("background collection failed: %s", exc)
+            log.warning(
+                "background collection failed collection_generation=%s error=%s: %s",
+                self._collection_generation, type(exc).__name__, exc, exc_info=True,
+            )
             return
         if not isinstance(fresh, dict):
             log.warning("background collection returned invalid result")
@@ -1945,7 +2008,69 @@ class DashboardUpdater:
         """Build from the latest completed snapshot, never from a live fetch."""
         if self._snapshot is None:
             return None
-        return _to_payload(self._snapshot.results)
+        return _to_payload(
+            self._snapshot.results,
+            rthk_news_max_age_hours=self.settings.rthk_news_max_age_hours,
+        )
+
+    def _log_dashboard_health(self, payload: DashboardPayload) -> None:
+        """Report displayed availability on transitions and every five minutes."""
+        snapshot = self._snapshot
+        if snapshot is None:
+            return
+        mr = snapshot.results.get("traffic_map")
+        now = datetime.now(UTC)
+        capture_age = base_age = None
+        if isinstance(mr, TrafficMapResult):
+            if mr.captured_at is not None:
+                capture_age = round((now - mr.captured_at).total_seconds(), 1)
+            base_time = mr.base_updated_at or mr.captured_at
+            if base_time is not None:
+                base_age = round((now - base_time).total_seconds(), 1)
+        has_map = any(_is_traffic_map_filename(asset.filename) for asset in payload.files)
+        if "traffic_map" not in snapshot.results:
+            map_state = "initializing"
+        elif has_map:
+            map_state = "cached" if (
+                isinstance(mr, TrafficMapResult) and (
+                    mr.stale or (capture_age is not None and capture_age > MAP_CAPTURE_STALE_AFTER_SECONDS)
+                )
+            ) else "available"
+        elif isinstance(mr, Exception):
+            map_state = f"failed_{type(mr).__name__}"
+        elif base_age is not None and base_age > MAP_CAPTURE_MAX_AGE_SECONDS:
+            map_state = "base_expired"
+        else:
+            map_state = "capture_unavailable"
+        weather = snapshot.results.get("weather")
+        warnings = weather.warnings if isinstance(weather, WeatherConditions) else (
+            weather[1] if isinstance(weather, tuple) and len(weather) == 3 else []
+        )
+        warning_codes = tuple(warning.code for warning in warnings)
+        missing_icons = tuple(warning.code for warning in warnings if not warning.icon_data)
+        has_strip = any(asset.label == "HKO warning icons" for asset in payload.files)
+        signature = (
+            map_state, tuple(sorted(snapshot.stale_providers)), warning_codes, missing_icons,
+            has_strip, self._dashboard_message_id(self._message), getattr(self._thread, "id", None),
+            len(self._pending_alert_messages),
+        )
+        monotonic_now = time.monotonic()
+        if signature == self._last_health_signature and monotonic_now - self._last_health_log_at < 300:
+            return
+        self._last_health_signature = signature
+        self._last_health_log_at = monotonic_now
+        log.info(
+            "dashboard health channel_id=%s message_id=%s thread_id=%s collection_generation=%s "
+            "map_state=%s map_capture_age_s=%s map_base_age_s=%s map_task_running=%s "
+            "stale_providers=%s warning_codes=%s missing_warning_icons=%s warning_strip=%s "
+            "pending_alerts=%d pending_alert_snapshots=%d edit_retry_remaining_s=%.1f",
+            self.settings.announce_channel_id, self._dashboard_message_id(self._message),
+            getattr(self._thread, "id", None), snapshot.generation, map_state,
+            capture_age, base_age, self._map_task is not None and not self._map_task.done(),
+            sorted(snapshot.stale_providers), warning_codes, missing_icons, has_strip,
+            len(self._pending_alert_messages), len(self._pending_alert_snapshots),
+            max(0.0, self._dashboard_edit_retry_at - monotonic_now),
+        )
 
     async def _tick(self, channel=None) -> None:
         # The presenter is deliberately independent of provider latency.  It
@@ -1963,6 +2088,7 @@ class DashboardUpdater:
         payload = self._snapshot_payload()
         if payload is None:
             return
+        self._log_dashboard_health(payload)
         # Keep the generation paired with this payload.  The edit awaits
         # Discord I/O, during which a newer provider snapshot may publish.
         payload_generation = payload_snapshot.generation if payload_snapshot else 0
@@ -2021,54 +2147,22 @@ class DashboardUpdater:
             self._persisted_dashboard_message_id = self._dashboard_message_id(self._message)
             self._clear_rollover_send_uncertainty()
         fingerprint = _payload_fingerprint(payload)
+        edit_started = time.monotonic()
         try:
-            if fingerprint != self._last_payload_fingerprint:
-                rollover = (
-                    self._dashboard_messages_reconciled
-                    and _dashboard_message_needs_rollover(self._message)
+            if (
+                fingerprint != self._last_payload_fingerprint
+                and time.monotonic() >= self._dashboard_edit_retry_at
+            ):
+                edited_message = await _bounded_discord(
+                    _apply_payload(self._message, payload, view=self.live_view)
                 )
-                rollover_ready = not rollover or await self._status_thread_ready_for_rollover()
-                try:
-                    if rollover and rollover_ready and not self._pending_dashboard_delete_ids:
-                        edited_message = await self._rollover_dashboard(
-                            channel,
-                            payload,
-                            fingerprint,
-                        )
-                    else:
-                        if rollover and not rollover_ready:
-                            log.warning(
-                                "dashboard rollover deferred until its status "
-                                "thread identity can be retained"
-                            )
-                        elif rollover:
-                            log.warning(
-                                "dashboard rollover deferred until stale-message cleanup succeeds"
-                            )
-                        edited_message = await _bounded_discord(
-                            _apply_payload(self._message, payload, view=self.live_view)
-                        )
-                except Exception as edit_exc:
-                    if (
-                        rollover
-                        or self._pending_dashboard_delete_ids
-                        or not self._dashboard_messages_reconciled
-                        or not _is_old_dashboard_edit_cap(edit_exc)
-                    ):
-                        raise
-                    if not await self._status_thread_ready_for_rollover():
-                        raise
-                    edited_message = await self._rollover_dashboard(
-                        channel,
-                        payload,
-                        fingerprint,
-                    )
                 if edited_message is not None:
                     # discord.py 2.x returns the edited Message rather than
                     # mutating this object in place. Retain it so its
                     # Attachment objects can be passed through next time.
                     self._set_dashboard_message(edited_message)
                 self._last_payload_fingerprint = fingerprint
+                self._dashboard_edit_retry_at = 0.0
                 map_asset = next(
                     (
                         asset
@@ -2082,23 +2176,58 @@ class DashboardUpdater:
                     log.info(
                         "dashboard edit succeeded collection_generation=%s "
                         "payload_fingerprint=%s traffic_map_sha256=%s "
-                        "traffic_map_filename=%s",
+                        "traffic_map_filename=%s channel_id=%s message_id=%s elapsed_s=%.3f",
                         payload_generation,
                         fingerprint[:12],
                         map_hash,
                         map_asset.filename,
+                        self.settings.announce_channel_id, self._dashboard_message_id(self._message),
+                        time.monotonic() - edit_started,
                     )
                 else:
                     log.info(
                         "dashboard edit succeeded collection_generation=%s "
                         "payload_fingerprint=%s traffic_map_sha256=none "
-                        "traffic_map_filename=none",
+                        "traffic_map_filename=none channel_id=%s message_id=%s elapsed_s=%.3f",
                         payload_generation,
                         fingerprint[:12],
+                        self.settings.announce_channel_id, self._dashboard_message_id(self._message),
+                        time.monotonic() - edit_started,
                     )
                 self._last_good_payload = payload
         except Exception as exc:  # noqa: BLE001
-            log.warning("edit failed (keeping last good): %s", exc)
+            retry_delay = _discord_edit_retry_delay(exc)
+            message_id = self._dashboard_message_id(self._message)
+            endpoint = (
+                f"PATCH /channels/{self.settings.announce_channel_id}/messages/{message_id}"
+            )
+            if retry_delay is not None:
+                self._dashboard_edit_retry_at = time.monotonic() + retry_delay
+                log.warning(
+                    "%s rate limited (%s, code=%s); keeping message/thread, retry in %.1fs "
+                    "status=%s thread_id=%s elapsed_s=%.3f",
+                    endpoint, type(exc).__name__, getattr(exc, "code", None), retry_delay,
+                    getattr(exc, "status", None), getattr(self._thread, "id", None),
+                    time.monotonic() - edit_started,
+                )
+            elif _is_discord_not_found(exc):
+                # Only confirmed deletion starts discovery/recovery. An edit
+                # quota or transient failure must never create a successor.
+                self._set_dashboard_message(None)
+                self._last_payload_fingerprint = None
+                self._dashboard_messages_reconciled = False
+                log.warning("%s: message missing; rediscovering dashboard", endpoint)
+            else:
+                log.warning(
+                    "%s failed (keeping last good) error=%s status=%s code=%s "
+                    "thread_id=%s elapsed_s=%.3f timeout_s=%.1f: %s",
+                    endpoint, type(exc).__name__, getattr(exc, "status", None),
+                    getattr(exc, "code", None), getattr(self._thread, "id", None),
+                    time.monotonic() - edit_started, DASHBOARD_DISCORD_TIMEOUT_SECONDS, exc,
+                    exc_info=True,
+                )
+                if getattr(exc, "status", None) == 403:
+                    _diagnose_dashboard_permissions(channel)
 
         # An unresolved send may reuse a known canonical for ordinary edits,
         # but cannot run status/alert side effects until reconciliation proves
@@ -2162,6 +2291,30 @@ class DashboardUpdater:
 # --------------------------------------------------------------------------
 # Discord bot wiring
 # --------------------------------------------------------------------------
+
+
+def _diagnose_dashboard_permissions(channel) -> None:
+    """Inspect cached effective permissions without making another request."""
+    guild = getattr(channel, "guild", None)
+    member = getattr(guild, "me", None)
+    try:
+        permissions = channel.permissions_for(member)
+    except Exception as exc:
+        log.warning(
+            "dashboard permissions unavailable channel_id=%s error=%s",
+            getattr(channel, "id", None), type(exc).__name__,
+        )
+        return
+    required = (
+        "view_channel", "send_messages", "embed_links", "attach_files", "read_message_history",
+        "create_public_threads", "send_messages_in_threads",
+    )
+    missing = [name for name in required if not getattr(permissions, name, False)]
+    log.log(
+        logging.WARNING if missing else logging.INFO,
+        "dashboard permissions channel_id=%s guild_id=%s bot_id=%s missing=%s",
+        getattr(channel, "id", None), getattr(guild, "id", None), getattr(member, "id", None), missing,
+    )
 
 
 def _diagnose_alert_ping_capability(channel, settings: Settings) -> bool:
@@ -2232,7 +2385,11 @@ async def run_discord_bot(settings: Settings) -> None:
         # ``static_login`` replaces the global-rate-limit Event, so install the
         # cancellation-safe wrapper only after login and before dashboard I/O.
         _configure_discord_http_deadlines(bot.http)
-        log.info("Logged in as %s", bot.user)
+        log.info(
+            "Discord ready bot_id=%s channel_id=%s latency_s=%.3f updater_running=%s",
+            getattr(bot.user, "id", None), settings.announce_channel_id, bot.latency,
+            updater.is_running,
+        )
         if updater.is_running:
             log.info("dashboard update loop already active after reconnect")
             return
@@ -2248,6 +2405,7 @@ async def run_discord_bot(settings: Settings) -> None:
             )
             await bot.close()
             return
+        _diagnose_dashboard_permissions(channel)
         _diagnose_alert_ping_capability(channel, settings)
         # Resolve the message once (configured ID or history scan).
         message = await _resolve_dashboard_message(
@@ -2283,7 +2441,7 @@ async def run_dev_webhook(settings: Settings) -> None:
         try:
             client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
             results = await collect_all(client, settings)
-            payload = _to_payload(results)
+            payload = _to_payload(results, rthk_news_max_age_hours=settings.rthk_news_max_age_hours)
             webhook = discord.Webhook.from_url(settings.dev_webhook, session=session)
             files = [discord_file(a) for a in payload.files]
             await webhook.send(
@@ -2309,7 +2467,7 @@ async def run_dry_run(settings: Settings) -> None:
         try:
             client = HttpClient(session, timeout_seconds=settings.http_timeout_seconds)
             results = await collect_all(client, settings)
-            payload = _to_payload(results)
+            payload = _to_payload(results, rthk_news_max_age_hours=settings.rthk_news_max_age_hours)
 
             lines: list[str] = []
             for i, embed in enumerate(payload.embeds):
@@ -2376,16 +2534,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
 
-    _setup_logging(settings.log_level)
+    _setup_logging(
+        settings.log_level, settings.cache_dir,
+        secret_values=tuple(value for value in (
+            settings.discord_token, settings.dev_webhook,
+            os.environ.get("BUS_QUEUE_KEY"), os.environ.get("PPL_COUNT_KEY"),
+        ) if value),
+    )
+    mode = "dev_webhook" if args.dev_webhook else "dry_run" if args.dry_run else "discord"
+    log.info(
+        "dashboard startup mode=%s source_build=%s python=%s dependencies=%s "
+        "channel_id=%s configured_message_id=%s interval_s=%.1f http_timeout_s=%.1f "
+        "rthk_window_h=%.1f cache_dir=%s",
+        mode, source_fingerprint(Path(__file__).resolve().parent), sys.version.split()[0],
+        dependency_versions(), settings.announce_channel_id, settings.dashboard_message_id,
+        settings.update_interval_seconds, settings.http_timeout_seconds,
+        settings.rthk_news_max_age_hours, settings.cache_dir,
+    )
 
     try:
         ffmpeg_executable = startup_preflight()
     except ConfigError as exc:
         ffmpeg_executable = None
-        print(
-            f"Camera warning: {exc} Cameras are disabled; the dashboard will continue.",
-            file=sys.stderr,
-        )
+        log.warning("Camera warning: %s Cameras are disabled; the dashboard will continue.", exc)
     settings = replace(settings, ffmpeg_executable=ffmpeg_executable)
 
     try:
@@ -2399,7 +2570,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             asyncio.run(run_discord_bot(settings))
     except KeyboardInterrupt:
-        pass
+        log.info("dashboard stopped reason=keyboard_interrupt")
+    except Exception as exc:
+        log.exception(
+            "dashboard stopped reason=unhandled_error mode=%s error=%s: %s",
+            mode, type(exc).__name__, exc,
+        )
+        return 1
+    else:
+        log.info("dashboard stopped reason=normal mode=%s", mode)
     return 0
 
 

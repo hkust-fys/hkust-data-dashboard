@@ -153,6 +153,16 @@ _CHINESE_LANDMARK = re.compile(
     r"[\uff0c\u3002;\uff1b]|$)"
 )
 
+# TD's official Chinese page calls this Clear Water Bay Road locality 「井欄樹」,
+# while RTHK can shorten the same village name to 「井欄村」.  These are a
+# deliberately finite, evidence-backed set of variants; do not generalize by
+# stripping place suffixes, which would weaken the exact-landmark safeguard.
+_LANDMARK_IDENTITIES = {
+    "井欄樹": "tseng lan shue",
+    "井欄樹村": "tseng lan shue",
+    "井欄村": "tseng lan shue",
+}
+
 
 def _landmark(text: str) -> str:
     if match := _CHINESE_LANDMARK.search(text):
@@ -163,6 +173,11 @@ def _landmark(text: str) -> str:
         re.IGNORECASE,
     )
     return _clean(match.group(1).casefold()) if match else ""
+
+
+def _landmark_identity(landmark: str) -> str:
+    normalized = _clean(landmark).casefold()
+    return _LANDMARK_IDENTITIES.get(normalized, normalized)
 
 
 def _is_cleared(report: TrafficIncident, text: str) -> bool:
@@ -180,7 +195,7 @@ def incident_details(report: TrafficIncident, roads: Any) -> IncidentDetails:
     return IncidentDetails(
         road_keys=_road_keys(road_text, roads),
         direction=direction,
-        landmark=_landmark(text),
+        landmark=_landmark_identity(_landmark(text)),
         cause=_cause(text),
         cleared=_is_cleared(report, text),
     )

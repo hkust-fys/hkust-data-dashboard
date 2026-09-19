@@ -11,12 +11,15 @@ import io
 import json
 import logging
 import os
+import re
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from PIL import Image, ImageStat
 
+from dashboard.http import safe_endpoint
 from dashboard.models import MAP_CAPTURE_MAX_AGE_SECONDS
 
 log = logging.getLogger(__name__)
@@ -52,7 +55,7 @@ CANVAS_EXPORT_TIMEOUT_SECONDS = 5.0
 # of that document independently of the ten-second canvas export cadence.
 PAGE_REFRESH_SECONDS = 60.0
 # Leave room for page loading plus the separate 10-second presentation cycle.
-PAGE_WARMUP_SECONDS = 30.0
+PAGE_WARMUP_SECONDS = 20.0
 PAGE_PREPARATION_TIMEOUT_SECONDS = 30.0
 CANVAS_STABILITY_INTERVAL_SECONDS = 1.0
 _capture_retry_after = 0.0
@@ -98,6 +101,121 @@ _warming_task: asyncio.Task[_PreparedCapturePage] | None = None
 _warming_key: tuple[str, tuple[int, int]] | None = None
 _warming_loop = None
 _warming_retry_after = 0.0
+_last_cache_warning: tuple[str, str, str] | None = None
+_last_withhold_warning: tuple[str, tuple[str, tuple[int, int]]] | None = None
+
+_URL_IN_ERROR = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_SENSITIVE_HEADER_LINE = re.compile(
+    r"(?im)\b(authorization|cookie|set-cookie)\s*:\s*[^\r\n]*"
+)
+_SENSITIVE_ERROR_VALUE = re.compile(
+    r"(?i)\b(api[-_ ]?key|token)\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _safe_error_detail(exc: BaseException) -> str:
+    """Return one bounded diagnostic line without raw URL query values or credentials."""
+    detail = _SENSITIVE_HEADER_LINE.sub(
+        lambda match: f"{match.group(1)}: <redacted>", str(exc)
+    )
+    detail = " ".join(detail.split())
+    if not detail:
+        return "operation timed out" if isinstance(exc, TimeoutError) else "no detail"
+    detail = _URL_IN_ERROR.sub(lambda match: safe_endpoint(match.group(0)), detail)
+    detail = _SENSITIVE_ERROR_VALUE.sub(
+        lambda match: f"{match.group(1)}=<redacted>", detail
+    )
+    return detail[:240]
+
+
+def _bounded_safe_endpoint(url: object) -> str:
+    """Return a query-free endpoint bounded for one diagnostic field."""
+    return safe_endpoint(url if isinstance(url, str) else "")[:180]
+
+
+def _safe_resource_type(value: object) -> str:
+    """Bound a browser-controlled resource-type label."""
+    label = str(value or "unknown")[:32]
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", label) or "unknown"
+
+
+def _log_cache_unavailable(
+    cache_path: str,
+    reason: str,
+    *,
+    age: float | None = None,
+    exc: BaseException | None = None,
+) -> None:
+    """Warn once per cache failure state and demote identical repeats to DEBUG."""
+    global _last_cache_warning
+    error_type = type(exc).__name__ if exc is not None else ""
+    key = (os.path.abspath(cache_path), reason, error_type)
+    fields = [f"reason={reason}"]
+    if age is not None:
+        fields.extend((f"age_s={age:.3f}", f"max_age_s={MAP_CAPTURE_MAX_AGE_SECONDS:.3f}"))
+    if exc is not None:
+        fields.extend((f"type={error_type}", f"detail={_safe_error_detail(exc)}"))
+    message = "Google Maps cache unavailable " + " ".join(fields)
+    if key == _last_cache_warning:
+        log.debug("%s repeated=true", message)
+    else:
+        _last_cache_warning = key
+        log.warning("%s", message)
+
+
+def _warming_state(key: tuple[str, tuple[int, int]]) -> str:
+    if _warming_task is None:
+        return "none"
+    if _warming_key != key:
+        return "other"
+    return "ready" if _warming_task.done() else "pending"
+
+
+def _log_base_withheld(
+    reason: str,
+    key: tuple[str, tuple[int, int]],
+    *,
+    document_age: float | None = None,
+    retry_remaining: float | None = None,
+) -> None:
+    """Warn once when capture policy withholds a fresh base; debug repeated state."""
+    global _last_withhold_warning
+    fields = [
+        f"reason={reason}",
+        f"endpoint={_bounded_safe_endpoint(key[0])}",
+        f"warming_state={_warming_state(key)}",
+    ]
+    if document_age is not None:
+        fields.append(f"document_age_s={document_age:.3f}")
+    if retry_remaining is not None:
+        fields.append(f"retry_remaining_s={max(0.0, retry_remaining):.3f}")
+    message = "Google Maps fresh base withheld " + " ".join(fields)
+    warning_key = (reason, key)
+    if warning_key == _last_withhold_warning:
+        log.debug("%s repeated=true", message)
+    else:
+        _last_withhold_warning = warning_key
+        log.warning("%s", message)
+
+
+def _log_capture_phase_failure(
+    phase: str,
+    url: str,
+    exc: BaseException,
+    started_at: float,
+    diagnosis: str = "",
+) -> None:
+    """Log bounded, query-free context for one failed browser capture phase."""
+    log.warning(
+        "Google Maps capture failed phase=%s endpoint=%s type=%s detail=%s "
+        "elapsed=%.3fs%s",
+        phase,
+        safe_endpoint(url),
+        type(exc).__name__,
+        _safe_error_detail(exc),
+        max(0.0, time.monotonic() - started_at),
+        f" {diagnosis}" if diagnosis else "",
+    )
 
 
 async def _close_shared_browser() -> None:
@@ -301,6 +419,98 @@ CANVAS_EXPORT_SCRIPT = """
 }
 """
 
+PAGE_FAILURE_DIAGNOSIS_SCRIPT = """
+() => ({
+    canvasCount: document.querySelectorAll('canvas').length,
+    title: (document.title || '').slice(0, 160),
+    bodyText: (document.body?.innerText || '').slice(0, 512),
+})
+"""
+
+
+def _attach_page_failure_buffer(page: object) -> deque[str]:
+    """Retain only the four latest actionable page request failures."""
+    failures: deque[str] = deque(maxlen=4)
+    register = getattr(page, "on", None)
+    if not callable(register):
+        return failures
+
+    def on_response(response: object) -> None:
+        try:
+            status = getattr(response, "status", None)
+            if not isinstance(status, int) or isinstance(status, bool) or status < 400:
+                return
+            request = getattr(response, "request", None)
+            resource_type = _safe_resource_type(getattr(request, "resource_type", None))
+            endpoint = _bounded_safe_endpoint(getattr(response, "url", ""))
+            failures.append(
+                f"http_status={status} resource_type={resource_type} endpoint={endpoint}"
+            )
+        except Exception:  # noqa: BLE001
+            return
+
+    def on_request_failed(request: object) -> None:
+        try:
+            failure = str(getattr(request, "failure", "") or "unknown network failure")
+            if "net::ERR_ABORTED" in failure:
+                return
+            resource_type = _safe_resource_type(getattr(request, "resource_type", None))
+            endpoint = _bounded_safe_endpoint(getattr(request, "url", ""))
+            detail = _safe_error_detail(RuntimeError(failure))
+            failures.append(
+                f"network_error={detail} resource_type={resource_type} endpoint={endpoint}"
+            )
+        except Exception:  # noqa: BLE001
+            return
+
+    try:
+        register("response", on_response)
+        register("requestfailed", on_request_failed)
+    except Exception:  # noqa: BLE001
+        failures.clear()
+    return failures
+
+
+async def _capture_page_failure_diagnosis(
+    page: object, failures: deque[str] | None = None
+) -> str:
+    """Classify a failed page without retaining or logging its page contents."""
+    fields: list[str] = []
+    try:
+        page_url = getattr(page, "url", "")
+    except Exception:  # noqa: BLE001
+        page_url = ""
+    final_endpoint = _bounded_safe_endpoint(page_url)
+    if final_endpoint != "<invalid endpoint>":
+        fields.append(f"final_endpoint={final_endpoint}")
+    try:
+        summary = await asyncio.wait_for(
+            page.evaluate(PAGE_FAILURE_DIAGNOSIS_SCRIPT),  # type: ignore[attr-defined]
+            timeout=1.0,
+        )
+    except Exception:
+        fields.append("dom=unavailable")
+    else:
+        if not isinstance(summary, dict):
+            fields.append("dom=unavailable")
+        else:
+            canvas_count = summary.get("canvasCount")
+            if not isinstance(canvas_count, int) or isinstance(canvas_count, bool):
+                canvas_count = "unknown"
+            visible_text = (
+                f"{summary.get('title', '')} {summary.get('bodyText', '')}".casefold()
+            )
+            if "unusual traffic" in visible_text or "automated queries" in visible_text:
+                block_hint = "unusual-traffic"
+            elif "recaptcha" in visible_text or "captcha" in visible_text:
+                block_hint = "captcha"
+            else:
+                block_hint = "none"
+            fields.append(f"canvas_count={canvas_count} block_hint={block_hint}")
+    if failures:
+        fields.append("recent_failures=[" + " | ".join(failures) + "]")
+    return " ".join(fields)[:1000]
+
 
 def _canvas_candidate_rank(
     export_length: int, visible_area: float, bitmap_area: int
@@ -394,24 +604,41 @@ async def _export_page_canvas(page: object, viewport: tuple[int, int]) -> Image.
 
 
 async def _wait_for_stable_capture_page(
-    page: object, key: tuple[str, tuple[int, int]]
+    page: object,
+    key: tuple[str, tuple[int, int]],
+    *,
+    invalid_canvas_state: list[ValueError] | None = None,
 ) -> Image.Image:
     """Reject placeholders and changing canvases before a replacement can publish."""
     await page.wait_for_selector("canvas", timeout=15000)  # type: ignore[attr-defined]
     deadline = asyncio.get_running_loop().time() + PAGE_PREPARATION_TIMEOUT_SECONDS
     previous_digest: str | None = None
+    last_invalid_canvas: ValueError | None = None
     while asyncio.get_running_loop().time() < deadline:
         try:
             image = await _export_page_canvas(page, key[1])
-        except ValueError:
+        except ValueError as exc:
+            last_invalid_canvas = exc
+            if invalid_canvas_state is not None:
+                invalid_canvas_state[:] = [exc]
             await asyncio.sleep(CANVAS_STABILITY_INTERVAL_SECONDS)
             continue
+        last_invalid_canvas = None
+        if invalid_canvas_state is not None:
+            invalid_canvas_state.clear()
         digest = _capture_digest(image)
         if digest == previous_digest:
             return image
         previous_digest = digest
         await asyncio.sleep(CANVAS_STABILITY_INTERVAL_SECONDS)
-    raise ValueError("Google Maps canvas did not finish rendering stably")
+    if last_invalid_canvas is not None:
+        raise ValueError(
+            "Google Maps canvas did not finish rendering stably; "
+            f"last invalid canvas: {last_invalid_canvas}"
+        ) from last_invalid_canvas
+    raise ValueError(
+        "Google Maps canvas did not finish rendering stably; canvas pixels kept changing"
+    )
 
 
 async def _prepare_capture_page(
@@ -420,15 +647,36 @@ async def _prepare_capture_page(
     """Build a replacement independently, without changing the active page."""
     context: object | None = None
     page: object | None = None
+    phase = "launch"
+    phase_started = time.monotonic()
+    loop = asyncio.get_running_loop()
+    preparation_deadline = loop.time() + PAGE_PREPARATION_TIMEOUT_SECONDS
+    invalid_canvas_state: list[ValueError] = []
+    page_failures: deque[str] = deque(maxlen=4)
     try:
-        async with asyncio.timeout(PAGE_PREPARATION_TIMEOUT_SECONDS):
+        async with asyncio.timeout_at(preparation_deadline):
             browser = await _get_shared_browser()
             context = await browser.new_context(
                 viewport={"width": key[1][0], "height": key[1][1]}
             )
             page = await context.new_page()
-            await page.goto(key[0], wait_until="domcontentloaded", timeout=30000)
-            image = await _wait_for_stable_capture_page(page, key)
+            page_failures = _attach_page_failure_buffer(page)
+            phase = "navigation"
+            phase_started = time.monotonic()
+            response = await page.goto(
+                key[0], wait_until="domcontentloaded", timeout=30000
+            )
+            status = getattr(response, "status", None)
+            if isinstance(status, int) and not isinstance(status, bool) and status != 200:
+                response_url = getattr(response, "url", key[0])
+                raise RuntimeError(
+                    f"navigation returned HTTP {status} from {safe_endpoint(response_url)}"
+                )
+            phase = "stability"
+            phase_started = time.monotonic()
+            image = await _wait_for_stable_capture_page(
+                page, key, invalid_canvas_state=invalid_canvas_state
+            )
             return _PreparedCapturePage(
                 context=context,
                 page=page,
@@ -437,7 +685,23 @@ async def _prepare_capture_page(
                 loaded_at=time.monotonic(),
                 base_updated_at=datetime.now(UTC),
             )
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            try:
+                diagnosis = (
+                    await _capture_page_failure_diagnosis(page, page_failures)
+                    if page is not None and phase in {"navigation", "stability"}
+                    else ""
+                )
+            except asyncio.CancelledError:
+                await _close_capture_resources(page, context)
+                raise
+            if phase == "stability" and invalid_canvas_state:
+                invalid_detail = _safe_error_detail(invalid_canvas_state[-1])
+                diagnosis = f"last_invalid_canvas={invalid_detail} {diagnosis}".rstrip()
+            _log_capture_phase_failure(
+                phase, key[0], exc, phase_started, diagnosis
+            )
         await _close_capture_resources(page, context)
         raise
 
@@ -560,8 +824,10 @@ async def _take_ready_warming_page(
     except Exception as exc:  # noqa: BLE001
         _warming_retry_after = time.monotonic() + CAPTURE_FAILURE_BACKOFF_SECONDS
         log.warning(
-            "Google Maps replacement preparation failed (%s); retrying in %d s",
-            type(exc).__name__, int(CAPTURE_FAILURE_BACKOFF_SECONDS),
+            "Google Maps replacement unavailable endpoint=%s type=%s detail=%s; "
+            "retrying in %d s",
+            safe_endpoint(key[0]), type(exc).__name__, _safe_error_detail(exc),
+            int(CAPTURE_FAILURE_BACKOFF_SECONDS),
         )
         return None
     if prepared.key != key:
@@ -600,6 +866,7 @@ def _persist_capture(
 ) -> tuple[str, bool]:
     """Persist the latest pixels while retaining the document's original age."""
     global _last_capture_digest, _last_capture_image, _last_capture_identity
+    global _last_cache_warning, _last_withhold_warning
     digest = _capture_digest(image)
     identity = (os.path.abspath(cache_path), key)
     unchanged = (
@@ -638,6 +905,8 @@ def _persist_capture(
     _last_capture_digest = digest
     _last_capture_image = image.copy()
     _last_capture_identity = identity
+    _last_cache_warning = None
+    _last_withhold_warning = None
     return digest, not unchanged
 
 
@@ -690,10 +959,17 @@ async def capture_gmaps_base(
                     # An active export just failed, but its independently
                     # prepared replacement is still useful. Keep it alive and
                     # serve only the bounded disk fallback until it is ready.
+                    _log_base_withheld("replacement_warming", key)
                     return _cached_capture(cache_path, viewport)
                 await _discard_warming_page()
                 await _recycle_capture_page()
                 if time.monotonic() < _capture_retry_after:
+                    retry_remaining = _capture_retry_after - time.monotonic()
+                    _log_base_withheld(
+                        "capture_retry_backoff",
+                        key,
+                        retry_remaining=retry_remaining,
+                    )
                     return _cached_capture(cache_path, viewport)
                 await _create_capture_page(key)
             base_updated_at = _ensure_active_page_metadata()
@@ -703,6 +979,9 @@ async def capture_gmaps_base(
             if document_age >= PAGE_REFRESH_SECONDS:
                 # A warming page may complete on a later presentation tick,
                 # but an expired active document must never keep publishing.
+                _log_base_withheld(
+                    "hard_document_expiry", key, document_age=document_age
+                )
                 return _cached_capture(cache_path, viewport)
             image = await _export_page_canvas(_shared_page, viewport)
             captured_at = datetime.now(UTC)
@@ -710,8 +989,14 @@ async def capture_gmaps_base(
             # ready replacement's already-stable sample; otherwise do not
             # publish pixels from the expired document.
             if _active_document_age() >= PAGE_REFRESH_SECONDS:
+                expired_age = _active_document_age()
                 prepared = await _take_ready_warming_page(key)
                 if prepared is None:
+                    _log_base_withheld(
+                        "export_crossed_hard_expiry",
+                        key,
+                        document_age=expired_age,
+                    )
                     return _cached_capture(cache_path, viewport)
                 image = prepared.image.copy()
                 captured_at = prepared.base_updated_at
@@ -741,9 +1026,10 @@ async def capture_gmaps_base(
                         await _close_shared_browser()
             _capture_retry_after = time.monotonic() + CAPTURE_FAILURE_BACKOFF_SECONDS
             log.warning(
-                "Playwright Google Maps canvas export failed for %s (%s); retrying in %d s, "
-                "loading cache",
-                url, exc, int(CAPTURE_FAILURE_BACKOFF_SECONDS),
+                "Playwright Google Maps canvas export failed endpoint=%s type=%s "
+                "detail=%s; retrying in %d s, loading cache",
+                safe_endpoint(url), type(exc).__name__, _safe_error_detail(exc),
+                int(CAPTURE_FAILURE_BACKOFF_SECONDS),
             )
             return _cached_capture(cache_path, viewport)
 
@@ -752,27 +1038,43 @@ def _cached_capture(
     cache_path: str, viewport: tuple[int, int]
 ) -> MapCapture:
     """Serve only a recent last-good base, preserving its document age."""
-    if os.path.exists(cache_path):
-        try:
-            base_updated_at = datetime.fromtimestamp(os.path.getmtime(cache_path), UTC)
-            age = (datetime.now(UTC) - base_updated_at).total_seconds()
-            if not 0 <= age <= MAP_CAPTURE_MAX_AGE_SECONDS:
-                return MapCapture(None, None, stale=True)
-            with Image.open(cache_path) as cached:
-                cached.load()
-                image = _normalize_canvas_image(cached, viewport)
-                captured_at = _cached_export_timestamp(
-                    cache_path, image, base_updated_at
-                )
-                return MapCapture(
-                    image,
-                    captured_at,
-                    stale=True,
-                    base_updated_at=base_updated_at,
-                )
-        except Exception:  # noqa: BLE001
-            pass
-    return MapCapture(None, None, stale=True)
+    global _last_cache_warning
+    if not os.path.exists(cache_path):
+        _log_cache_unavailable(cache_path, "missing")
+        return MapCapture(None, None, stale=True)
+    try:
+        base_updated_at = datetime.fromtimestamp(os.path.getmtime(cache_path), UTC)
+        age = (datetime.now(UTC) - base_updated_at).total_seconds()
+        if age < 0:
+            _log_cache_unavailable(
+                cache_path,
+                "invalid",
+                age=age,
+                exc=ValueError("cache timestamp is in the future"),
+            )
+            return MapCapture(None, None, stale=True)
+        if age > MAP_CAPTURE_MAX_AGE_SECONDS:
+            _log_cache_unavailable(cache_path, "expired", age=age)
+            return MapCapture(None, None, stale=True)
+        with Image.open(cache_path) as cached:
+            cached.load()
+            image = _normalize_canvas_image(cached, viewport)
+            captured_at = _cached_export_timestamp(cache_path, image, base_updated_at)
+    except Exception as exc:  # noqa: BLE001
+        _log_cache_unavailable(cache_path, "invalid", exc=exc)
+        return MapCapture(None, None, stale=True)
+    _last_cache_warning = None
+    log.debug(
+        "Google Maps cache fallback used reason=recent age_s=%.3f max_age_s=%.3f",
+        age,
+        MAP_CAPTURE_MAX_AGE_SECONDS,
+    )
+    return MapCapture(
+        image,
+        captured_at,
+        stale=True,
+        base_updated_at=base_updated_at,
+    )
 
 
 def load_tile(_cache_dir: str, _zoom: int, _x: int, _y: int) -> Image.Image | None:

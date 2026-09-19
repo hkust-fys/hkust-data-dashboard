@@ -22,6 +22,7 @@ def capture_state(monkeypatch):
         "_last_capture_digest", "_last_capture_image", "_last_capture_identity",
         "_capture_lock", "_capture_lock_loop", "_browser_loop", "_playwright_manager",
         "_warming_task", "_warming_key", "_warming_loop",
+        "_last_cache_warning", "_last_withhold_warning",
     ):
         monkeypatch.setattr(tiles, name, None)
     monkeypatch.setattr(tiles, "_capture_retry_after", 0.0)
@@ -99,11 +100,51 @@ async def test_failed_capture_keeps_original_timestamp_and_retries_after_ten_sec
     await tiles.shutdown_gmaps_browser()
 
 
+@pytest.mark.asyncio
+async def test_empty_launch_timeout_log_has_phase_safe_endpoint_and_detail(
+    monkeypatch, caplog, capture_state,
+):
+    async def unavailable():
+        raise TimeoutError()
+
+    monkeypatch.setattr(tiles, "_get_shared_browser", unavailable)
+    with pytest.raises(TimeoutError):
+        await tiles._prepare_capture_page(
+            ("https://www.google.com/maps?token=do-not-log", (40, 20))
+        )
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "phase=launch" in messages
+    assert "endpoint=https://www.google.com/maps" in messages
+    assert "type=TimeoutError" in messages
+    assert "detail=operation timed out" in messages
+    assert "elapsed=" in messages
+    assert "do-not-log" not in messages
+
+
 def test_disk_fallback_expires_instead_of_showing_old_traffic(tmp_path):
     path, image = cached_map(tmp_path, age=301)
     result = tiles._cached_capture(str(path), image.size)
     assert result.image is None and result.captured_at is None
     assert result.stale
+
+
+def test_expired_cache_warning_has_age_and_is_not_repeated(
+    tmp_path, monkeypatch, caplog,
+):
+    path, image = cached_map(tmp_path, age=61)
+    monkeypatch.setattr(tiles, "_last_cache_warning", None)
+    first = tiles._cached_capture(str(path), image.size)
+    second = tiles._cached_capture(str(path), image.size)
+    assert first.image is None and second.image is None
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Google Maps cache unavailable reason=expired" in record.getMessage()
+        and record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert "age_s=" in warnings[0]
+    assert f"max_age_s={tiles.MAP_CAPTURE_MAX_AGE_SECONDS:.3f}" in warnings[0]
 
 
 @pytest.mark.asyncio
@@ -169,6 +210,77 @@ async def test_capture_continues_while_replacement_warms_then_swaps_atomically(
     assert tiles._shared_page is replacement
     assert active.closed and active_context.closed
     assert active.exports == 2 and replacement.exports == 1
+    await tiles.shutdown_gmaps_browser()
+
+
+@pytest.mark.asyncio
+async def test_twenty_second_warmup_allows_twenty_five_second_replacement_before_expiry(
+    tmp_path, monkeypatch, capture_state,
+):
+    clock = [100.0]
+    monkeypatch.setattr(tiles, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    class Resource:
+        def __init__(self, image=None):
+            self.image = image
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    active = Resource(Image.new("RGB", (40, 20), (10, 20, 30)))
+    active_context = Resource()
+    replacement = Resource(Image.new("RGB", (40, 20), (210, 220, 230)))
+    replacement_context = Resource()
+    key = (tiles.GMAPS_BASE_URL, active.image.size)
+    tiles._shared_page = active
+    tiles._shared_context = active_context
+    tiles._capture_key = key
+    tiles._page_loaded_at = clock[0]
+    tiles._page_base_updated_at = datetime.now(UTC)
+    started, release = asyncio.Event(), asyncio.Event()
+    attempts = []
+
+    async def export(page, _viewport):
+        return page.image.copy()
+
+    async def prepare(prepared_key):
+        attempts.append(clock[0])
+        assert prepared_key == key
+        started.set()
+        await release.wait()
+        return tiles._PreparedCapturePage(
+            replacement_context,
+            replacement,
+            key,
+            replacement.image.copy(),
+            clock[0],
+            datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(tiles, "_export_page_canvas", export)
+    monkeypatch.setattr(tiles, "_prepare_capture_page", prepare)
+
+    clock[0] = 119.0
+    await tiles.capture_gmaps_base(str(tmp_path), viewport=active.image.size)
+    assert tiles._warming_task is None
+    clock[0] = 120.0
+    during_warmup = await tiles.capture_gmaps_base(
+        str(tmp_path), viewport=active.image.size
+    )
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    assert attempts == [120.0]
+    assert during_warmup.image.getpixel((5, 5)) == (10, 20, 30)
+
+    clock[0] = 145.0
+    release.set()
+    await asyncio.wait_for(asyncio.shield(tiles._warming_task), timeout=0.2)
+    clock[0] = 150.0
+    swapped = await tiles.capture_gmaps_base(str(tmp_path), viewport=active.image.size)
+    assert swapped.image.getpixel((5, 5)) == (210, 220, 230)
+    assert not swapped.stale
+    assert tiles._shared_page is replacement
+    assert active.closed and active_context.closed
     await tiles.shutdown_gmaps_browser()
 
 
@@ -637,7 +749,7 @@ def test_retained_map_ages_without_being_relabeled_as_a_new_capture():
         b"webp", expired, markers_refreshed_at=markers_time,
     )})
     assert not payload.files
-    assert any("traffic map unavailable" in str(embed.to_dict()) for embed in payload.embeds)
+    assert payload.embeds[0].title == "Traffic map unavailable"
 
 
 def test_empty_news_does_not_imply_clear_roads_or_invent_report_time():

@@ -21,6 +21,26 @@ def test_settings_from_env_valid(monkeypatch):
     assert settings.update_interval_seconds == 10
 
 
+def test_settings_rthk_news_max_age_hours_is_configurable(monkeypatch):
+    monkeypatch.setenv("DISCORD_TOKEN", "abc")
+    monkeypatch.setenv("ANNOUNCE_CHANNEL_ID", "12345")
+    monkeypatch.setenv("RTHK_NEWS_MAX_AGE_HOURS", "2.5")
+
+    settings = Settings.from_env(require_keys=True)
+
+    assert settings.rthk_news_max_age_hours == 2.5
+
+
+@pytest.mark.parametrize("value", ["0", "nan", "inf", "-inf"])
+def test_settings_rejects_invalid_rthk_news_max_age_hours(monkeypatch, value):
+    monkeypatch.setenv("DISCORD_TOKEN", "abc")
+    monkeypatch.setenv("ANNOUNCE_CHANNEL_ID", "12345")
+    monkeypatch.setenv("RTHK_NEWS_MAX_AGE_HOURS", value)
+
+    with pytest.raises(ConfigError):
+        Settings.from_env(require_keys=True)
+
+
 def test_settings_missing_required_keys(monkeypatch):
     monkeypatch.delenv("DISCORD_TOKEN", raising=False)
     monkeypatch.delenv("ANNOUNCE_CHANNEL_ID", raising=False)

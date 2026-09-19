@@ -28,6 +28,10 @@ from dashboard.providers import tracked_roads as tracked_roads_provider
 from dashboard.providers import traffic as traffic_provider
 from dashboard.providers import traffic_location, transit
 from dashboard.providers import weather as weather_provider
+from dashboard.providers.traffic_news import (
+    DEFAULT_RTHK_NEWS_MAX_AGE_HOURS,
+    filter_expired_rthk_incidents,
+)
 from dashboard.render import build_payload
 
 log = logging.getLogger(__name__)
@@ -38,7 +42,10 @@ MapPaths: TypeAlias = tuple[list[RoadPath], list[RoadPath]]
 TRACKED_ROADS_WAIT_SECONDS = 5.0
 
 
-def map_road_paths_from_results(traffic_result: object, roads: object) -> MapPaths:
+def map_road_paths_from_results(
+    traffic_result: object, roads: object, *,
+    rthk_news_max_age_hours: float = DEFAULT_RTHK_NEWS_MAX_AGE_HOURS,
+) -> MapPaths:
     """Derive affected and important map paths from published results."""
     important_paths = road_policy.important_road_paths(roads)
     if not (isinstance(traffic_result, tuple) and len(traffic_result) >= 3):
@@ -48,7 +55,9 @@ def map_road_paths_from_results(traffic_result: object, roads: object) -> MapPat
         return [], important_paths
     paths = []
     seen_paths: set[tuple[tuple[float, float], ...]] = set()
-    for incident in traffic_result[1] or []:
+    for incident in filter_expired_rthk_incidents(
+        traffic_result[1] or [], now=datetime.now(UTC), max_age_hours=rthk_news_max_age_hours
+    ):
         if getattr(incident, "is_cleared", False):
             continue
         if getattr(incident, "location_resolution", ""):
@@ -94,7 +103,10 @@ async def fetch_traffic_map_from_results(
     roads = results.get("tracked_roads")
     if roads is None or isinstance(roads, Exception):
         roads = tracked_roads_provider.fallback_roads()
-    affected, important = map_road_paths_from_results(results.get("traffic"), roads)
+    affected, important = map_road_paths_from_results(
+        results.get("traffic"), roads,
+        rthk_news_max_age_hours=settings.rthk_news_max_age_hours,
+    )
     return await maps.fetch_traffic_map(
         client,
         groups=groups,
@@ -139,7 +151,9 @@ async def collect_all(
             )
         except Exception:
             roads = tracked_roads_provider.fallback_roads()
-        result = await traffic_provider.fetch_traffic_data(client, roads)
+        result = await traffic_provider.fetch_traffic_data(
+            client, roads, rthk_news_max_age_hours=settings.rthk_news_max_age_hours
+        )
         if result[1]:
             try:
                 geometry = await route_geometry_provider.fetch_route_geometry(
@@ -170,7 +184,9 @@ async def collect_all(
             )
         except Exception:
             roads = tracked_roads_provider.fallback_roads()
-        affected, important = map_road_paths_from_results(tr, roads)
+        affected, important = map_road_paths_from_results(
+            tr, roads, rthk_news_max_age_hours=settings.rthk_news_max_age_hours
+        )
         return await maps.fetch_traffic_map(
             client,
             groups=groups,
@@ -214,7 +230,11 @@ async def collect_all(
             await asyncio.gather(*remaining, return_exceptions=True)
 
 
-def to_payload(results: ProviderResults) -> DashboardPayload:
+def to_payload(
+    results: ProviderResults, *,
+    rthk_news_max_age_hours: float = DEFAULT_RTHK_NEWS_MAX_AGE_HOURS,
+    now: datetime | None = None,
+) -> DashboardPayload:
     """Adapt isolated provider results to the renderer contract."""
     errors: list[str] = []
     tr = results.get("transit")
@@ -251,6 +271,9 @@ def to_payload(results: ProviderResults) -> DashboardPayload:
         stale = []
     else:
         statuses, incidents, roadworks, capture, stale = [], [], [], None, []
+    incidents = filter_expired_rthk_incidents(
+        incidents, now=now or datetime.now(UTC), max_age_hours=rthk_news_max_age_hours
+    )
     present = "traffic_map" in results
     mr = results.get("traffic_map")
     map_time = None

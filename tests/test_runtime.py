@@ -378,8 +378,9 @@ def test_to_payload_distinguishes_missing_map_from_present_failure():
     failed = _to_payload(
         {"traffic": ([], [], [], None), "traffic_map": ValueError("capture failed")}
     )
-    assert failed.embeds[0].title == "🚦 Traffic news"
-    assert any(
+    assert failed.embeds[0].title == "Traffic map unavailable"
+    assert failed.embeds[1].title == "🚦 Traffic news"
+    assert not any(
         e.fields and "traffic map unavailable" in e.fields[0].value
         for e in failed.embeds
     )
@@ -461,14 +462,15 @@ async def test_updater_edits_same_message_and_no_duplicate(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_updater_rolls_old_dashboard_before_discord_edit_cap(monkeypatch):
+@pytest.mark.parametrize("age_minutes", [56, 61, 180, 2880])
+async def test_updater_keeps_old_dashboard_and_thread(monkeypatch, age_minutes):
     import bot as bot_module
 
     old_thread = _FakeThread()
     old = _FakeMessage(
         _FakeAuthor(bot=True),
         DASHBOARD_MESSAGE_MARKER,
-        created_at=datetime.now(UTC) - timedelta(minutes=56),
+        created_at=datetime.now(UTC) - timedelta(minutes=age_minutes),
     )
     channel = _FakeChannel([old])
     payload = DashboardPayload(files=[ImageAsset("map.png", b"fresh-map")])
@@ -483,12 +485,11 @@ async def test_updater_rolls_old_dashboard_before_discord_edit_cap(monkeypatch):
 
     await updater._tick(channel)  # noqa: SLF001
 
-    assert old.deleted
-    assert old.edits == 0
-    assert updater._message is channel.sent[0]  # noqa: SLF001
-    assert updater._thread is None  # noqa: SLF001
-    assert channel.send_kwargs[0]["content"] == DASHBOARD_MESSAGE_MARKER
-    assert len(channel.send_kwargs[0]["files"]) == 1
+    assert not old.deleted
+    assert old.edits == 1
+    assert updater._message is old
+    assert updater._thread is old_thread
+    assert not channel.sent
     assert updater._last_payload_fingerprint == _payload_fingerprint(payload)  # noqa: SLF001
 
 
@@ -513,7 +514,9 @@ async def test_dashboard_rollover_tracks_old_message_if_delete_fails(monkeypatch
     monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
     monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
 
-    await updater._tick(channel)  # noqa: SLF001
+    # Seed recovery state written by the former rollover implementation.
+    updater._dashboard_messages_reconciled = True
+    await updater._rollover_dashboard(channel, payload, _payload_fingerprint(payload))
 
     replacement = channel.sent[0]
     assert updater._message is replacement  # noqa: SLF001
@@ -630,7 +633,9 @@ async def test_dashboard_rollover_treats_missing_old_message_as_success(monkeypa
     monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
     monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
 
-    await updater._tick(channel)  # noqa: SLF001
+    # Seed recovery state written by the former rollover implementation.
+    updater._dashboard_messages_reconciled = True
+    await updater._rollover_dashboard(channel, payload, _payload_fingerprint(payload))
 
     assert updater._message is channel.sent[0]  # noqa: SLF001
     assert not updater._pending_dashboard_deletes  # noqa: SLF001
@@ -677,7 +682,7 @@ async def test_cancelled_rollover_finishes_single_handoff(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_updater_rolls_dashboard_when_discord_reports_old_edit_cap(monkeypatch):
+async def test_updater_keeps_dashboard_when_discord_reports_old_edit_cap(monkeypatch):
     import bot as bot_module
 
     class OldMessageEditCap(Exception):
@@ -706,9 +711,11 @@ async def test_updater_rolls_dashboard_when_discord_reports_old_edit_cap(monkeyp
 
     await updater._tick(channel)  # noqa: SLF001
 
-    assert old.deleted
-    assert updater._message is channel.sent[0]  # noqa: SLF001
-    assert updater._last_payload_fingerprint == _payload_fingerprint(payload)  # noqa: SLF001
+    assert not old.deleted
+    assert not channel.sent
+    assert updater._message is old
+    assert updater._last_payload_fingerprint is None
+    assert updater._dashboard_edit_retry_at > bot_module.time.monotonic()  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -735,6 +742,151 @@ async def test_updater_bounds_discord_edit_retry_wait(monkeypatch):
     await asyncio.wait_for(updater._tick(channel), timeout=0.25)  # noqa: SLF001
 
     assert updater._last_payload_fingerprint is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_edit_cooldown_keeps_thread_updates_and_retries_same_message(monkeypatch):
+    import bot as bot_module
+
+    class LimitedOnce(_FakeMessage):
+        attempts = 0
+
+        async def edit(self, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                response = SimpleNamespace(status=429, reason="Rate limited", headers={
+                    "Retry-After": "120",
+                })
+                raise discord.HTTPException(response, {"code": 30046, "message": "Try later"})
+            await super().edit(**kwargs)
+
+    old = LimitedOnce(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER)
+    channel = _FakeChannel([old])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True
+    updater._message = old
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    payload = DashboardPayload(files=[ImageAsset("map.png", b"map")])
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    status_cycles = []
+
+    async def status_updates():
+        status_cycles.append(True)
+
+    monkeypatch.setattr(updater, "_process_alert_snapshot", status_updates)
+    await updater._tick(channel)
+    assert updater._dashboard_edit_retry_at - bot_module.time.monotonic() > 119
+    await updater._tick(channel)
+    assert old.attempts == 1
+    assert len(status_cycles) == 2
+    updater._dashboard_edit_retry_at = bot_module.time.monotonic() - 1
+    await updater._tick(channel)
+    assert old.attempts == 2
+    assert old.edits == 1
+    assert updater._message is old
+    assert not channel.sent and not old.deleted
+    assert updater._last_payload_fingerprint == _payload_fingerprint(payload)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_missing_dashboard_recovers_once_without_deleting(monkeypatch):
+    import bot as bot_module
+
+    def missing():
+        return discord.NotFound(
+            SimpleNamespace(status=404, reason="Not found"), {"code": 10008}
+        )
+
+    class DeletedMessage(_FakeMessage):
+        async def edit(self, **_kwargs):
+            raise missing()
+
+        async def delete(self):
+            raise AssertionError("recovery must not delete the dashboard")
+
+    class Channel(_FakeChannel):
+        async def fetch_message(self, _message_id):
+            raise missing()
+
+    old = DeletedMessage(_FakeAuthor(bot=True), DASHBOARD_MESSAGE_MARKER, id=321)
+    channel = Channel([])
+    updater = DashboardUpdater(_fake_settings())
+    updater._running = True
+    updater._message = old
+    updater._dashboard_messages_reconciled = True
+    updater._persisted_dashboard_message_id = old.id
+    updater._snapshot = bot_module.CollectionSnapshot({}, 1, 0.0)
+    payload = DashboardPayload(embeds=[discord.Embed(title="Current dashboard")])
+    monkeypatch.setattr(updater, "_snapshot_payload", lambda: payload)
+    monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(updater, "_process_alert_snapshot", lambda: asyncio.sleep(0))
+
+    await updater._tick(channel)
+    assert updater._message is None
+    assert not channel.sent
+    await updater._tick(channel)
+    await updater._tick(channel)
+    assert len(channel.sent) == 1
+    assert updater._message is channel.sent[0]
+    assert updater._message.id != old.id
+
+
+@pytest.mark.asyncio
+async def test_thread_creation_race_fetches_the_attached_thread():
+    thread = _FakeThread()
+    thread.id = 321
+
+    class Message(_CreatableThreadMessage):
+        fetches = 0
+
+        async def fetch_thread(self):
+            self.fetches += 1
+            if self.fetches == 1:
+                raise discord.NotFound(
+                    SimpleNamespace(status=404, reason="Not found"), {"code": 10003}
+                )
+            return thread
+
+        async def create_thread(self, **kwargs):
+            self.created_threads += 1
+            assert kwargs == {"name": "status updates"}
+            raise discord.HTTPException(
+                SimpleNamespace(status=400, reason="Bad request"), {"code": 160004}
+            )
+
+    message = Message(id=321)
+    updater = DashboardUpdater(_fake_settings())
+    updater._message = message
+    await updater._ensure_thread()
+    assert updater._thread is thread
+    assert updater._status_thread_id == message.id
+    assert message.fetches == 2
+    assert message.created_threads == 1
+
+
+@pytest.mark.asyncio
+async def test_thread_unarchive_retains_discord_returned_object():
+    unarchived = _FakeThread()
+    unarchived.id = 321
+
+    class Archived(_FakeThread):
+        async def edit(self, **kwargs):
+            self.edits.append(kwargs)
+            return unarchived
+
+    archived = Archived(archived=True)
+    message = _ThreadedMessage(archived, id=321)
+    message.thread = archived
+    updater = DashboardUpdater(_fake_settings())
+    updater._message = message
+    await updater._ensure_thread()
+    await updater._ensure_thread()
+    assert updater._thread is unarchived
+    assert archived.edits == [{"archived": False}]
+    updater._pending_alert_messages.append(("weather update", False))
+    await updater._flush_alert_messages()
+    assert unarchived.sent[0]["content"] == "weather update"
 
 
 @pytest.mark.asyncio
@@ -773,7 +925,10 @@ async def test_timed_out_accepted_rollover_is_reconciled_before_retry(
     monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
     monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
 
-    await updater._tick(channel)  # noqa: SLF001
+    # Seed recovery state written by the former rollover implementation.
+    updater._dashboard_messages_reconciled = True
+    with pytest.raises(TimeoutError):
+        await updater._rollover_dashboard(channel, payload, _payload_fingerprint(payload))
     assert len(channel.sent) == 1
     assert updater._rollover_uncertain_since is not None  # noqa: SLF001
 
@@ -990,7 +1145,10 @@ async def test_rollover_nonce_deduplicates_before_history_is_visible(
     monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
     monkeypatch.setattr(bot_module, "DASHBOARD_DISCORD_TIMEOUT_SECONDS", 0.01)
 
-    await updater._tick(channel)  # noqa: SLF001
+    # Seed recovery state written by the former rollover implementation.
+    updater._dashboard_messages_reconciled = True
+    with pytest.raises(TimeoutError):
+        await updater._rollover_dashboard(channel, payload, _payload_fingerprint(payload))
 
     nonce = updater._dashboard_send_nonce  # noqa: SLF001
     assert nonce is not None
@@ -1449,7 +1607,7 @@ async def test_unobserved_rejection_conservatively_retains_send_nonce(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_first_explicit_rollover_rejection_can_retry(monkeypatch):
+async def test_rejected_legacy_rollover_resumes_editing_original(monkeypatch):
     import bot as bot_module
 
     class ExplicitRejection(Exception):
@@ -1487,17 +1645,21 @@ async def test_first_explicit_rollover_rejection_can_retry(monkeypatch):
     monkeypatch.setattr(updater, "_ensure_thread", lambda: asyncio.sleep(0))
     monkeypatch.setattr(updater, "_post_alert_events", lambda _results: asyncio.sleep(0))
 
-    await updater._tick(channel)  # noqa: SLF001
+    # Seed recovery state written by the former rollover implementation.
+    updater._dashboard_messages_reconciled = True
+    with pytest.raises(ExplicitRejection):
+        await updater._rollover_dashboard(channel, payload, _payload_fingerprint(payload))
     assert channel.attempts == 1
     assert updater._dashboard_send_nonce is None  # noqa: SLF001
     assert updater._message is old  # noqa: SLF001
     assert not old.deleted
 
     await updater._tick(channel)  # noqa: SLF001
-    assert channel.attempts == 2
-    assert len(channel.sent) == 1
-    assert updater._message is channel.sent[0]  # noqa: SLF001
-    assert old.deleted
+    assert channel.attempts == 1
+    assert not channel.sent
+    assert updater._message is old
+    assert old.edits == 1
+    assert not old.deleted
 
 
 @pytest.mark.asyncio
@@ -1600,7 +1762,10 @@ async def test_restarted_hidden_rollover_retires_predecessor_and_edits_current_p
     monkeypatch.setattr(first, "_ensure_thread", lambda: asyncio.sleep(0))
     monkeypatch.setattr(first, "_post_alert_events", lambda _results: asyncio.sleep(0))
 
-    await first._tick(channel)  # noqa: SLF001
+    # Seed recovery state written by the former rollover implementation.
+    first._dashboard_messages_reconciled = True
+    with pytest.raises(TimeoutError):
+        await first._rollover_dashboard(channel, first_payload, _payload_fingerprint(first_payload))
     nonce = first._dashboard_send_nonce  # noqa: SLF001
     assert nonce is not None
     assert first._dashboard_send_predecessor_id == old.id  # noqa: SLF001
@@ -2184,14 +2349,15 @@ async def test_expired_nonce_edit_failure_cannot_rollover_or_send(tmp_path, fail
     await updater._tick(channel)  # noqa: SLF001
 
     assert not channel.sent
-    assert updater._last_payload_fingerprint == "old-fingerprint"  # noqa: SLF001
+    expected = None if getattr(failure, "status", None) == 404 else "old-fingerprint"
+    assert updater._last_payload_fingerprint == expected
     assert updater._dashboard_send_nonce == 123  # noqa: SLF001
     assert updater._rollover_uncertain_since == 1.0  # noqa: SLF001
     assert not updater._dashboard_messages_reconciled  # noqa: SLF001
 
 
 @pytest.mark.asyncio
-async def test_first_rollover_creates_thread_attached_to_replacement(monkeypatch, tmp_path):
+async def test_old_dashboard_reuses_its_attached_thread(monkeypatch, tmp_path):
     import bot as bot_module
 
     thread = _FakeThread()
@@ -2219,12 +2385,13 @@ async def test_first_rollover_creates_thread_attached_to_replacement(monkeypatch
 
     await updater._tick(channel)  # noqa: SLF001
 
-    assert old.deleted
-    assert updater._message is channel.sent[0]  # noqa: SLF001
-    assert updater._thread is channel.sent[0].thread  # noqa: SLF001
-    assert updater._thread is not thread  # noqa: SLF001
-    assert updater._status_thread_id == channel.sent[0].id  # noqa: SLF001
-    assert channel.sent[0].created_threads == 1
+    assert not old.deleted
+    assert not channel.sent
+    assert updater._message is old
+    assert old.edits == 1
+    assert updater._thread is thread
+    assert updater._status_thread_id == old.id
+    assert old.created_threads == 0
 
 
 @pytest.mark.asyncio
@@ -2480,7 +2647,7 @@ async def test_apply_payload_retains_unchanged_content_addressed_attachment():
 
 
 @pytest.mark.asyncio
-async def test_apply_payload_reuses_live_warning_thumbnail_when_attachments_omitted():
+async def test_apply_payload_reuploads_warning_when_only_cdn_thumbnail_remains():
     import time
 
     from bot import _apply_payload
@@ -2512,8 +2679,12 @@ async def test_apply_payload_reuses_live_warning_thumbnail_when_attachments_omit
 
     await _apply_payload(message, payload)
 
-    assert message.kwargs["attachments"] == []
-    assert message.kwargs["embeds"][0].thumbnail.url == live_url
+    uploaded = message.kwargs["attachments"]
+    assert len(uploaded) == 1
+    assert isinstance(uploaded[0], discord.File)
+    assert uploaded[0].filename == filename
+    uploaded[0].close()
+    assert message.kwargs["embeds"][0].thumbnail.url == f"attachment://{filename}"
     assert payload.embeds[0].thumbnail.url == f"attachment://{filename}"
 
 
@@ -2554,23 +2725,7 @@ async def test_apply_payload_reuploads_warning_for_expired_cdn_thumbnail():
     uploaded[0].close()
 
 
-def test_warning_thumbnail_reuse_rejects_other_channel_and_non_discord_hosts():
-    import time
 
-    from bot import _trusted_live_discord_attachment_url
-
-    filename = "hko-warnings-0123456789ab.png"
-    expires = f"{int(time.time()) + 600:x}"
-    assert not _trusted_live_discord_attachment_url(
-        f"https://cdn.discordapp.com/attachments/999/456/{filename}?ex={expires}",
-        filename=filename,
-        channel_id=123,
-    )
-    assert not _trusted_live_discord_attachment_url(
-        f"https://example.com/attachments/123/456/{filename}?ex={expires}",
-        filename=filename,
-        channel_id=123,
-    )
 
 
 def test_dry_run_recognizes_content_addressed_traffic_map_filename():
@@ -2870,6 +3025,7 @@ async def test_independent_map_keeps_retained_traffic_and_important_road_overlay
     incident = SimpleNamespace(
         latitude=22.33, longitude=114.22,
         near_landmark=None, between_landmark=None,
+        source="TD", related_reports=(),
     )
 
     class Roads:
@@ -3230,7 +3386,7 @@ async def test_collect_all_reuses_tracked_roads_after_timeout_for_important_path
     async def weather(*_args, **_kwargs):
         return (None, [], None)
 
-    async def traffic(_client, matched_roads):
+    async def traffic(_client, matched_roads, **_kwargs):
         assert matched_roads is not roads_table
         release_roads.set()
         await asyncio.sleep(0)
@@ -3562,17 +3718,109 @@ async def test_traffic_thread_allows_only_intended_configured_role():
 
 
 @pytest.mark.asyncio
-async def test_updater_fetches_and_unarchives_dashboard_message_thread():
+async def test_updater_fetches_and_unarchives_dashboard_message_thread(caplog):
     updater = DashboardUpdater(_fake_settings())
     thread = _FakeThread(archived=True)
     message = _ThreadedMessage(thread)
     updater._message = message  # noqa: SLF001
 
-    await updater._ensure_thread()  # noqa: SLF001
+    with caplog.at_level("INFO", logger="bot"):
+        await updater._ensure_thread()  # noqa: SLF001
 
     assert updater._thread is thread  # noqa: SLF001
     assert thread.edits == [{"archived": False}]
     assert message.created_threads == 0
+    assert "message_id=1 thread_id=1" in caplog.text
+    assert "via=starter_id_fetch unarchived=True" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_thread_failure_diagnostics_identify_operation_and_retained_queue(caplog):
+    class Forbidden(Exception):
+        status = 403
+        code = 50013
+
+    message = _CreatableThreadMessage(id=123)
+
+    async def forbidden(**_kwargs):
+        raise Forbidden("missing permissions")
+
+    message.create_thread = forbidden
+    updater = DashboardUpdater(replace(_fake_settings(), announce_channel_id=123))
+    updater._message = message
+    updater._pending_alert_messages.append(("private queued message text", False))
+    await updater._ensure_thread()
+    assert "POST /channels/123/messages/123/threads" in caplog.text
+    assert "via=created error=Forbidden status=403 code=50013" in caplog.text
+    assert "timeout_s=4.0 pending_alerts=1" in caplog.text
+    assert "private queued message text" not in caplog.text
+    assert updater._thread is None
+    assert len(updater._pending_alert_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_thread_send_logs_retry_and_delivery_without_message_text(caplog):
+    updater = DashboardUpdater(replace(_fake_settings(), announce_channel_id=123))
+    thread = _FailOnceThread()
+    updater._message = _ThreadedMessage(thread, id=321)
+    updater._thread = thread
+    updater._pending_alert_messages.append(("private queued message text", False))
+    with caplog.at_level("INFO", logger="bot"):
+        await updater._flush_alert_messages()
+        await updater._ensure_thread()
+        await updater._flush_alert_messages()
+    assert "POST /channels/321/messages failed" in caplog.text
+    assert "pending_alerts=1" in caplog.text
+    assert "status update delivered channel_id=123 message_id=321 thread_id=321" in caplog.text
+    assert "remaining_alerts=0" in caplog.text
+    assert "private queued message text" not in caplog.text
+    assert not updater._pending_alert_messages
+
+
+def test_dashboard_health_logs_expiry_missing_icons_recovery_and_bounded_heartbeat(monkeypatch, caplog):
+    import bot as bot_module
+    from dashboard.models import TrafficMapResult, WeatherWarning
+
+    now = datetime.now(UTC)
+    monotonic_time = [100.0]
+    monkeypatch.setattr(bot_module.time, "monotonic", lambda: monotonic_time[0])
+    updater = DashboardUpdater(_fake_settings())
+    results = {
+        "traffic_map": TrafficMapResult(
+            b"map", now - timedelta(seconds=5), base_updated_at=now - timedelta(seconds=75),
+        ),
+        "weather": (None, [WeatherWarning("WHOT", "Very Hot Weather Warning")], now),
+    }
+    updater._snapshot = bot_module.CollectionSnapshot(results, 1, 0.0)
+    with caplog.at_level("INFO", logger="bot"):
+        updater._log_dashboard_health(updater._snapshot_payload())
+        updater._log_dashboard_health(updater._snapshot_payload())
+        assert len(caplog.records) == 1
+        assert "map_state=base_expired" in caplog.text
+        assert "missing_warning_icons=('WHOT',) warning_strip=False" in caplog.text
+        results["traffic_map"] = TrafficMapResult(b"map", now, base_updated_at=now)
+        updater._log_dashboard_health(updater._snapshot_payload())
+        assert len(caplog.records) == 2
+        assert "map_state=available" in caplog.records[-1].message
+        monotonic_time[0] += 301
+        updater._log_dashboard_health(updater._snapshot_payload())
+        assert len(caplog.records) == 3
+
+
+def test_dashboard_permissions_log_only_missing_effective_permissions(caplog):
+    from bot import _diagnose_dashboard_permissions
+
+    permissions = SimpleNamespace(
+        view_channel=True, send_messages=True, embed_links=True, attach_files=False,
+        read_message_history=True, create_public_threads=False, send_messages_in_threads=True,
+    )
+    channel = SimpleNamespace(
+        id=123, guild=SimpleNamespace(id=456, me=SimpleNamespace(id=789)),
+        permissions_for=lambda _member: permissions,
+    )
+    _diagnose_dashboard_permissions(channel)
+    assert "channel_id=123 guild_id=456 bot_id=789" in caplog.text
+    assert "missing=['attach_files', 'create_public_threads']" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -4148,7 +4396,7 @@ def test_runtime_preflight_missing_imageio_is_actionable(monkeypatch):
         runtime.resolve_ffmpeg_executable()
 
 
-def test_missing_camera_dependency_warns_but_dashboard_continues(monkeypatch, capsys):
+def test_missing_camera_dependency_warns_but_dashboard_continues(monkeypatch, caplog):
     import bot as bot_module
     from dashboard.config import ConfigError
 
@@ -4162,9 +4410,26 @@ def test_missing_camera_dependency_warns_but_dashboard_continues(monkeypatch, ca
 
     monkeypatch.setattr(bot_module, "startup_preflight", failed_preflight)
     monkeypatch.setattr(bot_module, "run_dry_run", fake_dry_run)
+    monkeypatch.setattr(bot_module, "_setup_logging", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot_module, "load_dotenv", lambda: None)
     assert bot_module.main(["--dry-run", "--no-keys"]) == 0
     assert observed["ffmpeg"] is None
-    assert "Cameras are disabled; the dashboard will continue" in capsys.readouterr().err
+    assert "Cameras are disabled; the dashboard will continue" in caplog.text
+
+
+def test_main_failure_uses_configured_logging_and_returns_failure(monkeypatch, caplog):
+    import bot as bot_module
+
+    async def failed_run(_settings):
+        raise RuntimeError("failed during startup")
+
+    monkeypatch.setattr(bot_module, "_setup_logging", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot_module, "load_dotenv", lambda: None)
+    monkeypatch.setattr(bot_module, "startup_preflight", lambda: None)
+    monkeypatch.setattr(bot_module, "run_dry_run", failed_run)
+    assert bot_module.main(["--dry-run", "--no-keys"]) == 1
+    assert "dashboard stopped reason=unhandled_error mode=dry_run error=RuntimeError" in caplog.text
+    assert caplog.records[-1].exc_info is not None
 
 
 @pytest.mark.asyncio

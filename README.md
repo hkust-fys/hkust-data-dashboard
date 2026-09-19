@@ -114,10 +114,17 @@ time are tracked separately; exporting unchanged pixels cannot renew the base's
 age. Failures retry after 10 seconds. Any retained fallback is labelled, and a
 base older than one minute is withheld.
 The map embed timestamp supplies its capture time, without extra refresh clocks.
-Marker counts and positions follow the latest available ETA cohorts. KMB uses
-all stops in its route response; per-stop feeds prioritize the stops immediately
-around each estimated marker. Historical identity matching cannot hold an old
-marker in place or retain it after the current ETA cohort disappears.
+Marker counts follow the latest available ETA cohorts. KMB uses all stops in its
+route response. Per-stop feeds query the final terminus first, then search upstream
+when a three-row response may hide more buses. Within the existing query budget,
+each response guides the next search or local stop queries. The actual stops
+before and after a marker are checked together before local interpolation.
+Matched ETA differences measure travel time between those stops; each bus's own
+countdown determines its fraction of that interval. Exact timestamps retain the
+sign around zero. Rounded zeroes cover roughly minus to plus 30 seconds; nearby
+nonzero ETAs and measured travel times help resolve consecutive zeroes. An
+unresolved span uses its midpoint and remains a coarse estimate. Historical
+identity matching cannot retain a ghost or freeze a corrected position.
 During startup or an outage, the map's status notice stays in the map's usual
 first position. A map failure is not repeated in the general source-status pane.
 TD and RTHK news pages are checked independently every 60 seconds. RTHK reports

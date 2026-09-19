@@ -124,11 +124,18 @@ Current ETA cohorts determine displayed marker counts, coordinates and source
 provenance every frame. MarkerTracker.present uses temporal identity only as a
 hint: the stricter identity reconciliation in update cannot suppress a current
 marker, retain a ghost, or freeze a corrected interpolation. Complete route
-generations publish immediately after their final physical request commits;
+generations publish immediately after their final required physical request commits;
 unrelated slow requests do not delay ready routes. KMB uses every stop returned
-by its single route request. Per-stop APIs use four fixed anchors plus the
-immediate neighbours of the displayed markers, under the existing bounded,
-acknowledged polling queue. Source countdowns stay immutable between responses.
+by its single route request. The production per-stop sampler seeds each route at
+its final terminus. dashboard.providers.probe_plan walks upstream when a response
+contains three or more ETAs and may conceal later buses. It returns whole local
+query units, including extra stops needed to resolve zeroes. After each response,
+the map estimator supplies updated local queries; source requests stay within the
+existing total/GMB caps, pacing and cooldown. Physical-group service debt rotates
+contested units. The provider's general checkpoint scheduler remains available to
+explicit fixed-probe callers. Production positioning consumes responses younger
+than 60 seconds and rereads completed work after map capture, without waiting for
+the full background sweep. Source countdowns stay immutable between responses.
 Gate rows retain absolute arrival times for matching responses collected at
 different times; cached positive origin ETAs never age into departure evidence.
 Observed stops, observed empty responses, and missing evidence remain distinct.
@@ -144,11 +151,25 @@ precedence; coarse headways must not put a bus beyond its next positive-ETA
 stop. ETA rank is per stop and can change with boarding or overtaking; it is
 not a permanent vehicle ID or a fixed physical ordering. Map markers and
 traffic-news bus lists use the shared compact destination vocabulary.
-All operators use the same certified bracket refinement. Without a proven
-bracket, markers remain coarse and non-authoritative. KMB's nearest-positive
-fallback requires a fresh atomic route response; the independent Citybus/GMB
-stop responses do not provide that certificate merely by sharing a revision
-number.
+dashboard.maps.interpolation refines all operators after cohort association and
+spacing, preserving marker multiplicity and scheduled styling. It matches the
+whole arrival lists at consecutive stops on their absolute clocks. A still-future
+upstream match moves the search upstream; a leading arrival absent upstream or
+an exact signed due/future crossing can delimit a marker. A later unlisted row
+may be hidden by the three-row limit and never proves passage. The median matched
+arrival difference supplies local travel time, with an exact signed crossing for
+that vehicle taking precedence. Position is the next stop minus the vehicle's
+countdown divided by this travel time, projected along the official road path.
+No fixed two-minute assumption supplies that denominator; coarse projections only
+guide unresolved searches. Independently fetched boundary responses must be fresh;
+absolute timestamps align staggered observations without advancing cached values
+just because another frame is rendered. Rounded-only observations use half-minute
+intervals. Measured edge travel times and neighbouring nonzero observations
+constrain a common arrival-time offset for consecutive zeroes. Use the remaining
+interval's centre, or the zero span's midpoint when unresolved; only a uniquely
+delimited interval gains position authority. Exact API timestamps take precedence
+over display rounding. Missing evidence retains a coarse estimate and requests
+the actual local stops; it never changes a live marker to scheduled styling.
 
 The live-view interaction reads the updater's rolling North/South HLS frame
 cache. Background decoding runs about every 20 seconds with a bounded freshness

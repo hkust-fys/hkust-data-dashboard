@@ -4241,15 +4241,19 @@ def test_kmb_91m_future_terminal_cohorts_keep_count_and_local_eta_bounds():
         if ("probe", 9) in estimate.source_observations
     )
     assert len(estimates) == 3
+    # The two matched arrivals measure 3.2 and 3.433... minutes from 27 to 28;
+    # use their median rather than the former fixed two-minute projection.
+    local_minutes = ((rows[8].arrival_at - rows[5].arrival_at).total_seconds()
+                     + (rows[9].arrival_at - rows[6].arrival_at).total_seconds()) / 120
     assert earliest_terminal.position == pytest.approx(
-        28 - rows[7].minutes / 2.0
+        28 - rows[7].minutes / local_minutes
     )
     assert second_terminal.position == pytest.approx(
-        27 - rows[5].minutes / 2.0
+        27 - rows[5].minutes / ((rows[6].arrival_at - rows[4].arrival_at).total_seconds() / 60)
     )
     assert second_terminal.position < 27
     assert earliest_terminal.position < 28
-    assert earliest_terminal.position_authoritative is False
+    assert earliest_terminal.position_authoritative is True
     assert ("probe", 9) in trailing.source_observations
 
 

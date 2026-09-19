@@ -283,7 +283,7 @@ async def test_estimator_receives_geometry_verified_gate_occurrences(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_active_priority_adds_supplement_without_changing_sparse_baseline(monkeypatch):
+async def test_map_supplies_full_query_universe_with_terminus_baseline_and_adaptive_planner(monkeypatch):
     import dashboard.maps as maps
     from dashboard.providers.route_geometry import RouteGeometry
 
@@ -308,6 +308,9 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
         def poll_priorities(self):
             return {("GMB", "11", "seq-1"): {4, 6}}
 
+        def poll_neighbour_pairs(self):
+            return {("GMB", "11", "seq-1"): ((4, 5), (6, 7))}
+
         def poll_lifecycle_routes(self):
             return frozenset({("GMB", "11", "seq-1")})
 
@@ -325,11 +328,13 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
     await maps.fetch_traffic_map(object(), tracker=Tracker())
 
     baseline = seen["generation_probes"]
-    assert [probe.index for probe in baseline] == [0, 3, 5, 8]
-    assert [probe.index for probe in seen["probes"]] == [0, 3, 5, 8, 4, 6]
+    assert [probe.index for probe in baseline] == [8]
+    assert [probe.index for probe in seen["probes"]] == list(range(9))
     assert seen["priorities"] == {
-        ("GMB", "11", "seq-1"): frozenset({0, 3, 4, 5, 6, 8})
+        ("GMB", "11", "seq-1"): frozenset({4, 5, 6, 7, 8})
     }
+    assert callable(seen["neighbour_pairs"])
+    assert seen["terminus_first"] is True
     assert seen["lifecycle_routes"] == {
         ("GMB", "11", "seq-1"): 17,
     }

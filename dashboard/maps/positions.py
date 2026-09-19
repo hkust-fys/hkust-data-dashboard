@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from itertools import combinations
 from statistics import median
 
+from dashboard.maps.interpolation import refine_adjacent_positions
 from dashboard.models import EtaKind, Operator
 
 LIVE_PROBE_ETA_KINDS = frozenset({EtaKind.REALTIME, EtaKind.MOVING_SLOWLY, EtaKind.DELAYED})
@@ -103,6 +104,10 @@ class BusEstimate:
     # Explicitly false only for a cold all-positive projection whose upstream
     # frontier is unknown. None preserves legacy gate/reliable semantics.
     position_authoritative: bool | None = None
+    # Adjacent official occurrences needed for this marker's next local query.
+    query_pair: tuple[int, int] | None = None
+    query_stops: tuple[int, ...] = ()
+    segment_minutes: float | None = None
 
     @property
     def bracket_lower(self):
@@ -3110,7 +3115,14 @@ def estimate_bus_positions(
                 position_authoritative=position_authoritative,
             )
             )
-    return estimates
+    refined = refine_adjacent_positions(
+        estimates, probe_inputs, route_lines, reproject=reproject_estimate,
+    )
+    return [replace(estimate, label=_label_for(
+        estimate.route, estimate.operator_code, estimate.bound, estimate.position,
+        lines_by_key[(estimate.operator_code, estimate.route, estimate.bound)].stops,
+        destination_map,
+    )) for estimate in refined]
 
 
 def reproject_estimate(estimate: BusEstimate, position: float, route_lines) -> BusEstimate:

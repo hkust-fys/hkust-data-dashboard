@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from dashboard.destinations import short_destination as _shorthand
+from dashboard.maps.interpolation import marker_query_units
 from dashboard.maps.marker_audit import (
     _verified_gate_index,
     audit_gmb_marker_pairs,
@@ -30,12 +31,18 @@ from dashboard.maps.tiles import (
 from dashboard.maps.tracker import MarkerTracker
 from dashboard.models import EtaKind, RouteEtaGroup, TrafficMapResult
 from dashboard.providers.route_geometry import (
-    ProbeStop,
     Stop,
     fetch_route_geometry,
     select_probe_stops,
 )
-from dashboard.providers.transit import CTB_STOPS, GMB_STOPS, KMB_STOPS, fetch_probe_snapshot
+from dashboard.providers.transit import (
+    CTB_STOPS,
+    GMB_STOPS,
+    KMB_STOPS,
+    ProbeEtaSnapshot,
+    fetch_probe_snapshot,
+    read_probe_snapshot,
+)
 
 log = logging.getLogger(__name__)
 _frame_counter = 0
@@ -208,19 +215,27 @@ async def fetch_traffic_map(
                 str(spec["stop"]) for spec in KMB_STOPS
             } | {str(spec["stop"]) for spec in CTB_STOPS}
             mandatory |= {str(stop_id) for stop_id in GMB_STOPS}
-            # KMB returns the entire route in one physical request. Retaining
-            # every stop costs no extra HTTP calls and gives adjacent-stop
-            # interpolation immediately. Per-stop APIs use bounded anchors
-            # plus the current markers' immediate neighbours below.
-            baseline_probes = [
+            # The full sequence is a query universe, not a request to poll every
+            # stop. Per-stop feeds seed at the terminus and adapt within budget;
+            # KMB supplies the entire route in that one physical request.
+            probes = [
                 probe for line in route_lines
                 for probe in select_probe_stops(
-                    [line], mandatory_stop_ids=mandatory,
-                    max_anchors=None if line.operator == "KMB" else 4,
+                    [line], mandatory_stop_ids=mandatory, max_anchors=None,
                 )
             ]
+            terminals = {(line.operator, line.route, line.bound): len(line.stops) - 1
+                         for line in route_lines}
+            baseline_probes = [probe for probe in probes if probe.operator == "KMB"
+                               or probe.index == terminals[(probe.operator, probe.route, probe.bound)]]
             priority_provider = getattr(tracker, "poll_priorities", None)
             priorities = priority_provider() if callable(priority_provider) else None
+            pair_provider = getattr(tracker, "poll_neighbour_pairs", None)
+            neighbour_pairs = pair_provider() if callable(pair_provider) else {}
+            if neighbour_pairs:
+                priorities = {key: set(indices) for key, indices in (priorities or {}).items()}
+                for key, pairs in neighbour_pairs.items():
+                    priorities.setdefault(key, set()).update(index for pair in pairs for index in pair)
             lifecycle_request_provider = getattr(
                 tracker, "poll_lifecycle_requests", None
             )
@@ -244,33 +259,27 @@ async def fetch_traffic_map(
                     route_key: frozenset(indices)
                     for route_key, indices in promoted.items()
                 }
-            probes = list(baseline_probes)
-            seen = {(p.operator, p.route, p.bound, p.index) for p in probes}
-            for line in route_lines:
-                route_key = (line.operator, line.route, line.bound)
-                wanted = (priorities or {}).get(route_key, ())
-                for index in wanted:
-                    index = int(index)
-                    if not 0 <= index < len(line.stops):
-                        continue
-                    key = (line.operator, line.route, line.bound, index)
-                    if key in seen:
-                        continue
-                    template = next((p for p in baseline_probes
-                        if (p.operator, p.route, p.bound) == route_key), None)
-                    if template is None:
-                        continue
-                    probes.append(ProbeStop(
-                        line.operator, line.route, line.bound,
-                        line.stops[index].stop_id, template.route_id,
-                        template.sequence, index,
-                    ))
-                    seen.add(key)
+            gate_inputs = _authoritative_etas(groups or [], route_lines)
+            destinations = _destination_map(groups or [], route_lines)
+            verified = {(line.operator, line.route, line.bound): index for line in route_lines
+                        if (index := _verified_gate_index(line)) is not None}
+
+            def next_local_queries(rows):
+                observed = {}
+                for row in rows:
+                    observed.setdefault((row.operator, row.route, row.bound), set()).add(row.index)
+                current = estimate_bus_positions(
+                    rows, route_lines, destinations, gate_inputs,
+                    observed_checkpoint_indices=observed, verified_gate_indices=verified,
+                )
+                return marker_query_units(current, route_lines)
             probe_task = asyncio.create_task(
                 fetch_probe_snapshot(
                     client, probes, priorities=priorities, wait_for_refresh=False,
                     generation_probes=baseline_probes,
                     lifecycle_routes=lifecycle_routes,
+                    neighbour_pairs=next_local_queries,
+                    terminus_first=True,
                 )
             )
             operation_tasks.append(probe_task)
@@ -305,7 +314,11 @@ async def fetch_traffic_map(
             if isinstance(probe_result, BaseException):
                 log.warning("probe ETA estimation failed: %s", type(probe_result).__name__)
             else:
-                snapshot = probe_result
+                snapshot = (
+                    read_probe_snapshot(probes, generation_probes=baseline_probes,
+                                        positioning_max_age_seconds=60.0)
+                    if isinstance(probe_result, ProbeEtaSnapshot) else probe_result
+                )
                 positioning_rows = getattr(snapshot, "positioning_rows", None)
                 probe_etas = list(
                     positioning_rows
@@ -434,9 +447,11 @@ async def fetch_traffic_map(
         except Exception as exc:  # audit must never prevent rendering
             log.warning("marker display audit unavailable frame=%d: %s", frame_id, type(exc).__name__)
         log.info(
-            "map markers: %d probe ETAs -> %d bus estimates",
+            "map markers: %d probe ETAs -> %d bus estimates local_interpolations=%d zero_spans=%d",
             len(probe_etas),
             len(estimates),
+            sum(estimate.segment_minutes is not None for estimate in estimates),
+            sum(bool(estimate.query_stops) for estimate in estimates),
         )
     finally:
         # If the parent is cancelled (or an operation fails), do not leave a

@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from math import ceil, floor, inf, isfinite, nextafter
 
+from dashboard.maps.interpolation import marker_query_units
 from dashboard.maps.positions import (
     LIVE_PROBE_ETA_KINDS,
     MINUTES_PER_STOP,
@@ -248,6 +249,16 @@ class MarkerTracker:
             self._priority_queue.pop(key, None)
             self._priority_pending.pop(key, None)
         return priorities
+
+    def poll_neighbour_pairs(self):
+        """Keep the actual adjacent stops together in the physical fetch plan."""
+        units = marker_query_units(
+            [candidate for candidates in (self._presented or {}).values() for candidate in candidates],
+            (),
+        )
+        return {key: tuple(unit for unit in wanted
+                           if max(unit) <= self._terminal_indices.get(key, max(unit)))
+                for key, wanted in units.items()}
 
     def _latched_priority_page(self, key, terminal):
         """Return one full physical page until every valid group was attempted."""

@@ -308,6 +308,144 @@ def test_probe_parser_preserves_negative_eta_offset_while_countdown_stays_zero()
     assert rows[0].signed_minutes == pytest.approx(-0.6)
 
 
+@pytest.mark.parametrize("offset", [-.25, .25, None])
+def test_gmb_rounded_zero_preserves_precise_timestamp_or_rounding_uncertainty(offset):
+    now = s.utc()
+    probe = ProbeStop("GMB", "11", "seq-1", "stop", 1, 1, 3)
+    eta = {"diff": 0}
+    if offset is not None:
+        eta["timestamp"] = (now + timedelta(minutes=offset)).isoformat()
+    raw = {"data": [{"route_id": 1, "route_seq": 1, "stop_seq": 4, "eta": [eta]}]}
+    parsed = transit._parse_probe_etas(probe, raw, now)[0]
+    assert parsed.countdown_rounded is (offset is None)
+    assert parsed.signed_minutes == offset
+    assert parsed.minutes == (max(0, offset) if offset is not None else 0)
+
+
+@pytest.mark.asyncio
+async def test_terminus_response_drives_upstream_discovery_and_adjacent_http_queries(monkeypatch):
+    probes = [ProbeStop("GMB", "11", "seq-1", str(index), 1, 1, index) for index in range(13)]
+    now = s.utc()
+    calls = []
+    monkeypatch.setattr(transit, "_probe_wall_clock", lambda: now)
+    monkeypatch.setattr(transit, "GMB_GROUPS_PER_CYCLE", 8)
+
+    async def fetch(_client, probe):
+        calls.append(probe.index)
+        minutes = (4, 8, 12) if probe.index == 12 else ((2, 7, 12) if probe.index == 6 else (1,))
+        return {"data": [{"route_id": 1, "route_seq": 1, "stop_seq": probe.index + 1,
+                          "eta": [{"timestamp": (now + timedelta(minutes=value)).isoformat()}
+                                  for value in minutes]}]}
+
+    planning_rows = []
+
+    def local_queries(rows):
+        planning_rows.append({row.index for row in rows})
+        return {("GMB", "11", "seq-1"): ((9, 10),)} if rows else {}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    result = await transit.fetch_probe_snapshot(
+        object(), probes, max_per_cycle=8, generation_probes=[probes[-1]],
+        terminus_first=True, neighbour_pairs=local_queries,
+    )
+    assert calls[0] == 12
+    assert 6 in calls and 0 in calls  # the third row hid the upstream population
+    assert calls.index(10) == calls.index(9) + 1
+    assert len(calls) == len(set(calls)) <= 8
+    assert any({12, 6} <= indices for indices in planning_rows)
+    assert {9, 10} <= {row.index for row in result.rows}
+
+
+@pytest.mark.asyncio
+async def test_zero_span_queries_are_not_split_to_fill_the_last_budget_slot(monkeypatch):
+    probes = [ProbeStop("GMB", "11", "seq-1", str(index), 1, 1, index) for index in range(7)]
+    calls = []
+
+    async def fetch(_client, probe):
+        calls.append(probe.index)
+        return {"data": [{"route_id": 1, "route_seq": 1, "eta": [{"diff": 1}]}]}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    kwargs = dict(generation_probes=[probes[-1]], terminus_first=True,
+                  neighbour_pairs={("GMB", "11", "seq-1"): ((2, 3, 4),)})
+    await transit.fetch_probe_snapshot(object(), probes, max_per_cycle=2, **kwargs)
+    assert calls == [6]
+    calls.clear()
+    await transit.fetch_probe_snapshot(object(), probes, max_per_cycle=4, **kwargs)
+    assert calls == [6, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_kmb_adaptive_termini_share_one_route_request(monkeypatch):
+    probes = [ProbeStop("KMB", "91", bound, str(index), None, None, index)
+              for bound in ("outbound", "inbound") for index in range(6)]
+    calls = []
+
+    async def fetch(_client, probe):
+        calls.append(probe)
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    result = await transit.fetch_probe_snapshot(object(), probes, terminus_first=True)
+    assert len(calls) == 1
+    assert len(result.positioning_checkpoints) == 12
+
+
+def test_adaptive_presentation_excludes_expired_interior_responses_without_aging_countdowns(monkeypatch):
+    mono = [0.0]
+    cache = transit.ProbeEtaCache(clock=lambda: mono[0])
+    monkeypatch.setattr(transit, "_probe_cache", cache)
+    probe = ProbeStop("GMB", "11", "seq-1", "stop", 1, 1, 3)
+    row = transit.ProbeEta("GMB", "11", "seq-1", "stop", 3, 1, refresh_generation=1)
+    key = transit._probe_cache_key(probe)
+    cache.set(key, [row], revision=1)
+    mono[0] = 20
+    assert transit.read_probe_snapshot([probe], positioning_max_age_seconds=60).rows[0].minutes == 1
+    mono[0] = 60
+    assert transit.read_probe_snapshot([probe], positioning_max_age_seconds=60).rows == ()
+    assert cache.get(key)[0].minutes == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_empty_checkpoint_does_not_stop_upstream_discovery(monkeypatch):
+    probes = [ProbeStop("GMB", "11", "seq-1", str(index), 1, 1, index) for index in range(7)]
+    mono = [0.0]
+    cache = transit.ProbeEtaCache(clock=lambda: mono[0])
+    monkeypatch.setattr(transit, "_probe_cache", cache)
+    cache.set(transit._probe_cache_key(probes[3]), [], revision=1)
+    mono[0] = 61
+    calls = []
+
+    async def fetch(_client, probe):
+        calls.append(probe.index)
+        return {"data": [{"route_id": 1, "route_seq": 1,
+                          "eta": [{"diff": value} for value in ((1, 2, 6) if probe.index == 6 else ())]}]}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit.fetch_probe_snapshot(object(), probes, max_per_cycle=2,
+                                       generation_probes=[probes[-1]], terminus_first=True)
+    assert calls == [6, 3]
+
+
+@pytest.mark.asyncio
+async def test_gmb_cooldown_does_not_block_other_operators_local_sampling(monkeypatch):
+    ctb = [ProbeStop("CTB", "X", "outbound", str(index), None, None, index) for index in range(5)]
+    gmb = [ProbeStop("GMB", "11", "seq-1", "gmb", 1, 1, 0)]
+    monkeypatch.setattr(transit, "_gmb_cooldown_until", float("inf"))
+    calls = []
+
+    async def fetch(_client, probe):
+        calls.append((probe.operator, probe.index))
+        return {"data": []}
+
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    await transit.fetch_probe_snapshot(
+        object(), [*ctb, *gmb], max_per_cycle=3, generation_probes=[ctb[-1], gmb[-1]],
+        terminus_first=True, neighbour_pairs={("CTB", "X", "outbound"): ((1, 2),)},
+    )
+    assert calls == [("CTB", 4), ("CTB", 1), ("CTB", 2)]
+
+
 def test_kmb_route_eta_parser_filters_by_one_based_sequence():
     now = s.utc()
     probe = SimpleNamespace(

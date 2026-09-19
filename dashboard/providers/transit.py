@@ -581,6 +581,8 @@ class ProbeEta:
     # nonnegative for countdown compatibility, while this value preserves a
     # slightly overdue ETA so positioning can find a due/future crossing.
     signed_minutes: float | None = None
+    # A diff-only response rounds around zero; it does not prove passage.
+    countdown_rounded: bool = False
 
 
 @dataclass(frozen=True)
@@ -935,7 +937,6 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
                     minutes = float(diff) if diff is not None else None
                 except (TypeError, ValueError):
                     minutes = None
-                signed_minutes = minutes
             else:
                 minutes = max(0.0, signed_minutes)
             if minutes is None or minutes < last:
@@ -953,6 +954,7 @@ def _parse_probe_etas(probe, raw: Any, now: datetime) -> list[ProbeEta]:
                     arrival_at=_parse_iso(eta.get("timestamp")),
                     observed_at=_parse_iso((raw or {}).get("generated_timestamp")) or now,
                     signed_minutes=signed_minutes,
+                    countdown_rounded=signed_minutes is None,
                 )
             )
     return out
@@ -967,6 +969,8 @@ async def fetch_probe_etas(
     wait_for_refresh: bool = True,
     generation_probes: Sequence[Any] | None = None,
     lifecycle_routes=None,
+    neighbour_pairs=None,
+    terminus_first: bool = False,
 ) -> list[ProbeEta]:
     """Return cached probe observations, refreshing the network at most every 30s."""
     global _probe_network_refresh_at, _probe_refresh_task, _probe_refresh_waiters
@@ -984,6 +988,8 @@ async def fetch_probe_etas(
                 client, probes, max_per_cycle, priorities,
                 generation_probes=generation_probes,
                 lifecycle_routes=lifecycle_routes,
+                neighbour_pairs=neighbour_pairs,
+                terminus_first=terminus_first,
             )
         )
         _probe_refresh_task.add_done_callback(_finish_probe_refresh)
@@ -1153,6 +1159,8 @@ async def _refresh_probe_etas(
     *,
     generation_probes: Sequence[Any] | None = None,
     lifecycle_routes=None,
+    neighbour_pairs=None,
+    terminus_first: bool = False,
 ) -> list[ProbeEta]:
     """Poll up to ``max_per_cycle`` fetch groups round-robin; cache results.
 
@@ -1960,7 +1968,6 @@ async def _refresh_probe_etas(
             successful[group_key] = False
             return True
         probes_in_group = groups[group_key]
-        now = _probe_wall_clock()
         if group_key.startswith("GMB:") and time.monotonic() < _gmb_cooldown_until:
             return True
         attempted_groups.add(group_key)
@@ -1990,6 +1997,7 @@ async def _refresh_probe_etas(
             successful[group_key] = False
             return False
         global _probe_generation
+        now = _probe_wall_clock()
         group_generation = _probe_generation + 1
         group_rows: list[ProbeEta] = []
         parsed_by_key: list[tuple[str, list[ProbeEta]]] = []
@@ -2033,10 +2041,61 @@ async def _refresh_probe_etas(
     # Non-GMB origins can overlap. GMB requests are deliberately sequential:
     # once one returns 403, stop this sweep instead of draining an already
     # queued burst into the provider during its cooldown.
-    await asyncio.gather(*(refresh_group(group_key) for group_key in selected_other))
-    for group_key in selected_gmb:
-        if await refresh_group(group_key):
-            break
+    if terminus_first:
+        from dashboard.providers.probe_plan import adaptive_query_units
+
+        visited = set()
+        selected_groups = []
+        used_gmb = 0
+        while len(visited) < cycle_budget:
+            checkpoint_rows = {
+                (str(probe.operator), str(probe.route), str(probe.bound), int(probe.index)): cached
+                for probe in unique.values()
+                if (cached := _probe_cache.get(_probe_cache_key(probe))) is not None
+                and float(_probe_cache.age_seconds(_probe_cache_key(probe)) or 0.0) < 60.0
+            }
+            local_units = neighbour_pairs or {}
+            if callable(local_units):
+                current_rows, _checkpoints = _cached_positioning_rows(unique.values(), 60.0)
+                try:
+                    local_units = local_units(current_rows)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("ETA local query planning failed: %s", type(exc).__name__)
+                    local_units = {}
+            units = adaptive_query_units(
+                [probe for probe in unique.values() if probe.operator != "GMB"
+                 or (used_gmb < GMB_GROUPS_PER_CYCLE and time.monotonic() >= _gmb_cooldown_until)],
+                checkpoint_rows, local_units, visited,
+                group_key=_fetch_group_key,
+            )
+            feasible = [unit for unit in units
+                        if len(visited) + len(unit) <= cycle_budget
+                        and used_gmb + sum(key.startswith("GMB:") for key in unit)
+                        <= GMB_GROUPS_PER_CYCLE
+                        and all(selectable(key) and not (
+                            key.startswith("GMB:") and time.monotonic() < _gmb_cooldown_until
+                        ) for key in unit)]
+            if not feasible:
+                break
+            unit = max(feasible, key=lambda item: (
+                min(_probe_group_service_debt.get(key, 0) for key in item),
+                not any(key.startswith("GMB:") for key in item),
+            ))
+            for group_key in unit:
+                visited.add(group_key)
+                selected_groups.append(group_key)
+                used_gmb += group_key.startswith("GMB:")
+                stopped = await refresh_group(group_key)
+                if stopped:
+                    break
+        log.info("ETA adaptive sampling requests=%d/%d GMB=%d/%d",
+                 len(attempted_groups), cycle_budget,
+                 sum(key.startswith("GMB:") for key in attempted_groups), GMB_GROUPS_PER_CYCLE)
+    else:
+        await asyncio.gather(*(refresh_group(group_key) for group_key in selected_other))
+        for group_key in selected_gmb:
+            if await refresh_group(group_key):
+                break
 
     # Only requests that actually started count as service. A GMB 403 stops
     # the sequential sweep, leaving later selected groups due for the next
@@ -2107,12 +2166,24 @@ async def fetch_probe_snapshot(
     wait_for_refresh: bool = True,
     generation_probes: Sequence[Any] | None = None,
     lifecycle_routes=None,
+    neighbour_pairs=None,
+    terminus_first: bool = False,
 ) -> ProbeEtaSnapshot:
     """Fetch probes and expose only atomically complete route generations."""
     await fetch_probe_etas(client, probes, max_per_cycle=max_per_cycle,
                            priorities=priorities, wait_for_refresh=wait_for_refresh,
                            generation_probes=generation_probes,
-                           lifecycle_routes=lifecycle_routes)
+                           lifecycle_routes=lifecycle_routes,
+                           neighbour_pairs=neighbour_pairs,
+                           terminus_first=terminus_first)
+    return read_probe_snapshot(
+        probes, generation_probes=generation_probes,
+        positioning_max_age_seconds=60.0 if terminus_first else None,
+    )
+
+
+def read_probe_snapshot(probes, *, generation_probes=None, positioning_max_age_seconds=None):
+    """Read committed responses without starting or waiting for another sweep."""
     collected_at = _probe_wall_clock()
     monotonic_at = _probe_mono_clock()
     for stale_key, stale_generation in tuple(_probe_route_generations.items()):
@@ -2164,12 +2235,26 @@ async def fetch_probe_snapshot(
             for row in generation.public.rows
         )
         routes.append(replace(generation.public, rows=aged_rows))
+    positioning, positioning_checkpoints = _cached_positioning_rows(probes, positioning_max_age_seconds)
+    return ProbeEtaSnapshot(
+        routes=tuple(routes), collected_at=collected_at,
+        positioning_rows=tuple(positioning),
+        positioning_checkpoints=frozenset(positioning_checkpoints),
+        probe_attempt_generation=_probe_attempt_generation,
+        attempted_checkpoints=_probe_attempted_checkpoints,
+    )
+
+
+def _cached_positioning_rows(probes, max_age_seconds=None):
     positioning: list[ProbeEta] = []
     positioning_checkpoints: set[tuple[str, str, str, int]] = set()
     for probe in probes:
         key = _probe_cache_key(probe)
         cached = _probe_cache.get(key)
         if cached is None:
+            continue
+        age = float(_probe_cache.age_seconds(key) or 0.0)
+        if max_age_seconds is not None and age >= max_age_seconds:
             continue
         checkpoint = (str(probe.operator), str(probe.route), str(probe.bound), int(probe.index))
         positioning_checkpoints.add(checkpoint)
@@ -2180,13 +2265,7 @@ async def fetch_probe_snapshot(
                 operator=str(probe.operator), route=str(probe.route),
                 bound=str(probe.bound), stop_id=str(probe.stop_id),
                 index=int(probe.index), minutes=None,
-                cache_age_seconds=float(_probe_cache.age_seconds(key) or 0.0),
+                cache_age_seconds=age,
                 refresh_generation=_probe_cache.revision(key),
             ))
-    return ProbeEtaSnapshot(
-        routes=tuple(routes), collected_at=collected_at,
-        positioning_rows=tuple(positioning),
-        positioning_checkpoints=frozenset(positioning_checkpoints),
-        probe_attempt_generation=_probe_attempt_generation,
-        attempted_checkpoints=_probe_attempted_checkpoints,
-    )
+    return positioning, positioning_checkpoints

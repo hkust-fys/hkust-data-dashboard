@@ -523,9 +523,33 @@ def _align_gate_arrivals(
     two-minutes-per-stop expectation. The returned pairs are
     ``(probe_input_index, gate_input_index)``.
     """
+    # Gate and probe responses may have been collected at different times.
+    # Their immutable countdowns cannot be subtracted as if they shared a
+    # clock. Prefer absolute arrivals for a fully timestamped gate comparison;
+    # leave origin/departure tests on the original source countdowns.
+    absolute_minutes = {}
+    eligible = [
+        row for _index, row in (*gate_rows, *probe_rows)
+        if row.minutes is not None and row.kind is not EtaKind.UNAVAILABLE
+    ]
+    if any(getattr(row, "authoritative", False) for _index, row in gate_rows):
+        for row in eligible:
+            arrival = getattr(row, "arrival_at", None)
+            value = None
+            try:
+                if arrival is not None and arrival.utcoffset() is not None:
+                    value = arrival.timestamp() / 60.0
+            except (AttributeError, TypeError, ValueError, OverflowError, OSError):
+                pass
+            if value is None or not math.isfinite(value):
+                # Partial availability must fall back as a whole, never mix
+                # epoch and countdown units within one comparison.
+                absolute_minutes.clear()
+                break
+            absolute_minutes[id(row)] = value
     gates = sorted(
         (
-            (max(0.0, float(row.minutes)), input_index)
+            (absolute_minutes.get(id(row), max(0.0, float(row.minutes))), input_index)
             for input_index, row in gate_rows
             if row.minutes is not None and row.kind is not EtaKind.UNAVAILABLE
         ),
@@ -533,7 +557,7 @@ def _align_gate_arrivals(
     )
     probes = sorted(
         (
-            (max(0.0, float(row.minutes)), input_index)
+            (absolute_minutes.get(id(row), max(0.0, float(row.minutes))), input_index)
             for input_index, row in probe_rows
             if row.minutes is not None and row.kind is not EtaKind.UNAVAILABLE
         ),

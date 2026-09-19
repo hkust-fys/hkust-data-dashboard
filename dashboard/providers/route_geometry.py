@@ -159,10 +159,11 @@ def select_probe_stops(
 ) -> list[ProbeStop]:
     """Select deterministic official occurrences for each route.
 
-    The live map explicitly selects four representative anchors per direction,
-    protecting both termini and mandatory occurrences before filling evenly
-    spaced interior positions. ``max_anchors=None`` retains the full sequence
-    for callers that need it; the transit layer deduplicates fetch groups.
+    The live map selects the full KMB sequence (one route request), and four
+    representative anchors for per-stop APIs. Both termini and mandatory
+    occurrences are protected before filling evenly spaced interior positions.
+    ``max_anchors=None`` retains the full sequence; the transit layer
+    deduplicates physical fetch groups.
     """
     required = {str(stop_id) for stop_id in mandatory_stop_ids}
     probes: list[ProbeStop] = []
@@ -171,8 +172,7 @@ def select_probe_stops(
         if not stops:
             continue
         spec = _spec_for_line(line)
-        # ``None`` preserves the full-topology API; the live map supplies its
-        # fixed sparse limit explicitly.
+        # Per-stop callers supply their sparse limit explicitly.
         limit = len(stops) if max_anchors is None else max(1, int(max_anchors))
         chosen: list[int] = []
         def add(index: int, stops=stops, chosen=chosen) -> None:

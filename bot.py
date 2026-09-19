@@ -29,6 +29,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import discord
 from dotenv import load_dotenv
@@ -747,7 +748,7 @@ async def _apply_payload(message, payload: DashboardPayload, view=None):
     A CDN thumbnail URL is not an attachment to retain. Omitting its file from
     the edit removes it even while the signed URL temporarily still resolves.
     """
-    embeds = [e for e in payload.embeds if e is not None]
+    embeds = [e.copy() for e in payload.embeds if e is not None]
     existing_by_filename = {
         attachment.filename: attachment
         for attachment in getattr(message, "attachments", ())
@@ -766,6 +767,15 @@ async def _apply_payload(message, payload: DashboardPayload, view=None):
         ):
             attachments.append(existing)
             retained.append(f"{asset.filename}:{existing.id}:{existing_size}")
+            # Keep both the attachment ID and the thumbnail URL stable.
+            # Discord accepts unsigned CDN URLs in embeds and renews their
+            # signatures itself; rotating query tokens need not change this
+            # unchanged warning image on every map/ETA edit.
+            thumbnail_url = _retained_thumbnail_url(existing)
+            if thumbnail_url is not None:
+                for embed in embeds:
+                    if embed.thumbnail.url == f"attachment://{asset.filename}":
+                        embed.set_thumbnail(url=thumbnail_url)
         else:
             attachments.append(discord_file(asset))
             uploaded.append(f"{asset.filename}:{len(asset.data)}")
@@ -2315,6 +2325,24 @@ def _diagnose_dashboard_permissions(channel) -> None:
         "dashboard permissions channel_id=%s guild_id=%s bot_id=%s missing=%s",
         getattr(channel, "id", None), getattr(guild, "id", None), getattr(member, "id", None), missing,
     )
+
+
+def _retained_thumbnail_url(attachment) -> str | None:
+    """Return a stable CDN URL; Discord renews embed URL signatures itself."""
+    url = getattr(attachment, "url", None)
+    if not isinstance(url, str):
+        return None
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.hostname not in {
+            "cdn.discordapp.com", "media.discordapp.net",
+        }:
+            return None
+        if parsed.path.split("/")[-2:] != [str(attachment.id), attachment.filename]:
+            return None
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return parsed._replace(query="", fragment="").geturl()
 
 
 def _diagnose_alert_ping_capability(channel, settings: Settings) -> bool:

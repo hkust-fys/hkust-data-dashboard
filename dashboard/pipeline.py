@@ -278,12 +278,10 @@ def to_payload(
     mr = results.get("traffic_map")
     map_time = None
     map_base_time = None
-    map_markers_time = None
     map_stale = False
     if isinstance(mr, TrafficMapResult):
         map_webp, map_time, map_stale = mr.webp, mr.captured_at, mr.stale
         map_base_time = mr.base_updated_at
-        map_markers_time = mr.markers_refreshed_at
         if map_time is not None:
             age = (datetime.now(UTC) - map_time).total_seconds()
             map_stale = map_stale or age > MAP_CAPTURE_STALE_AFTER_SECONDS
@@ -312,7 +310,6 @@ def to_payload(
         transit_source_time=transit_time,
         map_source_time=map_time,
         traffic_map_stale=map_stale,
-        map_markers_time=map_markers_time,
         roadworks=roadworks,
         traffic_stale_sources=stale,
         traffic_source_times=source_times,

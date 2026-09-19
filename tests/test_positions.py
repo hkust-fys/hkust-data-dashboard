@@ -30,6 +30,28 @@ from dashboard.providers.route_geometry import RouteLine, Stop
 from dashboard.providers.transit import ProbeEtaSnapshot, ProbeRouteGeneration
 
 
+@pytest.mark.parametrize("invalid", [None, "missing", "naive", "malformed"])
+def test_gate_association_compares_absolute_arrivals_across_response_times(invalid):
+    now = datetime(2026, 9, 19, 10, 0, tzinfo=UTC)
+    # Gate collected earlier still reports five minutes. The newer adjacent
+    # stop response reports one; their absolute arrivals are two minutes apart.
+    gate = SimpleNamespace(minutes=5, kind=EtaKind.REALTIME,
+                           authoritative=True, arrival_at=now + timedelta(minutes=5))
+    probe = SimpleNamespace(minutes=1, kind=EtaKind.REALTIME,
+                            arrival_at=now + timedelta(minutes=7))
+    if invalid == "missing":
+        probe.arrival_at = None
+    elif invalid == "naive":
+        probe.arrival_at = probe.arrival_at.replace(tzinfo=None)
+    elif invalid == "malformed":
+        probe.arrival_at = "invalid"
+    result = _align_gate_arrivals([(0, gate)], [(1, probe)], gate_index=6, checkpoint=7)
+    assert result == ([(1, 0)] if invalid is None else [])
+    # Matching must not age the source countdown or declare a departure.
+    assert gate.minutes == 5
+    assert probe.minutes == 1
+
+
 def test_checkpoint_classifier_three_state_matrix():
     arrival = datetime(2026, 1, 1, tzinfo=UTC)
     downstream = SimpleNamespace(

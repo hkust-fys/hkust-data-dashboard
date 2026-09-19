@@ -6,7 +6,7 @@ import asyncio
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from math import inf, isfinite, nextafter
+from math import ceil, floor, inf, isfinite, nextafter
 
 from dashboard.maps.positions import (
     LIVE_PROBE_ETA_KINDS,
@@ -101,6 +101,7 @@ class MarkerTracker:
         self._partial_birth_generations = {}
         self._next_id = 1
         self._lock = asyncio.Lock()
+        self._presented = None
 
     async def update(self, snapshot, candidates, route_lines=()):
         async with self._lock:
@@ -112,6 +113,42 @@ class MarkerTracker:
     async def track(self, snapshot, candidates, route_lines=()):
         return await self.update(snapshot, candidates, route_lines)
 
+    async def present(self, snapshot, candidates, route_lines=()):
+        """Display the current ETA population, with identity only as a hint.
+
+        A stop's ETA rank is not a vehicle identifier. The temporal matcher
+        may retain an uncertain identity while requesting more evidence, but
+        that must not retain an extra visible bus or veto a corrected local
+        interpolation. Counts, coordinates and provenance come from this
+        frame's estimator; historical tracks only supply unambiguous IDs.
+        """
+        grouped = _group(candidates or ())
+        candidates = [candidate for key in list(grouped)[:self.max_routes]
+                      for candidate in grouped[key][:self.max_tracks_per_route]]
+        route_lines = list(route_lines or ())
+        async with self._lock:
+            self._ack_probe_attempts(snapshot)
+            tracked = self._update(snapshot, candidates, route_lines)
+            self._terminal_indices.update(_route_terminals(route_lines))
+            by_evidence = {}
+            for marker in tracked:
+                evidence = tuple(getattr(marker, "checkpoint_evidence", ()) or ())
+                if evidence:
+                    by_evidence.setdefault((_key(marker), evidence), []).append(marker.track_id)
+            used_ids = set()
+            presented = []
+            for candidate in candidates:
+                evidence = tuple(getattr(candidate, "checkpoint_evidence", ()) or ())
+                matches = by_evidence.get((_key(candidate), evidence), ())
+                track_id = matches[0] if len(matches) == 1 else None
+                if track_id in used_ids:
+                    track_id = None
+                used_ids.add(track_id)
+                presented.append(replace(candidate, track_id=track_id,
+                                         operator_code=_key(candidate)[0]))
+            self._presented = _group(presented)
+            return presented
+
     def clear(self):
         self._routes.clear()
         self._generations.clear()
@@ -122,6 +159,7 @@ class MarkerTracker:
         self._lifecycle_refresh_routes.clear()
         self._partial_birth_generations.clear()
         self._next_id = 1
+        self._presented = None
 
     @property
     def state_size(self):
@@ -129,6 +167,8 @@ class MarkerTracker:
 
     def poll_priorities(self):
         """Return only the physical checkpoints needed by the next refinement."""
+        if self._presented is not None:
+            return self._presented_priorities()
         priorities = {}
         for key, tracks in self._routes.items():
             if not tracks:
@@ -170,6 +210,43 @@ class MarkerTracker:
                 priorities[key] = frozenset(
                     selected
                 )
+        return priorities
+
+    def _presented_priorities(self):
+        """Refine the immediate neighbours of the markers actually on the map."""
+        priorities = {}
+        for key, candidates in self._presented.items():
+            terminal = self._terminal_indices.get(key)
+            latched = self._latched_priority_page(key, terminal)
+            if latched is not None:
+                priorities[key] = latched
+                continue
+            neighbours = []
+            evidence = []
+            for candidate in candidates:
+                position = getattr(candidate, "position", None)
+                if position is not None and isfinite(position):
+                    lower, upper = floor(position), ceil(position)
+                    # At an exact stop, include the stops on both sides too.
+                    neighbours.extend((lower, upper) if lower != upper
+                                      else (lower - 1, lower, lower + 1))
+                evidence.extend(sorted(candidate.priority_indices))
+                evidence.extend(sorted(candidate.exploratory_indices))
+            population = list(dict.fromkeys(
+                index for index in (*neighbours, *evidence)
+                if index >= 0 and (terminal is None or index <= terminal)
+            ))
+            queue = self._priority_queue.setdefault(key, [])
+            current = set(population)
+            queue[:] = [index for index in queue if index in current]
+            queue.extend(index for index in population if index not in queue)
+            window = tuple(queue[:MAX_PRIORITY_ENDPOINTS_PER_ROUTE])
+            if window:
+                self._priority_pending[key] = (window, set(window))
+                priorities[key] = frozenset(window)
+        for key in set(self._priority_queue) - self._presented.keys():
+            self._priority_queue.pop(key, None)
+            self._priority_pending.pop(key, None)
         return priorities
 
     def _latched_priority_page(self, key, terminal):

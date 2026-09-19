@@ -34,8 +34,8 @@ only after complete, stable canvas checks. The page/base has a hard one-minute l
 of repeated exports. Failed captures retry after 10 seconds; retained fallback
 is labelled, and exports older than 30 seconds are stale. Neither render time
 nor disk writes can extend the verified page's freshness.
-The separate "Markers refreshed" clock records overlay rendering and never
-extends the Google base's lifetime. The legend shows live ETA samples for all
+The embed timestamp is the only displayed map clock. Internal overlay render
+times never extend the Google base's lifetime. The legend shows live ETA samples for all
 operators and scheduled samples for KMB and GMB only.
 The renderer preserves the map's first embed slot for initializing and unavailable
 states. A map outage is removed from the general source-status pane once shown
@@ -96,7 +96,9 @@ alerts retain their delivery policy.
 
 HKO warning assets accept static PNG data only. A bounded composition cache
 reuses the strip for unchanged icons. Discord edits retain matching attachment
-objects. A missing attachment or changed icon set requires an upload: a CDN URL
+objects and stable thumbnail CDN paths. Discord renews embed URL signatures
+automatically, so signed query tokens are omitted without uploading unchanged bytes.
+A missing attachment or changed icon set requires an upload: a CDN URL
 alone cannot retain a file omitted from an edit. The static catalog can resolve
 warnsum's official names even if wxwarntoday metadata is unavailable.
 
@@ -118,20 +120,22 @@ Traffic-pixel masks match Google's known canvas and legend palette with bounded
 colour tolerance. Their cache key includes every pristine base pixel, so a new
 traffic colour or cleared stroke updates both single and stacked label avoidance.
 
-The marker contract separates exact source ETA rows from position authority:
-complete probe generations normally reconcile marker births and deaths, while
-per-stop cache evidence refines an existing position. A narrow, certified
-exception may add one display-only marker per route generation when two complete
-stop censuses prove a disjoint new source cohort and a unique continuation for
-every existing marker. It never retires a marker; the new cohort remains
-untrusted until a complete generation reconciles it. Unchanged or stale data
-does not move a vehicle. Observed stops, observed empty responses, and missing
-evidence remain distinct, and the position auditor is read-only. The live
-verifier checks displayed output against source rows and reports scheduled-only
-or held-position spacing as inconclusive rather than inventing GPS certainty.
-KMB gate ownership cannot cross backwards in absolute checkpoint arrival time
-or reattach later in that same generation. Distinct, tightly bunched same-stop
-ETA rows remain distinct buses unless their source identities prove duplication.
+Current ETA cohorts determine displayed marker counts, coordinates and source
+provenance every frame. MarkerTracker.present uses temporal identity only as a
+hint: the stricter identity reconciliation in update cannot suppress a current
+marker, retain a ghost, or freeze a corrected interpolation. Complete route
+generations publish immediately after their final physical request commits;
+unrelated slow requests do not delay ready routes. KMB uses every stop returned
+by its single route request. Per-stop APIs use four fixed anchors plus the
+immediate neighbours of the displayed markers, under the existing bounded,
+acknowledged polling queue. Source countdowns stay immutable between responses.
+Gate rows retain absolute arrival times for matching responses collected at
+different times; cached positive origin ETAs never age into departure evidence.
+Observed stops, observed empty responses, and missing evidence remain distinct.
+The read-only position auditor and live verifier inspect the actual displayed
+markers. Scheduled-only or uncorroborated evidence is inconclusive. Distinct,
+tightly bunched same-stop ETA rows stay separate unless their source identities
+prove duplication; the public feeds do not establish physical vehicle identity.
 The placement stages keep source-cohort association separate from provisional
 common-stop spacing and final local checkpoint refinement. Any positive origin
 ETA vetoes its associated cohort before spacing, including sub-minute future

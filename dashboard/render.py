@@ -284,18 +284,11 @@ def _build_traffic_map_embed(
     source_time: datetime | None = None,
     filename: str | None = None,
     stale: bool = False,
-    markers_time: datetime | None = None,
 ) -> discord.Embed | None:
     """Render the Google Maps base screenshot as an image pane."""
     if not webp:
         return None
     description = "🔗 [HKeMobility](https://www.hkemobility.gov.hk/)"
-    if source_time is not None:
-        description += f"\nMap captured {_fmt_timestamp(source_time, 'T')}"
-    else:
-        description += "\nMap capture time unavailable"
-    if markers_time is not None:
-        description += f" · Markers refreshed {_fmt_timestamp(markers_time, 'T')}"
     if stale:
         description += "\n⚠️ Cached map: live capture failed or is delayed."
     embed = discord.Embed(
@@ -577,7 +570,6 @@ def build_payload(
     now: datetime | None = None,
     traffic_map_initializing: bool = False,
     traffic_map_stale: bool = False,
-    map_markers_time: datetime | None = None,
 ) -> DashboardPayload:
     """Compose the dashboard payload, enforcing every Discord limit.
 
@@ -597,7 +589,6 @@ def build_payload(
             map_source_time,
             map_filename,
             stale=traffic_map_stale,
-            markers_time=map_markers_time,
         )
         if map_embed is not None:
             payload.embeds.append(map_embed)

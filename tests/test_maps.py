@@ -8,6 +8,7 @@ import io
 import math
 import sys
 import types
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,24 @@ def _candidate(position):
     return BusEstimate("R destination", 22.3, 114.2, Operator.KMB, 0.0,
                        route="R", bound="out", position=position,
                        operator_code="KMB")
+
+
+def test_authoritative_gate_preserves_absolute_eta_and_original_countdown():
+    from dashboard.maps import _authoritative_etas
+
+    source_time = datetime(2026, 9, 19, 10, 0, tzinfo=UTC)
+    arrival = source_time + timedelta(seconds=45)
+    row = EtaRow("91", "Diamond Hill", "S", Operator.KMB, 1,
+                 eta_time=arrival, source_time=source_time)
+    group = RouteEtaGroup("91", "Diamond Hill", "S", Operator.KMB,
+                          [row], bound="outbound")
+    line = RouteLine("91", "KMB", "outbound", [
+        Stop("B002CEF0DBC568F5", "Gate", 22.33, 114.26),
+    ])
+    converted, = _authoritative_etas([group], [line])
+    assert converted.arrival_at == arrival
+    assert converted.observed_at == source_time
+    assert converted.minutes == 1.0
 
 
 def test_map_capture_and_projection_contract_stays_synchronized():
@@ -183,7 +202,7 @@ async def test_marker_audit_failure_never_blocks_a_rendered_frame(monkeypatch, c
 
     assert image == b"rendered"
     assert audit_calls == 1
-    assert "marker candidate audit unavailable" in caplog.text
+    assert "marker display audit unavailable" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -208,7 +227,7 @@ async def test_probe_selection_receives_verified_gate_ids_as_mandatory_anchors(m
     monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
     await maps.fetch_traffic_map(object())
     assert {"B002CEF0DBC568F5", "003130", "20013011"} <= seen["ids"]
-    assert seen["max_anchors"] == 4
+    assert seen["max_anchors"] is None
 
 
 @pytest.mark.asyncio
@@ -269,9 +288,9 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
     from dashboard.providers.route_geometry import RouteGeometry
 
     line = RouteLine(
-        "91",
-        "KMB",
-        "outbound",
+        "11",
+        "GMB",
+        "seq-1",
         [Stop(f"s{index}", f"Stop {index}", 22.33, 114.26 + index * 0.001)
          for index in range(9)],
     )
@@ -287,13 +306,13 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
 
     class Tracker:
         def poll_priorities(self):
-            return {("KMB", "91", "outbound"): {4, 6}}
+            return {("GMB", "11", "seq-1"): {4, 6}}
 
         def poll_lifecycle_routes(self):
-            return frozenset({("KMB", "91", "outbound")})
+            return frozenset({("GMB", "11", "seq-1")})
 
         def poll_lifecycle_requests(self):
-            return {("KMB", "91", "outbound"): 17}
+            return {("GMB", "11", "seq-1"): 17}
 
         async def update(self, _snapshot, estimates, _lines):
             return estimates
@@ -309,12 +328,73 @@ async def test_active_priority_adds_supplement_without_changing_sparse_baseline(
     assert [probe.index for probe in baseline] == [0, 3, 5, 8]
     assert [probe.index for probe in seen["probes"]] == [0, 3, 5, 8, 4, 6]
     assert seen["priorities"] == {
-        ("KMB", "91", "outbound"): frozenset({0, 3, 4, 5, 6, 8})
+        ("GMB", "11", "seq-1"): frozenset({0, 3, 4, 5, 6, 8})
     }
     assert seen["lifecycle_routes"] == {
-        ("KMB", "91", "outbound"): 17,
+        ("GMB", "11", "seq-1"): 17,
     }
     assert seen["wait_for_refresh"] is False
+
+
+@pytest.mark.asyncio
+async def test_kmb_map_keeps_all_stops_from_one_physical_route_request(monkeypatch):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+    from dashboard.providers.transit import _fetch_group_key
+
+    lines = [RouteLine("91", "KMB", bound, [
+        Stop(f"{bound}-{index}", str(index), 22.33, 114.26 + index * 0.001)
+        for index in range(9)
+    ]) for bound in ("outbound", "inbound")]
+    seen = {}
+
+    async def probes(_client, requested, **kwargs):
+        seen["probes"] = requested
+        seen["baseline"] = kwargs["generation_probes"]
+        return _probe_snapshot()
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
+    monkeypatch.setattr(maps, "fetch_route_geometry",
+                        lambda *_args, **_kwargs: _resolved(RouteGeometry(routes=lines)))
+    monkeypatch.setattr(maps, "fetch_probe_snapshot", probes)
+    monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
+    await maps.fetch_traffic_map(object())
+
+    assert len(seen["baseline"]) == 18
+    assert seen["probes"] == seen["baseline"]
+    assert {_fetch_group_key(probe) for probe in seen["probes"]} == {"KMB:route:91"}
+
+
+@pytest.mark.asyncio
+async def test_map_renders_and_audits_current_markers_before_identity_generation(monkeypatch):
+    import dashboard.maps as maps
+    from dashboard.providers.route_geometry import RouteGeometry
+
+    candidates = [_candidate(3.25), _candidate(6.5)]
+    line = RouteLine("R", "KMB", "out", [
+        Stop(str(index), str(index), 22.33, 114.26) for index in range(9)
+    ])
+    captured = {}
+
+    def render(estimates, *_args):
+        captured["rendered"] = estimates
+        return b"rendered"
+
+    def audit(*args, **_kwargs):
+        captured["audited"] = args[2]
+        return {"checks": [], "issues": [], "stats": {"markers": 2}, "ok": True}
+
+    monkeypatch.setattr(maps, "capture_gmaps_base", lambda **_kwargs: _resolved(b"base"))
+    monkeypatch.setattr(maps, "fetch_route_geometry",
+                        lambda *_args, **_kwargs: _resolved(RouteGeometry(routes=[line])))
+    monkeypatch.setattr(maps, "fetch_probe_snapshot",
+                        lambda *_args, **_kwargs: _resolved(_probe_snapshot()))
+    monkeypatch.setattr(maps, "estimate_bus_positions", lambda *_args, **_kwargs: candidates)
+    monkeypatch.setattr(maps, "audit_marker_positions", audit)
+    monkeypatch.setattr(maps, "render_map", render)
+
+    await maps.fetch_traffic_map(object(), tracker=maps.MarkerTracker())
+    assert captured["rendered"] == captured["audited"] == candidates
 
 
 @pytest.mark.asyncio
@@ -344,7 +424,7 @@ async def test_tracker_failure_renders_stateless_candidates(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_marker_audit_receives_stateless_candidates_when_tracker_changes_output(monkeypatch):
+async def test_marker_audit_receives_actual_display_when_tracker_changes_output(monkeypatch):
     import dashboard.maps as maps
     from dashboard.providers.route_geometry import RouteGeometry
     candidate = _candidate(1.0)
@@ -376,7 +456,7 @@ async def test_marker_audit_receives_stateless_candidates_when_tracker_changes_o
     monkeypatch.setattr(maps, "audit_marker_positions", audit)
     monkeypatch.setattr(maps, "render_map", lambda *_args, **_kwargs: b"rendered")
     await maps.fetch_traffic_map(object(), tracker=Tracker())
-    assert audited["estimates"] == [candidate]
+    assert audited["estimates"] == [changed]
     assert audited["audit_observed"] == audited["estimate_observed"] == {
         ("KMB", "91", "outbound"): {7}
     }

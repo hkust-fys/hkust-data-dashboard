@@ -2326,6 +2326,86 @@ async def test_nonblocking_probe_refresh_publishes_for_a_later_map_frame(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ("failure", "cancellation"))
+async def test_complete_kmb_generation_publishes_while_gmb_sweep_is_pending(
+    monkeypatch, ending
+):
+    """A blocked later GMB request cannot hide an already complete KMB route."""
+    def probe(operator, route, stop_id, index):
+        return SimpleNamespace(
+            operator=operator,
+            route=route,
+            bound="seq-1" if operator == "GMB" else "outbound",
+            stop_id=stop_id,
+            route_id=1,
+            sequence=1,
+            index=index,
+        )
+
+    kmb = probe("KMB", "91", "kmb", 0)
+    gmb_first = probe("GMB", "11", "gmb-a", 0)
+    gmb_blocked = probe("GMB", "11", "gmb-b", 1)
+    probes = [kmb, gmb_first, gmb_blocked]
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fetch(_client, selected):
+        if selected.stop_id != "gmb-b":
+            return {"data": []}  # successful empty responses are complete evidence
+        blocked.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        raise RuntimeError("later GMB group failed")
+
+    monkeypatch.setattr(transit, "TRANSIT_NETWORK_REFRESH_SECONDS", 30.0)
+    monkeypatch.setattr(transit, "_fetch_raw_stop_eta", fetch)
+    initial = await transit.fetch_probe_snapshot(
+        object(), probes, max_per_cycle=3, wait_for_refresh=False, generation_probes=probes,
+    )
+    assert initial.complete_routes == ()
+    await asyncio.wait_for(blocked.wait(), timeout=1)
+    refresh = transit._probe_refresh_task  # noqa: SLF001
+    assert refresh is not None and not refresh.done()
+
+    visible = await transit.fetch_probe_snapshot(
+        object(), probes, max_per_cycle=3, wait_for_refresh=False, generation_probes=probes,
+    )
+    assert [route.route_key for route in visible.complete_routes] == [
+        ("KMB", "91", "outbound"),
+    ]
+    assert visible.complete_routes[0].rows == ()
+    assert ("GMB", "11", "seq-1") not in {
+        route.route_key for route in visible.complete_routes
+    }
+
+    if ending == "failure":
+        release.set()
+        await refresh
+    else:
+        refresh.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await refresh
+        assert cancelled.is_set()
+    await asyncio.sleep(0)
+
+    # Avoid launching a new sweep: this reads the retained publication after
+    # the pending GMB work failed or was cancelled.
+    monkeypatch.setattr(transit, "TRANSIT_NETWORK_REFRESH_SECONDS", 3_600.0)
+    monkeypatch.setattr(transit, "_probe_network_refresh_at", transit.time.monotonic())
+    retained = await transit.fetch_probe_snapshot(
+        object(), probes, max_per_cycle=3, wait_for_refresh=False, generation_probes=probes,
+    )
+    assert [route.route_key for route in retained.complete_routes] == [
+        ("KMB", "91", "outbound"),
+    ]
+    assert retained.complete_routes[0].generation == visible.complete_routes[0].generation
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancels_detached_probe_refresh(monkeypatch):
     probe = SimpleNamespace(
         operator="GMB", route="11", bound="seq-1", stop_id="stop",

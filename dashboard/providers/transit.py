@@ -1044,6 +1044,107 @@ def _collect_probe_cache(probes: Sequence[Any]) -> list[ProbeEta]:
     ]
 
 
+def _publish_complete_probe_generations(
+    route_keys: Sequence[tuple[str, str, str]],
+    *,
+    baseline_routes: Mapping[tuple[str, str, str], Sequence[str]],
+    unique: Mapping[str, Any],
+    baseline_keys: set[str],
+) -> None:
+    """Publish only route generations proven complete by committed group rows.
+
+    A physical request commits every cache row and its shared revision before
+    this helper runs.  The unchanged version, floor, topology, and cache-TTL
+    checks keep a partial route from becoming public merely because one of its
+    fetch groups completed.
+    """
+    global _probe_generation
+
+    collected_at = _probe_wall_clock()
+    published_monotonic = _probe_mono_clock()
+    for route_key in sorted(set(route_keys)):
+        route_groups = set(baseline_routes.get(route_key, ()))
+        if not route_groups or not all(key in _probe_group_versions for key in route_groups):
+            continue
+        previous = _probe_route_published_versions.get(route_key)
+        if route_key in _probe_route_generations and previous is None:
+            # Do not manufacture a publication from an inconsistent state.
+            continue
+        floor = _probe_route_version_floors.setdefault(
+            route_key,
+            {key: _probe_group_versions.get(key, 0) for key in route_groups},
+        )
+        required = floor if route_key not in _probe_route_generations else (previous or {})
+        if not all(
+            _probe_group_versions[key] > required.get(key, 0) for key in route_groups
+        ):
+            continue
+        route_probes = tuple(
+            probe
+            for probe in unique.values()
+            if (
+                (probe.operator, probe.route, probe.bound) == route_key
+                and _probe_cache_key(probe) in baseline_keys
+            )
+        )
+        # Version advancement is not sufficient after cache TTL eviction:
+        # every fixed probe must still have the exact response represented by
+        # its current shared-group revision. Capture each cache entry once so
+        # validation and publication cannot disagree; [] is valid evidence.
+        captured_cache: dict[str, list[ProbeEta]] = {}
+        captured_revisions: dict[str, int] = {}
+        cache_valid = True
+        for probe in route_probes:
+            cache_key = _probe_cache_key(probe)
+            cached = _probe_cache.get(cache_key)
+            group_key = _fetch_group_key(probe)
+            revision = _probe_cache.revision(cache_key)
+            if (
+                cached is None
+                or revision != _probe_group_versions.get(group_key, 0)
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision <= 0
+            ):
+                cache_valid = False
+                break
+            captured_cache.setdefault(cache_key, cached)
+            captured_revisions.setdefault(cache_key, revision)
+        if not cache_valid:
+            continue
+        rows = tuple(
+            eta
+            for probe in route_probes
+            for eta in captured_cache[_probe_cache_key(probe)]
+        )
+        _probe_generation += 1
+        public = ProbeRouteGeneration(
+            route_key=route_key,
+            rows=rows,
+            generation=_probe_generation,
+            collected_at=collected_at,
+            observed_checkpoint_indices=frozenset(probe.index for probe in route_probes),
+            checkpoint_revisions=tuple(
+                sorted(
+                    (
+                        int(probe.index),
+                        captured_revisions[_probe_cache_key(probe)],
+                    )
+                    for probe in route_probes
+                )
+            ),
+        )
+        published_versions = {key: _probe_group_versions[key] for key in route_groups}
+        _probe_route_published_versions[route_key] = published_versions
+        _probe_route_version_floors[route_key] = dict(published_versions)
+        _probe_route_generations[route_key] = _StoredProbeGeneration(
+            public=public,
+            topology_keys=frozenset(_probe_topology_key(probe) for probe in route_probes),
+            group_keys=frozenset(route_groups),
+            published_monotonic=published_monotonic,
+        )
+
+
 async def _refresh_probe_etas(
     client: HttpClient,
     probes: Sequence[Any],
@@ -1064,7 +1165,6 @@ async def _refresh_probe_etas(
     """
     global _probe_cold_cursor, _probe_priority_cursor, _probe_background_cursor
     global _probe_priority_owed
-    global _probe_generation
     global _probe_attempt_generation, _probe_attempted_checkpoints
     if not probes:
         return []
@@ -1918,6 +2018,16 @@ async def _refresh_probe_etas(
         _probe_group_versions[group_key] = group_generation
         _probe_group_rows[group_key] = tuple(group_rows)
         successful[group_key] = True
+        _publish_complete_probe_generations(
+            tuple(
+                route_key
+                for route_key, route_groups in baseline_routes.items()
+                if group_key in route_groups
+            ),
+            baseline_routes=baseline_routes,
+            unique=unique,
+            baseline_keys=baseline_keys,
+        )
         return False
 
     # Non-GMB origins can overlap. GMB requests are deliberately sequential:
@@ -1949,93 +2059,26 @@ async def _refresh_probe_etas(
             for probe in attempt_universe.get(group_key, ())
         )
 
-    # Publish complete route generations atomically. Empty successful entries
-    # are valid observations; failed or rate-limited groups retain the prior
-    # complete generation.
-    collected_at = _probe_wall_clock()
-    published_monotonic = _probe_mono_clock()
+    # A sweep-final pass preserves whole-sweep completion for candidates that
+    # did not become eligible at their individual group commit. Empty
+    # successful entries are valid observations; failed or rate-limited groups
+    # retain the prior complete generation.
     generation_groups = {
         route_key: set(group_keys)
         for route_key, group_keys in baseline_routes.items()
     }
-    selected_routes = sorted({route_key for key in selected_groups for route_key in generation_groups
-                              if key in generation_groups[route_key]})
-    for route_key in selected_routes:
-        route_groups = generation_groups[route_key]
-        if not all(key in _probe_group_versions for key in route_groups):
-            continue
-        previous = _probe_route_published_versions.get(route_key)
-        if route_key in _probe_route_generations and previous is None:
-            # Do not manufacture a publication from an inconsistent state.
-            continue
-        floor = _probe_route_version_floors.setdefault(
-            route_key,
-            {key: _probe_group_versions.get(key, 0) for key in route_groups},
-        )
-        required = floor if route_key not in _probe_route_generations else (previous or {})
-        if not all(_probe_group_versions[key] > required.get(key, 0)
-                   for key in route_groups):
-            continue
-        route_probes = tuple(
-            probe for probe in unique.values()
-            if ((probe.operator, probe.route, probe.bound) == route_key
-                and _probe_cache_key(probe) in baseline_keys)
-        )
-        # Version advancement is not sufficient after cache TTL eviction:
-        # every fixed probe must still have the exact response represented by
-        # its current shared-group revision. Capture each cache entry once so
-        # validation and publication cannot disagree; [] is valid evidence.
-        captured_cache: dict[str, list[ProbeEta]] = {}
-        captured_revisions: dict[str, int] = {}
-        cache_valid = True
-        for probe in route_probes:
-            cache_key = _probe_cache_key(probe)
-            cached = _probe_cache.get(cache_key)
-            group_key = _fetch_group_key(probe)
-            revision = _probe_cache.revision(cache_key)
-            if (
-                cached is None
-                or revision != _probe_group_versions.get(group_key, 0)
-                or not isinstance(revision, int)
-                or isinstance(revision, bool)
-                or revision <= 0
-            ):
-                cache_valid = False
-                break
-            captured_cache.setdefault(cache_key, cached)
-            captured_revisions.setdefault(cache_key, revision)
-        if not cache_valid:
-            continue
-        rows = tuple(
-            eta for probe in route_probes
-            for eta in captured_cache[_probe_cache_key(probe)]
-        )
-        _probe_generation += 1
-        public = ProbeRouteGeneration(
-            route_key=route_key,
-            rows=rows,
-            generation=_probe_generation,
-            collected_at=collected_at,
-            observed_checkpoint_indices=frozenset(p.index for p in route_probes),
-            checkpoint_revisions=tuple(sorted(
-                (
-                    int(probe.index),
-                    captured_revisions[_probe_cache_key(probe)],
-                )
-                for probe in route_probes
-            )),
-        )
-        published_versions = {
-            key: _probe_group_versions[key] for key in route_groups
-        }
-        _probe_route_published_versions[route_key] = published_versions
-        _probe_route_version_floors[route_key] = dict(published_versions)
-        _probe_route_generations[route_key] = _StoredProbeGeneration(
-            public=public,
-            topology_keys=frozenset(_probe_topology_key(probe) for probe in route_probes),
-            group_keys=frozenset(route_groups),
-            published_monotonic=published_monotonic,
-        )
+    selected_routes = tuple(
+        route_key
+        for group_key in selected_groups
+        for route_key, route_groups in generation_groups.items()
+        if group_key in route_groups
+    )
+    _publish_complete_probe_generations(
+        selected_routes,
+        baseline_routes=baseline_routes,
+        unique=unique,
+        baseline_keys=baseline_keys,
+    )
     while len(_probe_route_generations) > MAX_PROBE_ROUTE_GENERATIONS:
         oldest = min(
             _probe_route_generations,

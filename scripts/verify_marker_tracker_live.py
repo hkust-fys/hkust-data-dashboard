@@ -950,7 +950,7 @@ async def _run(cycles, interval, cache_dir, watch, output, fail_fast):
                     authoritative,
                     observed_checkpoint_indices=observed,
                 )
-                tracked = await tracker.update(snap, cand, lines)
+                tracked = await tracker.present(snap, cand, lines)
                 audit = audit_marker_positions(
                     rows,
                     authoritative,

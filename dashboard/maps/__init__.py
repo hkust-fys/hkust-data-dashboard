@@ -93,9 +93,11 @@ class _AuthoritativeEta:
     route: str
     bound: str
     index: int
-    minutes: int
+    minutes: float
     kind: EtaKind
     authoritative: bool = True
+    arrival_at: datetime | None = None
+    observed_at: datetime | None = None
 
 
 def _authoritative_etas(
@@ -153,7 +155,8 @@ def _authoritative_etas(
                 out.append(
                     _AuthoritativeEta(
                         operator, str(group.route), bound, index,
-                        max(0, int(row.minutes)), row.kind,
+                        max(0.0, float(row.minutes)), row.kind,
+                        arrival_at=row.eta_time, observed_at=row.source_time,
                     )
                 )
     return out
@@ -205,10 +208,17 @@ async def fetch_traffic_map(
                 str(spec["stop"]) for spec in KMB_STOPS
             } | {str(spec["stop"]) for spec in CTB_STOPS}
             mandatory |= {str(stop_id) for stop_id in GMB_STOPS}
-            baseline_probes = (select_probe_stops(
-                route_lines, mandatory_stop_ids=mandatory, max_anchors=4
-            )
-                      if route_lines else [])
+            # KMB returns the entire route in one physical request. Retaining
+            # every stop costs no extra HTTP calls and gives adjacent-stop
+            # interpolation immediately. Per-stop APIs use bounded anchors
+            # plus the current markers' immediate neighbours below.
+            baseline_probes = [
+                probe for line in route_lines
+                for probe in select_probe_stops(
+                    [line], mandatory_stop_ids=mandatory,
+                    max_anchors=None if line.operator == "KMB" else 4,
+                )
+            ]
             priority_provider = getattr(tracker, "poll_priorities", None)
             priorities = priority_provider() if callable(priority_provider) else None
             lifecycle_request_provider = getattr(
@@ -288,7 +298,6 @@ async def fetch_traffic_map(
                 base_image = capture_result
 
         estimates: list[BusEstimate] = []
-        audit_estimates: list[BusEstimate] = []
         authoritative = _authoritative_etas(groups or [], route_lines)
         probe_etas = []
         observed_for_frame: dict[tuple[str, str, str], object] = {}
@@ -327,24 +336,24 @@ async def fetch_traffic_map(
                         observed_checkpoint_indices=observed_for_frame,
                         verified_gate_indices=verified_gate_indices,
                     )
-                    audit_estimates = list(estimates)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("probe ETA estimation failed: %s", type(exc).__name__)
                     estimates = []
                 if tracker is not None:
                     try:
-                        estimates = await tracker.update(snapshot, estimates, route_lines)
+                        present = getattr(tracker, "present", tracker.update)
+                        estimates = await present(snapshot, estimates, route_lines)
                     except Exception as exc:  # noqa: BLE001
                         log.warning("marker tracker unavailable: %s", type(exc).__name__)
         try:
             audit = audit_marker_positions(
-                probe_etas, authoritative, audit_estimates, route_lines,
+                probe_etas, authoritative, estimates, route_lines,
                 frame_id=frame_id, seed=frame_id,
                 observed_checkpoint_indices=observed_for_frame,
             )
             marker_pairs = audit.get("gmb_marker_pairs", ())
             log.info(
-                "marker candidate audit frame=%d checks=%d inconclusive=%d issues=%d "
+                "marker display audit frame=%d checks=%d inconclusive=%d issues=%d "
                 "marker_pairs=%d markers=%d observed_checkpoints=%d "
                 "audited_checkpoints=%d uncovered_checkpoints=%d "
                 "observed_rows=%d audited_rows=%d uncovered_rows=%d status=%s",
@@ -374,7 +383,7 @@ async def fetch_traffic_map(
                 if not _first_marker_issue(issue_key):
                     continue
                 log.warning(
-                    "marker candidate audit mismatch frame=%d route=%s kind=%s "
+                    "marker display audit mismatch frame=%d route=%s kind=%s "
                     "checkpoint=%s unmatched_source=%s source_tokens=%s "
                     "unmatched_marker=%s marker_id=%s position=%s "
                     "marker_sources=%s reason=%s",
@@ -391,7 +400,7 @@ async def fetch_traffic_map(
                     detail.get("reason", "one-to-one mismatch"),
                 )
                 log.warning(
-                    "marker candidate audit context frame=%d route=%s gate_rows=%s "
+                    "marker display audit context frame=%d route=%s gate_rows=%s "
                     "checkpoint_rows=%s route_markers=%s association_rows=%s",
                     frame_id,
                     "/".join(issue["key"]),
@@ -423,7 +432,7 @@ async def fetch_traffic_map(
                     common[:2],
                 )
         except Exception as exc:  # audit must never prevent rendering
-            log.warning("marker candidate audit unavailable frame=%d: %s", frame_id, type(exc).__name__)
+            log.warning("marker display audit unavailable frame=%d: %s", frame_id, type(exc).__name__)
         log.info(
             "map markers: %d probe ETAs -> %d bus estimates",
             len(probe_etas),

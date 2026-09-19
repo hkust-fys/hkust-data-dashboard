@@ -729,10 +729,8 @@ async def test_capture_metadata_survives_render_and_payload(monkeypatch):
     second = pipeline.to_payload({"traffic_map": result})
     assert first.embeds[0].timestamp == second.embeds[0].timestamp == timestamp
     assert first.files[0].source_time == timestamp
-    assert f"<t:{int(timestamp.timestamp())}:T>" in first.embeds[0].description
-    marker_label = f"Markers refreshed <t:{int(result.markers_refreshed_at.timestamp())}:T>"
-    assert marker_label in first.embeds[0].description
-    assert marker_label in second.embeds[0].description
+    assert first.embeds[0].description == second.embeds[0].description
+    assert first.embeds[0].description == "🔗 [HKeMobility](https://www.hkemobility.gov.hk/)"
     assert "Cached map" not in first.embeds[0].description
 
 

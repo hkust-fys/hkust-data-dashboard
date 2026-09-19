@@ -2647,6 +2647,45 @@ async def test_apply_payload_retains_unchanged_content_addressed_attachment():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("expired", [False, True])
+async def test_apply_payload_retains_warning_file_and_stable_thumbnail_across_map_edits(expired):
+    import time
+
+    from bot import _apply_payload
+
+    filename = "hko-warnings-0123456789ab.png"
+    png = b"unchanged-warning-strip"
+    expires = 1 if expired else int(time.time()) + 3600
+    url = f"https://cdn.discordapp.com/attachments/123/456/{filename}?ex={expires:x}&hm=test"
+    attachment = SimpleNamespace(id=456, filename=filename, size=len(png), url=url)
+    weather = discord.Embed(title="Weather")
+    weather.set_thumbnail(url=f"attachment://{filename}")
+
+    class Message:
+        attachments = [attachment]
+
+        async def edit(self, **kwargs):
+            self.kwargs = kwargs
+            return self
+
+    message = Message()
+    for cycle in range(3):
+        attachment.url = url + f"&is={cycle}&width=64"
+        await _apply_payload(message, DashboardPayload(
+            embeds=[weather], files=[
+                ImageAsset(f"traffic-map-{cycle}.webp", bytes([cycle])),
+                ImageAsset(filename, png),
+            ],
+        ))
+        assert message.kwargs["attachments"][1] is attachment
+        expected = url.split("?", 1)[0]
+        assert message.kwargs["embeds"][0].thumbnail.url == expected
+        assert weather.thumbnail.url == f"attachment://{filename}"
+        assert len([item for item in message.kwargs["attachments"] if isinstance(item, discord.File)]) == 1
+        message.kwargs["attachments"][0].close()
+
+
+@pytest.mark.asyncio
 async def test_apply_payload_reuploads_warning_when_only_cdn_thumbnail_remains():
     import time
 

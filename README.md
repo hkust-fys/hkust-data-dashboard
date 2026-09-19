@@ -113,6 +113,11 @@ checks. Capture time and view-refresh
 time are tracked separately; exporting unchanged pixels cannot renew the base's
 age. Failures retry after 10 seconds. Any retained fallback is labelled, and a
 base older than one minute is withheld.
+The map embed timestamp supplies its capture time, without extra refresh clocks.
+Marker counts and positions follow the latest available ETA cohorts. KMB uses
+all stops in its route response; per-stop feeds prioritize the stops immediately
+around each estimated marker. Historical identity matching cannot hold an old
+marker in place or retain it after the current ETA cohort disappears.
 During startup or an outage, the map's status notice stays in the map's usual
 first position. A map failure is not repeated in the general source-status pane.
 TD and RTHK news pages are checked independently every 60 seconds. RTHK reports
@@ -165,7 +170,8 @@ incident or the upstream data's age.
 
 HKO warning icons are static official PNGs stitched into one PNG strip. Icon
 bytes and the composed strip are cached; unchanged warnings retain their actual
-Discord attachment on edits. If the attachment is missing, the strip is uploaded
+Discord attachment and stable thumbnail CDN path on edits. Discord renews URL
+signatures without reuploading the strip. If the attachment is missing, it is uploaded
 again rather than relying on a temporary CDN URL. Official warnsum names can
 also resolve icons from the HKO catalog when the optional metadata feed fails.
 

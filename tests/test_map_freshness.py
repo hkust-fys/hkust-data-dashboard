@@ -756,8 +756,7 @@ def test_empty_news_does_not_imply_clear_roads_or_invent_report_time():
         [], [], None, traffic_source_times={"traffic_news_checked": timestamp},
     )
     assert embed.timestamp is None
-    assert "No current TD notices match" in embed.description
-    assert "do not cover every traffic jam" in embed.description
+    assert "No reported TD traffic incidents along roads travelled on by HKUST (mini)buses." in embed.description
     assert embed.color.value == 0x64748B
 
 

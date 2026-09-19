@@ -497,10 +497,11 @@ def _build_traffic_summary_embed(
                 name for name, checked in (("TD", checked_at), ("RTHK", rthk_checked_at))
                 if checked is not None
             )
-            lines.append(f"No current {sources} notices match the tracked HKUST approaches.")
+            lines.append(
+                f"No reported {sources} traffic incidents along roads travelled on by HKUST (mini)buses."
+            )
         else:
             lines.append("TD traffic notices have not been checked successfully yet.")
-        lines.append("Traffic notices do not cover every traffic jam; check the Google traffic map.")
     if works:
         lines.append("\n**Relevant roadworks**")
         for work in works:
